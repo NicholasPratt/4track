@@ -23,9 +23,11 @@ void TransportController::stop()
     if (currentState.load() != State::STOPPED)
     {
         setState(State::STOPPED);
-        resetPosition();
-        juce::Logger::writeToLog("Transport: STOP (position reset)");
     }
+    // Always reset position when stop() is called (even if already stopped)
+    // This allows double-tap stop to return to zero
+    resetPosition();
+    juce::Logger::writeToLog("Transport: STOP (position reset to 0)");
 }
 
 void TransportController::pause()
@@ -41,8 +43,20 @@ void TransportController::record()
 {
     if (currentState.load() != State::RECORDING)
     {
+        // If starting recording from stopped state, reset position to 0
+        // This ensures recording starts from the beginning
+        // If already playing, this allows punch-in recording at current position
+        if (currentState.load() == State::STOPPED)
+        {
+            resetPosition();
+            juce::Logger::writeToLog("Transport: RECORD (from stop, position reset to 0)");
+        }
+        else
+        {
+            juce::Logger::writeToLog("Transport: RECORD (punch-in at current position)");
+        }
+
         setState(State::RECORDING);
-        juce::Logger::writeToLog("Transport: RECORD");
     }
 }
 

@@ -7,33 +7,33 @@ AudioEngine::AudioEngine()
     trackManager = std::make_unique<TrackManager>();
     transport = std::make_unique<TransportController>();
 
-    // Initialize audio device
-    juce::Logger::writeToLog("AudioEngine: Initializing audio device...");
+    // Listen for device changes
+    deviceManager.addChangeListener(this);
 
-    auto error = deviceManager.initialiseWithDefaultDevices(2, 2);
+    // macOS: recording will be silent unless mic permission is granted.
+    // Ask up-front and only start the device when permitted.
+    auto startAudio = [this]() { initialiseAudioDevice(); };
 
-    if (error.isNotEmpty())
+    if (juce::RuntimePermissions::isGranted(juce::RuntimePermissions::recordAudio)
+        || !juce::RuntimePermissions::isRequired(juce::RuntimePermissions::recordAudio))
     {
-        juce::Logger::writeToLog("Audio initialization error: " + error);
+        startAudio();
     }
     else
     {
-        auto* device = deviceManager.getCurrentAudioDevice();
-        if (device)
-        {
-            juce::Logger::writeToLog("Audio device: " + device->getName());
-            juce::Logger::writeToLog("Sample rate: " + juce::String(device->getCurrentSampleRate()));
-            juce::Logger::writeToLog("Buffer size: " + juce::String(device->getCurrentBufferSizeSamples()));
-            juce::Logger::writeToLog("Input channels: " + juce::String(device->getActiveInputChannels().countNumberOfSetBits()));
-            juce::Logger::writeToLog("Output channels: " + juce::String(device->getActiveOutputChannels().countNumberOfSetBits()));
-
-            // Register this as the audio callback
-            deviceManager.addAudioCallback(this);
-        }
-        else
-        {
-            juce::Logger::writeToLog("WARNING: No audio device found!");
-        }
+        juce::RuntimePermissions::request(juce::RuntimePermissions::recordAudio,
+            [this, startAudio](bool granted)
+            {
+                if (granted)
+                {
+                    juce::Logger::writeToLog("Microphone permission granted");
+                    juce::MessageManager::callAsync(startAudio);
+                }
+                else
+                {
+                    juce::Logger::writeToLog("Microphone permission denied - recording will be silent.");
+                }
+            });
     }
 }
 
@@ -44,8 +44,13 @@ AudioEngine::~AudioEngine()
 
 void AudioEngine::shutdownAudio()
 {
-    deviceManager.removeAudioCallback(this);
-    deviceManager.closeAudioDevice();
+    deviceManager.removeChangeListener(this);
+    if (audioDeviceInitialised)
+    {
+        deviceManager.removeAudioCallback(this);
+        deviceManager.closeAudioDevice();
+        audioDeviceInitialised = false;
+    }
 }
 
 void AudioEngine::audioDeviceAboutToStart(juce::AudioIODevice* device)
@@ -63,6 +68,90 @@ void AudioEngine::audioDeviceAboutToStart(juce::AudioIODevice* device)
     if (trackManager)
     {
         trackManager->prepareToPlay(currentSampleRate, currentBufferSize);
+    }
+}
+
+void AudioEngine::initialiseAudioDevice()
+{
+    if (audioDeviceInitialised)
+        return;
+
+    juce::Logger::writeToLog("AudioEngine: Initializing audio device...");
+
+    // Set up audio device with explicit configuration
+    juce::AudioDeviceManager::AudioDeviceSetup setup;
+    deviceManager.getAudioDeviceSetup(setup);
+
+    // Enable all available input channels (up to 8)
+    setup.inputChannels.setRange(0, 8, true);
+    // Enable stereo output
+    setup.outputChannels.setRange(0, 2, true);
+
+    setup.useDefaultInputChannels = false;
+    setup.useDefaultOutputChannels = true;
+
+    juce::Logger::writeToLog("AudioEngine: Requesting input channels: " +
+                             juce::String(setup.inputChannels.countNumberOfSetBits()));
+
+    juce::String error = deviceManager.initialise(
+        8,      // numInputChannelsNeeded
+        2,      // numOutputChannelsNeeded
+        nullptr, // savedState
+        true,   // selectDefaultDeviceOnFailure
+        juce::String(), // preferredDefaultDeviceName
+        &setup  // setup
+    );
+
+    if (error.isNotEmpty())
+    {
+        juce::Logger::writeToLog("Audio initialization error: " + error);
+
+        // Try fallback with simpler initialization
+        juce::Logger::writeToLog("Trying fallback initialization...");
+        error = deviceManager.initialiseWithDefaultDevices(2, 2);
+
+        if (error.isNotEmpty())
+        {
+            juce::Logger::writeToLog("Fallback also failed: " + error);
+            return;
+        }
+    }
+
+    auto* device = deviceManager.getCurrentAudioDevice();
+    if (device)
+    {
+        currentSampleRate = device->getCurrentSampleRate();
+        currentBufferSize = device->getCurrentBufferSizeSamples();
+
+        juce::Logger::writeToLog("Audio device: " + device->getName());
+        juce::Logger::writeToLog("Sample rate: " + juce::String(currentSampleRate));
+        juce::Logger::writeToLog("Buffer size: " + juce::String(currentBufferSize));
+
+        auto activeInputChannels = device->getActiveInputChannels();
+        auto activeOutputChannels = device->getActiveOutputChannels();
+
+        juce::Logger::writeToLog("Active input channels: " + juce::String(activeInputChannels.countNumberOfSetBits()));
+        juce::Logger::writeToLog("Active output channels: " + juce::String(activeOutputChannels.countNumberOfSetBits()));
+
+        // Log which specific channels are active
+        juce::String inputChannelList;
+        for (int i = 0; i < 16; ++i)
+        {
+            if (activeInputChannels[i])
+                inputChannelList += juce::String(i) + " ";
+        }
+        juce::Logger::writeToLog("Input channel indices: " + inputChannelList);
+
+        // Register this as the audio callback
+        deviceManager.addAudioCallback(this);
+        audioDeviceInitialised = true;
+
+        // Notify UI to refresh input selector options
+        deviceChangeBroadcaster.sendChangeMessage();
+    }
+    else
+    {
+        juce::Logger::writeToLog("WARNING: No audio device found!");
     }
 }
 
@@ -92,9 +181,25 @@ void AudioEngine::audioDeviceIOCallbackWithContext(const float* const* inputChan
         juce::String stateStr = state == TransportController::State::PLAYING ? "PLAYING" :
                                state == TransportController::State::RECORDING ? "RECORDING" : "STOPPED";
 
-        juce::Logger::writeToLog("Audio callback - samples: " + juce::String(numSamples) +
+        // Calculate peak input level for debugging
+        float inputPeak = 0.0f;
+        for (int ch = 0; ch < numInputChannels; ++ch)
+        {
+            if (inputChannelData[ch] != nullptr)
+            {
+                for (int i = 0; i < numSamples; ++i)
+                {
+                    inputPeak = juce::jmax(inputPeak, std::abs(inputChannelData[ch][i]));
+                }
+            }
+        }
+
+        juce::Logger::writeToLog("Audio callback - inputs: " + juce::String(numInputChannels) +
+                                 ", outputs: " + juce::String(numOutputChannels) +
+                                 ", samples: " + juce::String(numSamples) +
                                  ", state: " + stateStr +
-                                 ", position: " + juce::String(transport->getPosition()));
+                                 ", position: " + juce::String(transport->getPosition()) +
+                                 ", inputPeak: " + juce::String(inputPeak, 4));
     }
 
     // Clear output first
@@ -109,6 +214,9 @@ void AudioEngine::audioDeviceIOCallbackWithContext(const float* const* inputChan
     if (!trackManager || !transport)
         return;
 
+    // Synchronize trackManager position with transport BEFORE processing
+    trackManager->setPlaybackPosition(static_cast<int>(transport->getPosition()));
+
     // Create JUCE audio buffers for easier manipulation
     juce::AudioBuffer<float> inputBuffer(const_cast<float**>(inputChannelData),
                                         numInputChannels, numSamples);
@@ -118,17 +226,48 @@ void AudioEngine::audioDeviceIOCallbackWithContext(const float* const* inputChan
 
     // Process audio through track manager
     bool isRecording = transport->isRecording();
-    trackManager->processBlock(outputBuffer, inputBuffer, isRecording);
+    bool isPlaying = transport->isPlaying();
 
-    // Update transport position
-    if (transport->isPlaying() || transport->isRecording())
+    // Only play audio when actually playing or recording (mute when stopped)
+    if (isPlaying || isRecording)
     {
+        trackManager->processBlock(outputBuffer, inputBuffer, isRecording);
+
+        // Advance transport position AFTER processing
         transport->advance(numSamples);
-        trackManager->setPlaybackPosition(static_cast<int>(transport->getPosition()));
+    }
+    else
+    {
+        // When stopped, just update meters but don't output audio
+        // This prevents audio bleeding through when scrubbing
+        juce::AudioBuffer<float> dummyOutput(2, numSamples);
+        dummyOutput.clear();
+        trackManager->processBlock(dummyOutput, inputBuffer, false);
     }
 }
 
 void AudioEngine::showAudioSettings()
 {
     // TODO: Implement audio settings dialog
+}
+
+void AudioEngine::changeListenerCallback(juce::ChangeBroadcaster* source)
+{
+    if (source == &deviceManager)
+    {
+        juce::Logger::writeToLog("Audio device changed");
+
+        // Notify UI components about the device change
+        deviceChangeBroadcaster.sendChangeMessage();
+    }
+}
+
+int AudioEngine::getNumInputChannels() const
+{
+    auto* device = deviceManager.getCurrentAudioDevice();
+    if (device)
+    {
+        return device->getActiveInputChannels().countNumberOfSetBits();
+    }
+    return 0;
 }

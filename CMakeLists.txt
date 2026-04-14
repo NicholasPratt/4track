@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.15)
 
-project(4Track VERSION 0.4.0)
+project(4Track VERSION 0.5.0)
 
 # C++ Standard
 set(CMAKE_CXX_STANDARD 17)
@@ -14,6 +14,8 @@ juce_add_gui_app(4Track
     PRODUCT_NAME "4track"
     COMPANY_NAME "4Track"
     BUNDLE_ID "com.4track.recorder"
+    ICON_BIG   "${CMAKE_CURRENT_SOURCE_DIR}/Assets/4track.icns"
+    ICON_SMALL "${CMAKE_CURRENT_SOURCE_DIR}/Assets/4track.icns"
     NEEDS_MIDI_INPUT FALSE
     NEEDS_MIDI_OUTPUT FALSE
     IS_SYNTH FALSE
@@ -22,13 +24,17 @@ juce_add_gui_app(4Track
     EDITOR_WANTS_KEYBOARD_FOCUS TRUE
     COPY_PLUGIN_AFTER_BUILD FALSE
     PLUGIN_MANUFACTURER_CODE 4Trk
-    PLUGIN_CODE 4Tk1)
+    PLUGIN_CODE 4Tk1
+    MICROPHONE_PERMISSION_ENABLED TRUE
+    MICROPHONE_PERMISSION_TEXT "This app needs access to your microphone to record audio tracks.")
 
 # Source files
 target_sources(4Track PRIVATE
     Source/Main.cpp
     Source/UI/MainComponent.cpp
     Source/UI/MainComponent.h
+    Source/UI/AudioSettingsDialog.cpp
+    Source/UI/AudioSettingsDialog.h
     Source/UI/VUMeter.cpp
     Source/UI/VUMeter.h
     Source/UI/TrackStrip.cpp
@@ -51,7 +57,7 @@ target_compile_definitions(4Track PRIVATE
     JUCE_VST3_CAN_REPLACE_VST2=0
     JUCE_APPLICATION_NAME_STRING="$<TARGET_PROPERTY:4Track,JUCE_PRODUCT_NAME>"
     JUCE_APPLICATION_VERSION_STRING="$<TARGET_PROPERTY:4Track,JUCE_VERSION>"
-    APP_VERSION="0.4.0"
+    APP_VERSION="0.5.0"
     APP_BUILD_DATE=__DATE__)
 
 # Link JUCE libraries

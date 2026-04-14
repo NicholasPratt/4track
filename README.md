@@ -68,6 +68,13 @@ cmake --build .
 
 ## Version History
 
+- **v0.5.0** - Audio device selection and per-track input routing
+  - Audio settings dialog with full device configuration
+  - Per-track input channel selection (mono and stereo)
+  - Dynamic input selector updates on device changes
+  - Fixed recording/playback position synchronization
+  - Fixed RTZ (Return to Zero) functionality
+  - Fixed VU meter display during recording and playback
 - **v0.4.0** - Initial release with core recording/playback functionality
 
 ## Technical Details

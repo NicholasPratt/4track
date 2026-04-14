@@ -17,7 +17,7 @@ void VUMeter::setLevel(float newLevel)
 
 void VUMeter::timerCallback()
 {
-    // Smooth decay of display level for natural needle movement
+    // Smooth decay of display level for natural bar movement
     if (currentLevel > displayLevel)
     {
         displayLevel = currentLevel; // Instant attack
@@ -25,6 +25,21 @@ void VUMeter::timerCallback()
     else
     {
         displayLevel *= decayRate; // Gradual decay
+    }
+
+    // Peak hold logic
+    if (currentLevel > peakHold)
+    {
+        peakHold = currentLevel;
+        peakHoldCounter = peakHoldFrames;
+    }
+    else if (peakHoldCounter > 0)
+    {
+        --peakHoldCounter;
+    }
+    else
+    {
+        peakHold *= 0.95f; // Slowly decay peak hold after hold time expires
     }
 
     repaint();
@@ -41,65 +56,99 @@ void VUMeter::paint(juce::Graphics& g)
     g.setColour(juce::Colours::white);
     g.drawRect(bounds, 1.0f);
 
-    // Draw meter scale markings
-    auto meterArea = bounds.reduced(10.0f);
-    float centerX = meterArea.getCentreX();
-    float centerY = meterArea.getCentreY() + 10.0f;  // Pivot point in center
-    float radius = meterArea.getWidth() * 0.4f;
+    // Meter area (vertical bar)
+    auto meterArea = bounds.reduced(4.0f);
+    float meterWidth = meterArea.getWidth() * 0.6f;
+    float meterHeight = meterArea.getHeight();
 
-    // Draw arc for meter range (-20 dB to +3 dB)
-    // Adjust angles so needle doesn't dip below the meter box
-    // -∞ dB (silence) should be at the left (-20 position)
-    g.setColour(juce::Colours::white);
-    float startAngle = juce::MathConstants<float>::pi * 1.0f;   // 180 degrees (straight left)
-    float endAngle = 0.0f;                                       // 0 degrees (straight right)
+    // Center the meter horizontally
+    float meterX = meterArea.getCentreX() - meterWidth / 2.0f;
+    float meterY = meterArea.getY();
 
-    juce::Path arcPath;
-    arcPath.addCentredArc(centerX, centerY, radius, radius,
-                         0.0f, startAngle, endAngle, true);
-    g.strokePath(arcPath, juce::PathStrokeType(1.5f));
+    // Draw meter background (dark grey)
+    g.setColour(juce::Colour(0xff2a2a2a));
+    g.fillRect(meterX, meterY, meterWidth, meterHeight);
 
-    // Draw scale markings
-    g.setColour(juce::Colours::white);
-    for (int i = 0; i <= 10; ++i)
+    // Calculate level height
+    float levelHeight = displayLevel * meterHeight;
+    float levelY = meterY + meterHeight - levelHeight;
+
+    // Draw level segments with color gradient
+    // Green: 0-70% (-∞ to -6dB)
+    // Yellow: 70-90% (-6dB to 0dB)
+    // Red: 90-100% (0dB to +3dB)
+
+    if (displayLevel > 0.0f)
     {
-        float t = i / 10.0f;
-        float angle = startAngle + (endAngle - startAngle) * t;
+        // Green section (bottom 70%)
+        float greenHeight = juce::jmin(levelHeight, meterHeight * 0.7f);
+        if (greenHeight > 0.0f)
+        {
+            g.setColour(juce::Colour(0xff00ff00)); // Bright green
+            g.fillRect(meterX, meterY + meterHeight - greenHeight, meterWidth, greenHeight);
+        }
 
-        float x1 = centerX + std::cos(angle) * (radius - 5.0f);
-        float y1 = centerY + std::sin(angle) * (radius - 5.0f);
-        float x2 = centerX + std::cos(angle) * radius;
-        float y2 = centerY + std::sin(angle) * radius;
+        // Yellow section (70-90%)
+        if (displayLevel > 0.7f)
+        {
+            float yellowStart = meterY + meterHeight * 0.3f;
+            float yellowHeight = juce::jmin(levelHeight - meterHeight * 0.7f, meterHeight * 0.2f);
+            if (yellowHeight > 0.0f)
+            {
+                g.setColour(juce::Colour(0xffffff00)); // Yellow
+                g.fillRect(meterX, yellowStart + meterHeight * 0.2f - yellowHeight, meterWidth, yellowHeight);
+            }
+        }
 
-        g.drawLine(x1, y1, x2, y2, (i % 5 == 0) ? 1.5f : 1.0f);
+        // Red section (90-100%)
+        if (displayLevel > 0.9f)
+        {
+            float redStart = meterY;
+            float redHeight = levelHeight - meterHeight * 0.9f;
+            if (redHeight > 0.0f)
+            {
+                g.setColour(juce::Colour(0xffff0000)); // Red
+                g.fillRect(meterX, redStart + meterHeight * 0.1f - redHeight, meterWidth, redHeight);
+            }
+        }
     }
 
-    // Draw labels
-    g.setFont(juce::Font(10.0f));
-    g.drawText("-20", bounds.getX() + 5, centerY - 5, 20, 10,
-               juce::Justification::centred);
-    g.drawText("0", bounds.getCentreX() - 10, bounds.getY() + 5, 20, 10,
-               juce::Justification::centred);
-    g.drawText("+3", bounds.getRight() - 25, centerY - 5, 20, 10,
-               juce::Justification::centred);
+    // Draw peak hold indicator
+    if (peakHold > 0.01f)
+    {
+        float peakY = meterY + meterHeight * (1.0f - peakHold);
+        g.setColour(peakHold > 0.9f ? juce::Colours::red : juce::Colours::white);
+        g.fillRect(meterX, peakY - 1.0f, meterWidth, 2.0f);
+    }
 
-    // Draw the needle
-    float needleAngle = startAngle + (endAngle - startAngle) * displayLevel;
-    float needleLength = radius - 10.0f;
+    // Draw meter border
+    g.setColour(juce::Colours::white);
+    g.drawRect(meterX, meterY, meterWidth, meterHeight, 1.0f);
 
-    float needleX = centerX + std::cos(needleAngle) * needleLength;
-    float needleY = centerY + std::sin(needleAngle) * needleLength;
+    // Draw dB scale markings on the right side
+    g.setFont(juce::Font(8.0f));
+    g.setColour(juce::Colours::white);
 
-    // Needle in red if clipping (> 0.9), white otherwise
-    if (displayLevel > 0.9f)
-        g.setColour(juce::Colours::red);
-    else
-        g.setColour(juce::Colours::white);
+    // Draw scale: +3, 0, -6, -12, -18, -24, -∞
+    std::vector<std::pair<juce::String, float>> scaleMarks = {
+        {"+3", 1.0f},
+        {"0", 0.9f},
+        {"-6", 0.7f},
+        {"-12", 0.5f},
+        {"-18", 0.3f},
+        {"-24", 0.15f},
+        {"-\u221E", 0.0f}
+    };
 
-    g.drawLine(centerX, centerY, needleX, needleY, 2.0f);
+    float scaleX = meterX + meterWidth + 2.0f;
+    for (const auto& mark : scaleMarks)
+    {
+        float y = meterY + meterHeight * (1.0f - mark.second);
+        g.drawText(mark.first, scaleX, y - 6, 20, 12, juce::Justification::left);
 
-    // Draw center pivot
-    g.fillEllipse(centerX - 3.0f, centerY - 3.0f, 6.0f, 6.0f);
+        // Draw tick mark
+        g.drawLine(meterX + meterWidth, y, meterX + meterWidth + 2, y, 1.0f);
+    }
 }
 
 void VUMeter::resized()

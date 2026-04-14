@@ -44,6 +44,20 @@ public:
     double getPositionInSeconds(double sampleRate) const;
     void setPositionInSeconds(double seconds, double sampleRate);
 
+    // Markers (stored in samples, -1 = not set)
+    void setMarkerOne(juce::int64 pos) { markerOne = pos; }
+    void setMarkerTwo(juce::int64 pos) { markerTwo = pos; }
+    juce::int64 getMarkerOne() const { return markerOne.load(); }
+    juce::int64 getMarkerTwo() const { return markerTwo.load(); }
+    bool isMarkerOneSet() const { return markerOne.load() >= 0; }
+    bool isMarkerTwoSet() const { return markerTwo.load() >= 0; }
+    void clearMarkerOne() { markerOne = -1; }
+    void clearMarkerTwo() { markerTwo = -1; }
+
+    // Punch mode: auto-record between M1 and M2 during playback
+    void setPunchMode(bool enabled) { punchModeEnabled = enabled; }
+    bool isPunchModeEnabled() const { return punchModeEnabled.load(); }
+
     // Callbacks for state changes
     void onStateChanged(std::function<void(State)> callback) { stateChangedCallback = callback; }
 
@@ -52,6 +66,10 @@ private:
 
     std::atomic<State> currentState { State::STOPPED };
     std::atomic<juce::int64> position { 0 };
+
+    std::atomic<juce::int64> markerOne { -1 };
+    std::atomic<juce::int64> markerTwo { -1 };
+    std::atomic<bool> punchModeEnabled { false };
 
     std::function<void(State)> stateChangedCallback;
 

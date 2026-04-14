@@ -13,12 +13,31 @@ public:
     void initialise(const juce::String& commandLine) override
     {
         juce::ignoreUnused(commandLine);
+
+        // Set up file logging - use Documents folder which we know works
+        auto logFile = juce::File::getSpecialLocation(juce::File::userDocumentsDirectory)
+                          .getChildFile("4track-debug.log");
+
+        fileLogger = std::make_unique<juce::FileLogger>(logFile, "4Track Recorder Log", 1024 * 1024);
+        juce::Logger::setCurrentLogger(fileLogger.get());
+
+        juce::Logger::writeToLog("========================================");
+        juce::Logger::writeToLog("4Track Recorder v0.5.0 Starting");
+        juce::Logger::writeToLog("Log file: " + logFile.getFullPathName());
+        juce::Logger::writeToLog("========================================");
+
+        // Also output to stderr for debugging
+        std::cerr << "4Track starting - log file: " << logFile.getFullPathName().toStdString() << std::endl;
+
         mainWindow.reset(new MainWindow(getApplicationName()));
     }
 
     void shutdown() override
     {
+        juce::Logger::writeToLog("4Track Recorder Shutting Down");
         mainWindow = nullptr;
+        juce::Logger::setCurrentLogger(nullptr);
+        fileLogger = nullptr;
     }
 
     void systemRequestedQuit() override
@@ -64,6 +83,7 @@ public:
 
 private:
     std::unique_ptr<MainWindow> mainWindow;
+    std::unique_ptr<juce::FileLogger> fileLogger;
 };
 
 START_JUCE_APPLICATION(FourTrackApplication)
