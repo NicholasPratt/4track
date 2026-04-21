@@ -45,6 +45,10 @@ public:
     // Device change notifications
     juce::ChangeBroadcaster& getDeviceChangeBroadcaster() { return deviceChangeBroadcaster; }
 
+    // Persist / restore audio device settings
+    void saveDeviceState();
+    std::unique_ptr<juce::XmlElement> loadSavedDeviceState();
+
     // Project folder management
     void setProjectFolder(const juce::File& folder) { currentProjectFolder = folder; }
     juce::File getProjectFolder() const { return currentProjectFolder; }

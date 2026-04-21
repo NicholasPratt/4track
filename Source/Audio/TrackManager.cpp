@@ -100,9 +100,10 @@ void TrackManager::processBlock(juce::AudioBuffer<float>& outputBuffer,
         const bool isBounceTrack = (track->getInputMode() == Track::InputMode::BounceFromMix);
 
         // Record from hardware input (non-bounce tracks only)
-        if (isRecording && track->isRecordArmed() && !isBounceTrack)
+        if (track->isRecordArmed() && !isBounceTrack)
         {
             const int numInputChannels = inputBuffer.getNumChannels();
+            float blockPeak = 0.0f;
 
             for (int sample = 0; sample < numSamples; ++sample)
             {
@@ -130,8 +131,17 @@ void TrackManager::processBlock(juce::AudioBuffer<float>& outputBuffer,
                         : 0.0f;
                 }
 
-                track->addInputSample(leftSample, rightSample, currentPosition + sample);
+                blockPeak = juce::jmax(blockPeak,
+                                       std::abs(leftSample),
+                                       std::abs(rightSample));
+
+                if (isRecording)
+                    track->addInputSample(leftSample, rightSample, currentPosition + sample);
             }
+
+            // Always update the input meter so armed tracks show signal even when stopped
+            if (!isRecording)
+                track->updateInputMeter(blockPeak);
         }
 
         // Bounce-armed tracks are excluded from the mix during bounce recording

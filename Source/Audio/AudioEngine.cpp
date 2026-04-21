@@ -71,6 +71,37 @@ void AudioEngine::audioDeviceAboutToStart(juce::AudioIODevice* device)
     }
 }
 
+void AudioEngine::saveDeviceState()
+{
+    auto state = deviceManager.createStateXml();
+    if (state == nullptr)
+        return;
+
+    juce::File stateFile = juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
+                               .getChildFile("4track")
+                               .getChildFile("audioDevice.xml");
+
+    stateFile.getParentDirectory().createDirectory();
+    stateFile.replaceWithText(state->toString());
+    juce::Logger::writeToLog("AudioEngine: Saved device state to " + stateFile.getFullPathName());
+}
+
+std::unique_ptr<juce::XmlElement> AudioEngine::loadSavedDeviceState()
+{
+    juce::File stateFile = juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
+                               .getChildFile("4track")
+                               .getChildFile("audioDevice.xml");
+
+    if (!stateFile.existsAsFile())
+        return nullptr;
+
+    auto xml = juce::XmlDocument::parse(stateFile);
+    if (xml != nullptr)
+        juce::Logger::writeToLog("AudioEngine: Loaded saved device state from " + stateFile.getFullPathName());
+
+    return xml;
+}
+
 void AudioEngine::initialiseAudioDevice()
 {
     if (audioDeviceInitialised)
@@ -78,29 +109,31 @@ void AudioEngine::initialiseAudioDevice()
 
     juce::Logger::writeToLog("AudioEngine: Initializing audio device...");
 
-    // Set up audio device with explicit configuration
-    juce::AudioDeviceManager::AudioDeviceSetup setup;
-    deviceManager.getAudioDeviceSetup(setup);
+    auto savedState = loadSavedDeviceState();
 
-    // Enable all available input channels (up to 8)
-    setup.inputChannels.setRange(0, 8, true);
-    // Enable stereo output
-    setup.outputChannels.setRange(0, 2, true);
+    juce::String error;
 
-    setup.useDefaultInputChannels = false;
-    setup.useDefaultOutputChannels = true;
+    if (savedState != nullptr)
+    {
+        // Restore the user's previously chosen device / channel configuration
+        error = deviceManager.initialise(8, 2, savedState.get(), true);
+        juce::Logger::writeToLog("AudioEngine: Initialised from saved state");
+    }
+    else
+    {
+        // First run: request default device with up to 8 input channels
+        juce::AudioDeviceManager::AudioDeviceSetup setup;
+        deviceManager.getAudioDeviceSetup(setup);
+        setup.inputChannels.setRange(0, 8, true);
+        setup.outputChannels.setRange(0, 2, true);
+        setup.useDefaultInputChannels = false;
+        setup.useDefaultOutputChannels = true;
 
-    juce::Logger::writeToLog("AudioEngine: Requesting input channels: " +
-                             juce::String(setup.inputChannels.countNumberOfSetBits()));
+        juce::Logger::writeToLog("AudioEngine: Requesting input channels: " +
+                                 juce::String(setup.inputChannels.countNumberOfSetBits()));
 
-    juce::String error = deviceManager.initialise(
-        8,      // numInputChannelsNeeded
-        2,      // numOutputChannelsNeeded
-        nullptr, // savedState
-        true,   // selectDefaultDeviceOnFailure
-        juce::String(), // preferredDefaultDeviceName
-        &setup  // setup
-    );
+        error = deviceManager.initialise(8, 2, nullptr, true, {}, &setup);
+    }
 
     if (error.isNotEmpty())
     {
@@ -256,6 +289,9 @@ void AudioEngine::changeListenerCallback(juce::ChangeBroadcaster* source)
     if (source == &deviceManager)
     {
         juce::Logger::writeToLog("Audio device changed");
+
+        // Persist the new device selection so it survives restarts
+        saveDeviceState();
 
         // Notify UI components about the device change
         deviceChangeBroadcaster.sendChangeMessage();

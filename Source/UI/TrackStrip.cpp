@@ -398,11 +398,12 @@ void TrackStrip::updateInputChannelOptions(int numAvailableInputs)
 
     // Restore previous selection if still valid, otherwise select first mono channel
     if (currentSelection > 0 && inputSelector.indexOfItemId(currentSelection) >= 0)
-    {
         inputSelector.setSelectedId(currentSelection, juce::dontSendNotification);
-    }
     else
-    {
         inputSelector.setSelectedId(1, juce::dontSendNotification); // Default to Ch 1 (Mono)
-    }
+
+    // Always push the current selection into the track model. Using dontSendNotification
+    // above suppresses the comboBoxChanged callback, so the track's input mode would
+    // otherwise never be applied (especially on startup / device change).
+    comboBoxChanged(&inputSelector);
 }

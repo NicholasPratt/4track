@@ -78,6 +78,7 @@ public:
 
     // Level metering
     float getPeakLevel() const { return peakLevel.load(); }
+    void updateInputMeter(float inputPeak);  // Update meter from live input without writing to buffer
 
     // Buffer management
     void clearBuffer();

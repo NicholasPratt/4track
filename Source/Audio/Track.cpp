@@ -273,12 +273,19 @@ void Track::addToReverbSend(juce::AudioBuffer<float>& sendBuffer, int startSampl
     }
 }
 
+void Track::updateInputMeter(float inputPeak)
+{
+    float oldPeak = peakLevel.load();
+    peakLevel.store(juce::jmax(inputPeak, oldPeak * 0.95f));
+}
+
 void Track::clearBuffer()
 {
     recordedAudio.clear();
     playbackPosition = 0;
     hasAudio.store(false);
     cachedBufferLength = 0;
+    peakLevel.store(0.0f);
 }
 
 void Track::ensureBufferSize(int numSamples)

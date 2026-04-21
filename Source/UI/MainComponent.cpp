@@ -294,7 +294,12 @@ juce::File MainComponent::getProjectFolder()
 
 void MainComponent::createProjectFolderIfNeeded()
 {
-    juce::File projectFolder = getProjectFolder();
+    // Always use the canonical scratch folder — never derive from currentProjectFolder
+    // which may have been changed by loadProject() to point at a user-chosen directory.
+    juce::File projectFolder = juce::File::getSpecialLocation(juce::File::userDocumentsDirectory)
+                                   .getChildFile("4track-projects")
+                                   .getChildFile("Current");
+
     bool folderCreated = false;
 
     if (!projectFolder.exists())
@@ -304,30 +309,18 @@ void MainComponent::createProjectFolderIfNeeded()
         folderCreated = true;
     }
 
-    // Set the project folder in AudioEngine
+    // Keep currentProjectFolder and AudioEngine in sync with the scratch folder
+    currentProjectFolder = projectFolder;
     if (audioEngine)
     {
         audioEngine->setProjectFolder(projectFolder);
     }
 
-    // Load existing tracks if folder already existed
-    if (!folderCreated && audioEngine)
-    {
-        auto* trackManager = audioEngine->getTrackManager();
-        for (int i = 0; i < 4; ++i)
-        {
-            juce::File trackFile = projectFolder.getChildFile("Track" + juce::String(i + 1) + ".wav");
-            if (trackFile.existsAsFile())
-            {
-                auto* track = trackManager->getTrack(i);
-                if (track)
-                {
-                    track->loadFromFile(trackFile);
-                    juce::Logger::writeToLog("Auto-loaded existing " + trackFile.getFileName());
-                }
-            }
-        }
-    }
+    // Do NOT auto-load audio files here.  The scratch folder is purely a working
+    // directory for recording; restoring a session is an explicit user action via
+    // "Load Project".  Auto-loading caused old audio to persist across new-project
+    // requests because files in Current/ were reloaded every time the app started.
+    juce::ignoreUnused(folderCreated);
 }
 
 void MainComponent::saveProject()
@@ -397,6 +390,15 @@ void MainComponent::loadProject()
         currentProjectFolder = selectedFolder;
 
         auto* trackManager = audioEngine->getTrackManager();
+
+        // Stop transport and clear all tracks before loading so no stale audio remains
+        audioEngine->getTransport()->stop();
+        for (int i = 0; i < 4; ++i)
+        {
+            auto* track = trackManager->getTrack(i);
+            if (track)
+                track->clearBuffer();
+        }
 
         for (int i = 0; i < 4; ++i)
         {
@@ -499,29 +501,44 @@ void MainComponent::newProject()
         // choice == 2: Discard & New — fall through
     }
 
-    // Stop transport
+    // The scratch folder is always .../4track-projects/Current.
+    // Construct the path directly rather than trusting stored pointers —
+    // audioEngine->getProjectFolder() and currentProjectFolder can drift
+    // (e.g. after loadProject() points them at a user-chosen directory).
+    juce::File scratchFolder = juce::File::getSpecialLocation(juce::File::userDocumentsDirectory)
+                                   .getChildFile("4track-projects")
+                                   .getChildFile("Current");
+
+    juce::Logger::writeToLog("NEW PROJECT: scratch folder = " + scratchFolder.getFullPathName());
+
+    // 1. Stop transport first. If we were recording this fires stateChangedCallback
+    //    → stopRecordingToFiles() → loadFromFile(), reloading audio into memory.
+    //    That is fine — we clear the buffers in step 3 after the callback completes.
     audioEngine->getTransport()->stop();
 
-    // The "Current" scratch folder is always managed by audioEngine, not
-    // currentProjectFolder (which may point to a loaded saved project).
-    juce::File workingFolder = audioEngine->getProjectFolder();
+    // Resync both folder pointers to the scratch folder now that stop has completed.
+    audioEngine->setProjectFolder(scratchFolder);
+    currentProjectFolder = scratchFolder;
 
-    // Delete track WAVs from the working folder
-    if (workingFolder.exists())
+    // 2. Delete ALL WAV files from the scratch folder.
+    if (scratchFolder.isDirectory())
     {
-        for (int i = 0; i < 4; ++i)
+        auto files = scratchFolder.findChildFiles(juce::File::findFiles, false, "*.wav");
+        juce::Logger::writeToLog("NEW PROJECT: found " + juce::String(files.size()) + " WAV(s) to delete");
+        for (auto& f : files)
         {
-            juce::File trackFile = workingFolder.getChildFile("Track" + juce::String(i + 1) + ".wav");
-            if (trackFile.existsAsFile())
-                trackFile.deleteFile();
+            bool ok = f.deleteFile();
+            juce::Logger::writeToLog(juce::String("NEW PROJECT: ") + (ok ? "deleted " : "FAILED to delete ") + f.getFullPathName());
         }
-        juce::Logger::writeToLog("New project: deleted track WAVs from " + workingFolder.getFullPathName());
+    }
+    else
+    {
+        juce::Logger::writeToLog("NEW PROJECT: scratch folder does not exist, nothing to delete");
+        scratchFolder.createDirectory();
     }
 
-    // Reset the active project pointer back to the working folder
-    currentProjectFolder = workingFolder;
-
-    // Clear all tracks in memory
+    // 3. Clear all in-memory track data. Must happen AFTER transport->stop()
+    //    because the state-change callback may have reloaded audio into memory.
     for (int i = 0; i < 4; ++i)
     {
         auto* track = trackManager->getTrack(i);
