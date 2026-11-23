@@ -22,8 +22,8 @@ juce_add_gui_app(8Track
     COMPANY_NAME "8track"
     BUNDLE_ID "com.8track.recorder"
     VERSION ${PROJECT_VERSION}
-    ICON_BIG   "${CMAKE_CURRENT_SOURCE_DIR}/Assets/8track.icns"
-    ICON_SMALL "${CMAKE_CURRENT_SOURCE_DIR}/Assets/8track.icns"
+    ICON_BIG   "${CMAKE_CURRENT_SOURCE_DIR}/Assets/8track.iconset/icon_512x512@2x.png"
+    ICON_SMALL "${CMAKE_CURRENT_SOURCE_DIR}/Assets/8track.iconset/icon_32x32.png"
     MICROPHONE_PERMISSION_ENABLED TRUE
     MICROPHONE_PERMISSION_TEXT "8track needs microphone access to record audio.")
 
@@ -70,9 +70,12 @@ target_compile_definitions(8Track PRIVATE
 target_link_libraries(8Track PRIVATE juce::juce_recommended_lto_flags)
 
 # macOS only shows the microphone prompt (and only delivers real input) to a signed app.
-# Intel toolchains don't sign automatically, so sign ad hoc after every build.
+# JUCE builds AppIcon.icns from the PNGs above; replace it with the hand-made .icns (every size
+# drawn properly), then sign ad hoc, since Intel toolchains don't sign automatically.
 if(APPLE)
     add_custom_command(TARGET 8Track POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_CURRENT_SOURCE_DIR}/Assets/8track.icns"
+                "$<TARGET_BUNDLE_CONTENT_DIR:8Track>/Resources/AppIcon.icns"
         COMMAND codesign --force --deep --sign - --identifier com.8track.recorder
                 "$<TARGET_BUNDLE_DIR:8Track>"
         COMMENT "Ad-hoc signing 8track.app")
