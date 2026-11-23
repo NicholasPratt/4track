@@ -1,75 +1,52 @@
 #pragma once
 
-#include <juce_gui_basics/juce_gui_basics.h>
-#include "../Audio/TransportController.h"
-#include "VUMeter.h"
+#include "Widgets.h"
+#include "TimelineView.h"
+#include "../Project/Project.h"
 
-class TrackManager;  // Forward declaration
-
-class TransportBar : public juce::Component,
-                     private juce::Button::Listener,
-                     private juce::Slider::Listener,
-                     private juce::Timer
+/** Top toolbar: transport, position display, tempo, recording options, view controls. */
+class TransportBar : public juce::Component
 {
 public:
-    TransportBar(TransportController* transport, TrackManager* trackManager, double sampleRate);
-    ~TransportBar() override;
+    TransportBar(AudioEngine&, Project&, TimelineView&);
 
-    void paint(juce::Graphics& g) override;
+    void paint(juce::Graphics&) override;
     void resized() override;
 
-    // Update sample rate (call when audio device changes)
-    void setSampleRate(double newSampleRate) { sampleRate = newSampleRate; }
+    /** Call from the UI timer. */
+    void tick();
+    /** Re-reads tempo/toggles after a project load. */
+    void refresh();
 
-    // Marker controls (called from MainComponent key handler)
-    // Sets the marker at the current transport position, or jumps to it if already set.
-    void setMarker(int markerNumber);   // 1 = M1, 2 = M2
-    void togglePunchMode();
+    std::function<void()> onPlay, onStop, onRecord, onToStart;
+    std::function<void()> onZoomIn, onZoomOut, onToggleMixer, onGridChanged;
+
+    void setMasterPeaks(float l, float r) { masterMeter.setPeaks(l, r); }
+    void setMixerVisible(bool visible) { mixer.setToggleState(visible, juce::dontSendNotification); }
 
 private:
-    void buttonClicked(juce::Button* button) override;
-    void sliderValueChanged(juce::Slider* slider) override;
-    void timerCallback() override;
-    void mouseDown(const juce::MouseEvent& e) override;
+    AudioEngine& engine;
+    Project& project;
+    TimelineView& view;
 
-    TransportController* transport;
-    TrackManager* trackManager;
-    double sampleRate;
+    juce::Label projectName;
+    IconButton toStart { "Go to start", IconButton::Icon::ToStart },
+               play    { "Play", IconButton::Icon::Play, Theme::monitor },
+               stop    { "Stop", IconButton::Icon::Stop },
+               record  { "Record", IconButton::Icon::Record, Theme::record };
 
-    // UI Components
-    juce::TextButton playButton;
-    juce::TextButton stopButton;
-    juce::TextButton recordButton;
-    juce::TextButton rwdButton;  // Rewind
-    juce::TextButton ffdButton;  // Fast Forward
-    juce::Label counterDisplay;
+    juce::Rectangle<int> displayArea;
+    juce::String barsText, timeText;
 
-    // For double-click detection on STOP
-    juce::int64 lastStopClickTime = 0;
-    const int stopDoubleClickMs = 500;
+    juce::Slider bpm;
+    juce::ComboBox timeSig;
 
-    // Marker buttons (click = jump; [ / ] keys = set; right-click = clear)
-    juce::TextButton m1Button;
-    juce::TextButton m2Button;
-    juce::TextButton punchButton;
+    ToggleChip click   { "Click", Theme::accent, "Metronome (C)" },
+               countIn { "Count-in", Theme::accent, "One bar of click before recording starts" },
+               punch   { "Punch", Theme::record, "Record only inside the punch range (P). Drag on the lower strip of the ruler to set it." },
+               snap    { "Snap", Theme::accent, "Snap edits to the grid (hold Cmd while dragging to bypass)" },
+               mixer   { "Mixer", Theme::accent, "Show the mixer (X)" };
+    juce::TextButton zoomOut { "-" }, zoomIn { "+" };
 
-    // Track whether punch was already triggered this pass (prevents re-triggering)
-    bool punchInFired = false;
-    bool punchOutFired = false;
-
-    // Reverb controls
-    juce::Label reverbLabel;
-    juce::Label roomLabel;
-    juce::Label dampLabel;
-    juce::Label mixLabel;
-    juce::Slider roomSizeKnob;
-    juce::Slider dampingKnob;
-    juce::Slider reverbMixKnob;
-
-    // Master output level meters
-    juce::Label masterLabel;
-    VUMeter masterVULeft;
-    VUMeter masterVURight;
-
-    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(TransportBar)
+    LevelMeter masterMeter { false };
 };

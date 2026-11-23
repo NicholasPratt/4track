@@ -1,59 +1,82 @@
 #pragma once
 
-#include <juce_gui_basics/juce_gui_basics.h>
-#include "../Audio/AudioEngine.h"
-#include "TrackStrip.h"
+#include "ArrangeView.h"
+#include "MixerPanel.h"
 #include "TransportBar.h"
-#include <memory>
-#include <array>
 
 class MainComponent : public juce::Component,
-                     private juce::Button::Listener,
-                     private juce::ChangeListener,
-                     public juce::KeyListener
+                      public juce::MenuBarModel,
+                      public juce::KeyListener,
+                      private juce::Timer,
+                      private juce::ChangeListener
 {
 public:
     MainComponent();
     ~MainComponent() override;
 
-    void paint(juce::Graphics& g) override;
+    void paint(juce::Graphics&) override;
     void resized() override;
     void parentHierarchyChanged() override;
 
-    // KeyListener (global key handler — registered on top-level window)
-    bool keyPressed(const juce::KeyPress& key, juce::Component* originatingComponent) override;
-    using juce::Component::keyPressed; // un-hide the 1-arg Component::keyPressed
+    /** Asks to save unsaved changes, then calls `quit` unless the user cancels. */
+    void requestQuit(std::function<void()> quit);
+
+   #if JUCE_DEBUG
+    /** Dev aid: `8track --snapshot out.png [--import file.wav ...] [--mixer]` renders the UI to a PNG and quits. */
+    void runDebugSnapshot(const juce::StringArray& args);
+    /** Dev aid: `8track --diagnose` prints the audio device setup and input levels, then quits. */
+    void runDiagnostics();
+   #endif
+
+    // MenuBarModel
+    juce::StringArray getMenuBarNames() override;
+    juce::PopupMenu getMenuForIndex(int index, const juce::String& name) override;
+    void menuItemSelected(int itemId, int topLevelMenuIndex) override;
+
+    // KeyListener (on the top-level window, so shortcuts work wherever focus is)
+    bool keyPressed(const juce::KeyPress&, juce::Component*) override;
+    using juce::Component::keyPressed;
 
 private:
-    void buttonClicked(juce::Button* button) override;
-    void showAudioSettingsDialog();
-    void changeListenerCallback(juce::ChangeBroadcaster* source) override;
-    void updateTrackInputSelectors();
+    enum Command
+    {
+        cmdNew = 1, cmdOpen, cmdSave, cmdSaveAs, cmdImport, cmdExport, cmdAudioSettings,
+        cmdUndo, cmdRedo, cmdSplit, cmdDelete, cmdSelectAll,
+        cmdPlayStop, cmdRecord, cmdToStart, cmdPunch, cmdPunchIn, cmdPunchOut, cmdClick, cmdCountIn,
+        cmdZoomIn, cmdZoomOut, cmdZoomFit, cmdMixer
+    };
 
-    // Project management
-    void newProject();
-    void saveProject();
-    void loadProject();
-    void renderProject();
-    void autoSaveTracks();
-    juce::File getProjectFolder();
-    void createProjectFolderIfNeeded();
+    void perform(int command);
+    void timerCallback() override;
+    void changeListenerCallback(juce::ChangeBroadcaster*) override;
 
-    std::unique_ptr<AudioEngine> audioEngine;
+    void togglePlay();
+    void toggleRecord();
+    void splitSelection();
+    void deleteSelection();
+    void setPunchPoint(bool in);
+    void toggleMixer();
 
-    // UI components
-    std::array<std::unique_ptr<TrackStrip>, 4> trackStrips;
-    std::unique_ptr<TransportBar> transportBar;
-    juce::Label titleLabel;
-    juce::Label versionLabel;
-    juce::TextButton settingsButton;
-    juce::TextButton newButton;
-    juce::TextButton saveButton;
-    juce::TextButton loadButton;
-    juce::TextButton renderButton;
+    void confirmDiscard(std::function<void()> proceed);
+    void saveProject(bool chooseLocation, std::function<void(bool saved)> then = {});
+    void openProject();
+    void importAudio();
+    void exportMix();
+    void showAudioSettings();
+    void projectChanged();
+    void showError(const juce::String& title, const juce::String& message);
 
-    // Project folder
-    juce::File currentProjectFolder;
+    AudioEngine engine;
+    Project project { engine };
+
+    std::unique_ptr<ArrangeView> arrange;
+    std::unique_ptr<TransportBar> transport;
+    std::unique_ptr<MixerPanel> mixer;
+    std::unique_ptr<juce::MenuBarComponent> menuBar;   // non-mac only
+    juce::TooltipWindow tooltips { this, 600 };
+    std::shared_ptr<juce::FileChooser> chooser;
+
+    bool mixerVisible = false;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(MainComponent)
 };

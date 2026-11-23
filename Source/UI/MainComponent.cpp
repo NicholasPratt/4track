@@ -1,739 +1,673 @@
 #include "MainComponent.h"
 #include "AudioSettingsDialog.h"
-#include "../Audio/TrackManager.h"
+
+namespace
+{
+    juce::File projectsRoot()
+    {
+        return juce::File::getSpecialLocation(juce::File::userDocumentsDirectory).getChildFile("8track-projects");
+    }
+
+    /** Buttons and sliders shouldn't take keyboard focus, so Space etc. always reach the shortcuts. */
+    void disableFocus(juce::Component& c)
+    {
+        for (auto* child : c.getChildren())
+        {
+            if (dynamic_cast<juce::TextEditor*>(child) == nullptr)
+            {
+                child->setWantsKeyboardFocus(false);
+                child->setMouseClickGrabsKeyboardFocus(false);
+            }
+            disableFocus(*child);
+        }
+    }
+}
 
 MainComponent::MainComponent()
 {
-    // Create audio engine
-    audioEngine = std::make_unique<AudioEngine>();
+    arrange = std::make_unique<ArrangeView>(engine, project);
+    transport = std::make_unique<TransportBar>(engine, project, arrange->getView());
+    mixer = std::make_unique<MixerPanel>(engine, project);
 
-    // Title label
-    titleLabel.setText("4-TRACK RECORDER", juce::dontSendNotification);
-    titleLabel.setFont(juce::Font(28.0f, juce::Font::bold));
-    titleLabel.setJustificationType(juce::Justification::centred);
-    titleLabel.setColour(juce::Label::textColourId, juce::Colours::white);
-    addAndMakeVisible(titleLabel);
+    addAndMakeVisible(*transport);
+    addAndMakeVisible(*arrange);
+    addChildComponent(*mixer);
 
-    // Version label
-    versionLabel.setText("v" APP_VERSION, juce::dontSendNotification);
-    versionLabel.setFont(juce::Font(12.0f));
-    versionLabel.setJustificationType(juce::Justification::centredRight);
-    versionLabel.setColour(juce::Label::textColourId, juce::Colours::white);
-    addAndMakeVisible(versionLabel);
+    transport->onPlay = [this] { if (engine.getState() == AudioEngine::State::Stopped) engine.play(); };
+    transport->onStop = [this] { engine.stop(); };
+    transport->onRecord = [this] { toggleRecord(); };
+    transport->onToStart = [this] { perform(cmdToStart); };
+    transport->onZoomIn = [this] { arrange->zoom(0.6); };
+    transport->onZoomOut = [this] { arrange->zoom(1.0 / 0.6); };
+    transport->onToggleMixer = [this] { toggleMixer(); };
+    transport->onGridChanged = [this] { arrange->viewChanged(); };
 
-    // Settings button
-    settingsButton.setButtonText("Audio Settings");
-    settingsButton.setColour(juce::TextButton::buttonColourId, juce::Colours::darkgrey);
-    settingsButton.setColour(juce::TextButton::textColourOffId, juce::Colours::white);
-    settingsButton.addListener(this);
-    addAndMakeVisible(settingsButton);
+    project.onChanged = [this] { projectChanged(); };
+    engine.onTakesFinished = [this](std::vector<AudioEngine::FinishedTake> takes) { project.addTakes(takes); };
+    engine.addChangeListener(this);
 
-    // Save button
-    saveButton.setButtonText("Save As...");
-    saveButton.setColour(juce::TextButton::buttonColourId, juce::Colours::darkgreen);
-    saveButton.setColour(juce::TextButton::textColourOffId, juce::Colours::white);
-    saveButton.addListener(this);
-    addAndMakeVisible(saveButton);
+#if JUCE_MAC
+    juce::MenuBarModel::setMacMainMenu(this);
+#else
+    menuBar = std::make_unique<juce::MenuBarComponent>(this);
+    addAndMakeVisible(*menuBar);
+#endif
 
-    // Load button
-    loadButton.setButtonText("Load Project");
-    loadButton.setColour(juce::TextButton::buttonColourId, juce::Colours::darkblue);
-    loadButton.setColour(juce::TextButton::textColourOffId, juce::Colours::white);
-    loadButton.addListener(this);
-    addAndMakeVisible(loadButton);
-
-    // New Project button
-    newButton.setButtonText("New");
-    newButton.setColour(juce::TextButton::buttonColourId, juce::Colours::darkred);
-    newButton.setColour(juce::TextButton::textColourOffId, juce::Colours::white);
-    newButton.addListener(this);
-    addAndMakeVisible(newButton);
-
-    // Render button
-    renderButton.setButtonText("Render");
-    renderButton.setColour(juce::TextButton::buttonColourId, juce::Colours::purple);
-    renderButton.setColour(juce::TextButton::textColourOffId, juce::Colours::white);
-    renderButton.addListener(this);
-    addAndMakeVisible(renderButton);
-
-    // Create 4 track strips
-    auto* trackManager = audioEngine->getTrackManager();
-    for (int i = 0; i < 4; ++i)
-    {
-        trackStrips[i] = std::make_unique<TrackStrip>(trackManager->getTrack(i));
-        addAndMakeVisible(*trackStrips[i]);
-    }
-
-    // Create transport bar
-    transportBar = std::make_unique<TransportBar>(
-        audioEngine->getTransport(),
-        audioEngine->getTrackManager(),
-        audioEngine->getSampleRate()
-    );
-    addAndMakeVisible(*transportBar);
-
-    // Listen for device changes
-    audioEngine->getDeviceChangeBroadcaster().addChangeListener(this);
-
-    // Initialize track input selectors with current device
-    updateTrackInputSelectors();
-
-    // Create default project folder
-    createProjectFolderIfNeeded();
-
-    // Listen for transport state changes to start/stop file recording
-    audioEngine->getTransport()->onStateChanged([this](TransportController::State state)
-    {
-        if (state == TransportController::State::RECORDING)
-        {
-            // Start recording to files
-            auto projectFolder = audioEngine->getProjectFolder();
-            if (projectFolder != juce::File())
-            {
-                audioEngine->getTrackManager()->startRecordingToFiles(projectFolder);
-            }
-        }
-        else if (state == TransportController::State::PLAYING &&
-                 audioEngine->getTransport()->isPunchModeEnabled())
-        {
-            // Punch out: RECORDING → PLAYING while punch mode is on.
-            // Flush writers without reloading from file — the memory buffer
-            // already contains the full track (pre-punch + punched section).
-            audioEngine->getTrackManager()->stopRecordingToFilesForPunch();
-        }
-        else
-        {
-            // Normal stop: load the recorded files back into memory for playback
-            audioEngine->getTrackManager()->stopRecordingToFiles();
-        }
-    });
-
-    // Register as global key listener so shortcuts work regardless of focus
+    disableFocus(*this);
     setWantsKeyboardFocus(true);
 
-    setSize(1000, 700);
-}
-
-void MainComponent::parentHierarchyChanged()
-{
-    // Register as a global key listener on the top-level window so shortcuts
-    // work regardless of which child component currently has keyboard focus.
-    if (auto* topLevel = getTopLevelComponent())
-        topLevel->addKeyListener(this);
-}
-
-bool MainComponent::keyPressed(const juce::KeyPress& key, juce::Component*)
-{
-    if (!transportBar)
-        return false;
-
-    if (key == juce::KeyPress('['))
-    {
-        transportBar->setMarker(1);
-        return true;
-    }
-    if (key == juce::KeyPress(']'))
-    {
-        transportBar->setMarker(2);
-        return true;
-    }
-    if (key.getKeyCode() == 'P' || key.getKeyCode() == 'p')
-    {
-        transportBar->togglePunchMode();
-        return true;
-    }
-    return false;
+    arrange->setInputNames(engine.getActiveInputNames());
+    setSize(1320, 820);
+    startTimerHz(30);
 }
 
 MainComponent::~MainComponent()
 {
-    // Unregister key listener
-    if (auto* topLevel = getTopLevelComponent())
-        topLevel->removeKeyListener(this);
+    stopTimer();
+#if JUCE_MAC
+    juce::MenuBarModel::setMacMainMenu(nullptr);
+#endif
+    if (auto* top = getTopLevelComponent())
+        top->removeKeyListener(this);
+    engine.removeChangeListener(this);
+    if (engine.getState() != AudioEngine::State::Stopped)
+        engine.stop();
+}
 
-    // Auto-save on exit
-    autoSaveTracks();
-
-    if (audioEngine)
-        audioEngine->getDeviceChangeBroadcaster().removeChangeListener(this);
-
-    settingsButton.removeListener(this);
-    newButton.removeListener(this);
-    saveButton.removeListener(this);
-    loadButton.removeListener(this);
-    renderButton.removeListener(this);
-    transportBar.reset();
-    for (auto& strip : trackStrips)
-        strip.reset();
-    audioEngine.reset();
+void MainComponent::parentHierarchyChanged()
+{
+    if (auto* top = getTopLevelComponent())
+        top->addKeyListener(this);
 }
 
 void MainComponent::paint(juce::Graphics& g)
 {
-    // Black background
-    g.fillAll(juce::Colours::black);
-
-    // White border around everything
-    g.setColour(juce::Colours::white);
-    g.drawRect(getLocalBounds(), 3);
+    g.fillAll(Theme::bg);
 }
 
 void MainComponent::resized()
 {
-    auto bounds = getLocalBounds().reduced(10);
+    auto r = getLocalBounds();
+    if (menuBar != nullptr)
+        menuBar->setBounds(r.removeFromTop(24));
+    transport->setBounds(r.removeFromTop(52));
+    if (mixerVisible)
+        mixer->setBounds(r.removeFromBottom(MixerPanel::kHeight));
+    arrange->setBounds(r);
+}
 
-    // Title at top
-    auto titleArea = bounds.removeFromTop(50);
-    titleLabel.setBounds(titleArea.removeFromLeft(titleArea.getWidth() - 520));
-    newButton.setBounds(titleArea.removeFromLeft(60).reduced(2));
-    saveButton.setBounds(titleArea.removeFromLeft(80).reduced(2));
-    loadButton.setBounds(titleArea.removeFromLeft(80).reduced(2));
-    renderButton.setBounds(titleArea.removeFromLeft(70).reduced(2));
-    settingsButton.setBounds(titleArea.removeFromLeft(110).reduced(2));
-    versionLabel.setBounds(titleArea);
-
-    bounds.removeFromTop(10); // spacing
-
-    // Transport bar at top
-    transportBar->setBounds(bounds.removeFromTop(70).reduced(5));
-
-    bounds.removeFromTop(10); // spacing
-
-    // 4 track strips side by side
-    auto trackArea = bounds;
-    auto trackWidth = trackArea.getWidth() / 4;
-
-    for (int i = 0; i < 4; ++i)
+//==============================================================================
+void MainComponent::timerCallback()
+{
+    for (int t = 0; t < kNumTracks; ++t)
     {
-        trackStrips[i]->setBounds(trackArea.removeFromLeft(trackWidth).reduced(5));
+        auto& p = engine.getTrack(t);
+        const float l = p.peakL.exchange(0.0f), r = p.peakR.exchange(0.0f);
+        arrange->setMeter(t, l, r);
+        if (mixerVisible)
+            mixer->setMeter(t, l, r);
+    }
+
+    auto& m = engine.getMaster();
+    const float ml = m.peakL.exchange(0.0f), mr = m.peakR.exchange(0.0f);
+    transport->setMasterPeaks(ml, mr);
+    if (mixerVisible)
+    {
+        mixer->setMasterMeter(ml, mr);
+        mixer->refresh();
+    }
+
+    transport->tick();
+    arrange->tick();
+
+    if (auto* window = findParentComponentOfClass<juce::DocumentWindow>())
+    {
+        const auto title = project.getName() + (project.isDirty() ? " (edited)" : "") + " - 8track";
+        if (window->getName() != title)
+            window->setName(title);
     }
 }
 
-void MainComponent::buttonClicked(juce::Button* button)
+void MainComponent::changeListenerCallback(juce::ChangeBroadcaster*)
 {
-    if (button == &settingsButton)
-    {
-        showAudioSettingsDialog();
-    }
-    else if (button == &newButton)
-    {
-        newProject();
-    }
-    else if (button == &saveButton)
-    {
-        saveProject();
-    }
-    else if (button == &loadButton)
-    {
-        loadProject();
-    }
-    else if (button == &renderButton)
-    {
-        renderProject();
-    }
+    // Audio device changed (or started)
+    arrange->setInputNames(engine.getActiveInputNames());
+    project.handleSampleRateChange();
+    arrange->viewChanged();
 }
 
-void MainComponent::showAudioSettingsDialog()
+void MainComponent::projectChanged()
 {
-    auto dialogContent = std::make_unique<AudioSettingsDialog>(audioEngine->getDeviceManager());
-
-    juce::DialogWindow::LaunchOptions options;
-    options.content.set(dialogContent.release(), true);
-    options.dialogTitle = "Audio Settings";
-    options.dialogBackgroundColour = juce::Colours::black;
-    options.escapeKeyTriggersCloseButton = true;
-    options.useNativeTitleBar = true;
-    options.resizable = false;
-
-    options.launchAsync();
+    arrange->projectChanged();
+    transport->refresh();
+    mixer->refresh();
+    menuItemsChanged();
 }
 
-void MainComponent::changeListenerCallback(juce::ChangeBroadcaster* source)
+void MainComponent::showError(const juce::String& title, const juce::String& message)
 {
-    if (source == &audioEngine->getDeviceChangeBroadcaster())
+    juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::WarningIcon, title, message);
+}
+
+//==============================================================================
+void MainComponent::togglePlay()
+{
+    if (engine.getState() == AudioEngine::State::Stopped)
+        engine.play();
+    else
+        engine.stop();
+}
+
+void MainComponent::toggleRecord()
+{
+    if (engine.getState() == AudioEngine::State::Recording)
     {
-        // Audio device changed, update track input selectors and transport bar sample rate
-        updateTrackInputSelectors();
-
-        if (transportBar)
-        {
-            transportBar->setSampleRate(audioEngine->getSampleRate());
-            juce::Logger::writeToLog("Updated transport bar sample rate: " + juce::String(audioEngine->getSampleRate()));
-        }
-    }
-}
-
-void MainComponent::updateTrackInputSelectors()
-{
-    if (!audioEngine)
+        engine.stop();
         return;
-
-    int numInputs = audioEngine->getNumInputChannels();
-
-    juce::Logger::writeToLog("Updating track input selectors with " + juce::String(numInputs) + " inputs");
-
-    for (auto& strip : trackStrips)
-    {
-        if (strip)
-            strip->updateInputChannelOptions(numInputs);
     }
+
+    juce::String error;
+    if (!engine.record(project.getAudioFolder(), error))
+        showError("Can't record", error);
 }
 
-juce::File MainComponent::getProjectFolder()
+void MainComponent::splitSelection()
 {
-    if (currentProjectFolder == juce::File())
+    const auto playhead = engine.getPosition();
+    auto ids = arrange->getLanes().getSelection();
+
+    // Nothing selected: split whatever is under the playhead on the selected track.
+    if (ids.empty())
+        for (auto& c : project.getArrangement().tracks[(size_t) arrange->getSelectedTrack()])
+            if (playhead > c.start && playhead < c.end())
+                ids.insert(c.id);
+
+    project.perform([ids, playhead](Arrangement& a)
     {
-        // Use a single "Current" folder that gets reused for each session
-        // Files are overwritten until user explicitly saves to a new directory
-        currentProjectFolder = juce::File::getSpecialLocation(juce::File::userDocumentsDirectory)
-                                   .getChildFile("4track-projects")
-                                   .getChildFile("Current");
-    }
-    return currentProjectFolder;
-}
-
-void MainComponent::createProjectFolderIfNeeded()
-{
-    // Always use the canonical scratch folder — never derive from currentProjectFolder
-    // which may have been changed by loadProject() to point at a user-chosen directory.
-    juce::File projectFolder = juce::File::getSpecialLocation(juce::File::userDocumentsDirectory)
-                                   .getChildFile("4track-projects")
-                                   .getChildFile("Current");
-
-    bool folderCreated = false;
-
-    if (!projectFolder.exists())
-    {
-        projectFolder.createDirectory();
-        juce::Logger::writeToLog("Created project folder: " + projectFolder.getFullPathName());
-        folderCreated = true;
-    }
-
-    // Keep currentProjectFolder and AudioEngine in sync with the scratch folder
-    currentProjectFolder = projectFolder;
-    if (audioEngine)
-    {
-        audioEngine->setProjectFolder(projectFolder);
-    }
-
-    // Do NOT auto-load audio files here.  The scratch folder is purely a working
-    // directory for recording; restoring a session is an explicit user action via
-    // "Load Project".  Auto-loading caused old audio to persist across new-project
-    // requests because files in Current/ were reloaded every time the app started.
-    juce::ignoreUnused(folderCreated);
-}
-
-void MainComponent::saveProject()
-{
-    if (!audioEngine)
-        return;
-
-    // Let user choose a new directory to save to
-    auto chooser = std::make_shared<juce::FileChooser>("Save Project As...",
-                                                        juce::File::getSpecialLocation(juce::File::userDocumentsDirectory)
-                                                            .getChildFile("4track-projects"),
-                                                        "",
-                                                        true);
-
-    auto chooserFlags = juce::FileBrowserComponent::saveMode | juce::FileBrowserComponent::canSelectDirectories;
-
-    chooser->launchAsync(chooserFlags, [this, chooser](const juce::FileChooser&)
-    {
-        auto result = chooser->getResult();
-        if (result == juce::File())
-            return; // User cancelled
-
-        // Create the target directory
-        if (!result.exists())
-            result.createDirectory();
-
-        // Copy all track files to the new location
-        auto currentFolder = audioEngine->getProjectFolder();
-
-        for (int i = 0; i < 4; ++i)
-        {
-            juce::File sourceFile = currentFolder.getChildFile("Track" + juce::String(i + 1) + ".wav");
-            juce::File destFile = result.getChildFile("Track" + juce::String(i + 1) + ".wav");
-
-            if (sourceFile.existsAsFile())
-            {
-                sourceFile.copyFileTo(destFile);
-                juce::Logger::writeToLog("Saved " + destFile.getFileName() + " to " + result.getFullPathName());
-            }
-        }
-
-        juce::NativeMessageBox::showMessageBoxAsync(
-            juce::AlertWindow::InfoIcon,
-            "Project Saved",
-            "Project saved to:\n" + result.getFullPathName(),
-            nullptr);
+        bool any = false;
+        for (auto id : ids)
+            any = a.splitClip(id, playhead) || any;
+        return any;
     });
 }
 
-void MainComponent::loadProject()
+void MainComponent::deleteSelection()
 {
-    if (!audioEngine)
-        return;
-
-    auto chooser = std::make_shared<juce::FileChooser>("Select Project Folder",
-                                                        juce::File::getSpecialLocation(juce::File::userDocumentsDirectory).getChildFile("4track-projects"));
-
-    auto chooserFlags = juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectDirectories;
-
-    chooser->launchAsync(chooserFlags, [this, chooser](const juce::FileChooser&)
+    auto ids = arrange->getLanes().getSelection();
+    project.perform([ids](Arrangement& a)
     {
-        juce::File selectedFolder = chooser->getResult();
-
-        if (selectedFolder == juce::File() || !selectedFolder.isDirectory())
-            return;
-
-        currentProjectFolder = selectedFolder;
-
-        auto* trackManager = audioEngine->getTrackManager();
-
-        // Stop transport and clear all tracks before loading so no stale audio remains
-        audioEngine->getTransport()->stop();
-        for (int i = 0; i < 4; ++i)
-        {
-            auto* track = trackManager->getTrack(i);
-            if (track)
-                track->clearBuffer();
-        }
-
-        for (int i = 0; i < 4; ++i)
-        {
-            juce::File trackFile = currentProjectFolder.getChildFile("Track" + juce::String(i + 1) + ".wav");
-
-            if (trackFile.existsAsFile())
-            {
-                auto* track = trackManager->getTrack(i);
-                if (track)
-                {
-                    track->loadFromFile(trackFile);
-                }
-            }
-        }
-
-        // Reset to beginning after loading
-        audioEngine->getTransport()->stop();
-
-        juce::NativeMessageBox::showMessageBoxAsync(
-            juce::AlertWindow::InfoIcon,
-            "Project Loaded",
-            "Project loaded from:\n" + currentProjectFolder.getFullPathName(),
-            nullptr);
+        bool any = false;
+        for (auto id : ids)
+            any = a.removeClip(id) || any;
+        return any;
     });
+    arrange->getLanes().clearSelection();
 }
 
-void MainComponent::autoSaveTracks()
+void MainComponent::setPunchPoint(bool in)
 {
-    if (!audioEngine)
-        return;
+    auto pos = engine.getPosition();
+    if (arrange->getView().snapOn)
+        pos = Grid::make(engine, arrange->getView()).snap(pos);
 
-    createProjectFolderIfNeeded();
-
-    auto* trackManager = audioEngine->getTrackManager();
-    double sampleRate = audioEngine->getSampleRate();
-
-    int savedCount = 0;
-
-    for (int i = 0; i < 4; ++i)
+    if (in)
     {
-        auto* track = trackManager->getTrack(i);
-        if (track && track->hasRecordedAudio())
-        {
-            juce::File trackFile = currentProjectFolder.getChildFile("Track" + juce::String(i + 1) + ".wav");
-            if (track->saveToFile(trackFile, sampleRate))
-            {
-                savedCount++;
-            }
-        }
-    }
-
-    if (savedCount > 0)
-    {
-        juce::Logger::writeToLog("Auto-saved " + juce::String(savedCount) + " track(s) to " + currentProjectFolder.getFullPathName());
-    }
-}
-
-void MainComponent::newProject()
-{
-    if (!audioEngine)
-        return;
-
-    auto* trackManager = audioEngine->getTrackManager();
-
-    // Check whether there is any recorded audio to warn about
-    bool hasAudio = false;
-    for (int i = 0; i < 4; ++i)
-    {
-        auto* track = trackManager->getTrack(i);
-        if (track && track->hasRecordedAudio())
-        {
-            hasAudio = true;
-            break;
-        }
-    }
-
-    if (hasAudio)
-    {
-        int choice = juce::AlertWindow::showYesNoCancelBox(
-            juce::MessageBoxIconType::WarningIcon,
-            "New Project",
-            "You have recorded audio in the current session.\n\n"
-            "Starting a new project will permanently delete all track audio files from disk. "
-            "This cannot be undone.\n\n"
-            "Save your project first if you want to keep this session.",
-            "Save First",
-            "Discard & New",
-            "Cancel",
-            nullptr, nullptr);
-
-        if (choice == 0)
-            return; // Cancel
-
-        if (choice == 1)
-        {
-            // Save first — user clicks New again after saving
-            saveProject();
-            return;
-        }
-        // choice == 2: Discard & New — fall through
-    }
-
-    // The scratch folder is always .../4track-projects/Current.
-    // Construct the path directly rather than trusting stored pointers —
-    // audioEngine->getProjectFolder() and currentProjectFolder can drift
-    // (e.g. after loadProject() points them at a user-chosen directory).
-    juce::File scratchFolder = juce::File::getSpecialLocation(juce::File::userDocumentsDirectory)
-                                   .getChildFile("4track-projects")
-                                   .getChildFile("Current");
-
-    juce::Logger::writeToLog("NEW PROJECT: scratch folder = " + scratchFolder.getFullPathName());
-
-    // 1. Stop transport first. If we were recording this fires stateChangedCallback
-    //    → stopRecordingToFiles() → loadFromFile(), reloading audio into memory.
-    //    That is fine — we clear the buffers in step 3 after the callback completes.
-    audioEngine->getTransport()->stop();
-
-    // Resync both folder pointers to the scratch folder now that stop has completed.
-    audioEngine->setProjectFolder(scratchFolder);
-    currentProjectFolder = scratchFolder;
-
-    // 2. Delete ALL WAV files from the scratch folder.
-    if (scratchFolder.isDirectory())
-    {
-        auto files = scratchFolder.findChildFiles(juce::File::findFiles, false, "*.wav");
-        juce::Logger::writeToLog("NEW PROJECT: found " + juce::String(files.size()) + " WAV(s) to delete");
-        for (auto& f : files)
-        {
-            bool ok = f.deleteFile();
-            juce::Logger::writeToLog(juce::String("NEW PROJECT: ") + (ok ? "deleted " : "FAILED to delete ") + f.getFullPathName());
-        }
+        engine.punchIn = pos;
+        if (engine.punchOut.load() <= pos)
+            engine.punchOut = pos + engine.getSamplesPerBar() * 2;
     }
     else
     {
-        juce::Logger::writeToLog("NEW PROJECT: scratch folder does not exist, nothing to delete");
-        scratchFolder.createDirectory();
+        engine.punchOut = pos;
+        if (engine.punchIn.load() >= pos)
+            engine.punchIn = juce::jmax<juce::int64>(0, pos - engine.getSamplesPerBar() * 2);
     }
-
-    // 3. Clear all in-memory track data. Must happen AFTER transport->stop()
-    //    because the state-change callback may have reloaded audio into memory.
-    for (int i = 0; i < 4; ++i)
-    {
-        auto* track = trackManager->getTrack(i);
-        if (track)
-        {
-            track->clearBuffer();
-            track->setRecordArmed(false);
-            track->setMuted(false);
-            track->setSolo(false);
-        }
-    }
-
-    // Sync UI button states
-    for (auto& strip : trackStrips)
-    {
-        if (strip)
-            strip->resetUI();
-    }
-
-    juce::Logger::writeToLog("New project created - all tracks cleared");
+    engine.punchOn = true;
+    project.markDirty();
+    arrange->viewChanged();
 }
 
-void MainComponent::renderProject()
+void MainComponent::toggleMixer()
 {
-    if (!audioEngine)
-        return;
+    mixerVisible = !mixerVisible;
+    mixer->setVisible(mixerVisible);
+    transport->setMixerVisible(mixerVisible);
+    resized();
+}
 
-    auto* trackManager = audioEngine->getTrackManager();
-    double sampleRate = audioEngine->getSampleRate();
+//==============================================================================
+void MainComponent::perform(int command)
+{
+    const bool stopped = engine.getState() == AudioEngine::State::Stopped;
 
-    // Find the longest track to determine render length
-    int maxLength = 0;
-    bool hasAudio = false;
-
-    for (int i = 0; i < 4; ++i)
+    switch (command)
     {
-        auto* track = trackManager->getTrack(i);
-        if (track && track->hasRecordedAudio())
+        case cmdNew:      confirmDiscard([this] { project.newProject(); arrange->zoomToFit(); }); break;
+        case cmdOpen:     confirmDiscard([this] { openProject(); }); break;
+        case cmdSave:     saveProject(project.isUntitled()); break;
+        case cmdSaveAs:   saveProject(true); break;
+        case cmdImport:   importAudio(); break;
+        case cmdExport:   exportMix(); break;
+        case cmdAudioSettings: showAudioSettings(); break;
+
+        case cmdUndo:     if (stopped) project.undo(); break;
+        case cmdRedo:     if (stopped) project.redo(); break;
+        case cmdSplit:    splitSelection(); break;
+        case cmdDelete:   deleteSelection(); break;
+        case cmdSelectAll: arrange->getLanes().selectAll(); break;
+
+        case cmdPlayStop: togglePlay(); break;
+        case cmdRecord:   toggleRecord(); break;
+        case cmdToStart:
+            if (engine.getState() == AudioEngine::State::Recording) break;
+            if (!stopped) engine.stop();
+            engine.setPosition(0);
+            arrange->getView().viewStart = 0.0;
+            arrange->viewChanged();
+            break;
+        case cmdPunch:
+            if (engine.punchOut.load() > engine.punchIn.load())
+                engine.punchOn = !engine.punchOn.load();
+            else
+                setPunchPoint(true);
+            project.markDirty();
+            arrange->viewChanged();
+            break;
+        case cmdPunchIn:  setPunchPoint(true); break;
+        case cmdPunchOut: setPunchPoint(false); break;
+        case cmdClick:    engine.metronomeOn = !engine.metronomeOn.load(); project.markDirty(); break;
+        case cmdCountIn:  engine.countInOn = !engine.countInOn.load(); project.markDirty(); transport->refresh(); break;
+
+        case cmdZoomIn:   arrange->zoom(0.6); break;
+        case cmdZoomOut:  arrange->zoom(1.0 / 0.6); break;
+        case cmdZoomFit:  arrange->zoomToFit(); break;
+        case cmdMixer:    toggleMixer(); break;
+        default: break;
+    }
+    menuItemsChanged();
+}
+
+bool MainComponent::keyPressed(const juce::KeyPress& key, juce::Component* origin)
+{
+    // Let text fields have their keys.
+    if (dynamic_cast<juce::TextEditor*>(origin) != nullptr)
+        return false;
+
+    const auto mods = key.getModifiers();
+    const bool cmd = mods.isCommandDown();
+    const bool shift = mods.isShiftDown();
+    const int code = key.getKeyCode();
+    const auto ch = juce::CharacterFunctions::toLowerCase(key.getTextCharacter());
+
+    if (cmd)
+    {
+        switch (ch)
         {
-            hasAudio = true;
-            maxLength = juce::jmax(maxLength, track->getBufferLength());
+            case 'z': perform(shift ? cmdRedo : cmdUndo); return true;
+            case 'y': perform(cmdRedo); return true;
+            case 's': perform(shift ? cmdSaveAs : cmdSave); return true;
+            case 'o': perform(cmdOpen); return true;
+            case 'n': perform(cmdNew); return true;
+            case 'a': perform(cmdSelectAll); return true;
+            case 'i': perform(cmdImport); return true;
+            case 'e': perform(cmdExport); return true;
+            case ',': perform(cmdAudioSettings); return true;
+            default: break;
         }
+        return false;
     }
 
-    if (!hasAudio)
+    if (code == juce::KeyPress::spaceKey)                 { perform(cmdPlayStop); return true; }
+    if (code == juce::KeyPress::returnKey || code == juce::KeyPress::homeKey) { perform(cmdToStart); return true; }
+    if (code == juce::KeyPress::deleteKey || code == juce::KeyPress::backspaceKey) { perform(cmdDelete); return true; }
+
+    if (code == juce::KeyPress::leftKey || code == juce::KeyPress::rightKey)
     {
-        juce::NativeMessageBox::showMessageBoxAsync(
-            juce::AlertWindow::InfoIcon,
-            "Render",
-            "No audio to render. Record something first!");
+        const auto grid = Grid::make(engine, arrange->getView());
+        const auto step = (juce::int64) (shift ? grid.samplesPerBar() : grid.step);
+        const auto pos = grid.snap(engine.getPosition()) + (code == juce::KeyPress::leftKey ? -step : step);
+        engine.setPosition(juce::jmax<juce::int64>(0, pos));
+        arrange->viewChanged();
+        return true;
+    }
+
+    switch (ch)
+    {
+        case 'r': perform(cmdRecord); return true;
+        case 's': perform(cmdSplit); return true;
+        case 'p': perform(cmdPunch); return true;
+        case 'i': perform(cmdPunchIn); return true;
+        case 'o': perform(cmdPunchOut); return true;
+        case 'c': perform(cmdClick); return true;
+        case 'x': perform(cmdMixer); return true;
+        case 'z': perform(cmdZoomFit); return true;
+        case '=': case '+': perform(cmdZoomIn); return true;
+        case '-': perform(cmdZoomOut); return true;
+        default: break;
+    }
+    return false;
+}
+
+//==============================================================================
+juce::StringArray MainComponent::getMenuBarNames()
+{
+    return { "File", "Edit", "Transport", "View" };
+}
+
+juce::PopupMenu MainComponent::getMenuForIndex(int index, const juce::String&)
+{
+    auto item = [](int id, const juce::String& text, const juce::String& shortcut, bool enabled = true, bool ticked = false)
+    {
+        juce::PopupMenu::Item i(text);
+        i.itemID = id;
+        i.shortcutKeyDescription = shortcut;
+        i.isEnabled = enabled;
+        i.isTicked = ticked;
+        return i;
+    };
+
+    const bool stopped = engine.getState() == AudioEngine::State::Stopped;
+    juce::PopupMenu m;
+    switch (index)
+    {
+        case 0:
+            m.addItem(item(cmdNew, "New Project", "Cmd+N", stopped));
+            m.addItem(item(cmdOpen, "Open Project...", "Cmd+O", stopped));
+            m.addSeparator();
+            m.addItem(item(cmdSave, "Save", "Cmd+S", stopped));
+            m.addItem(item(cmdSaveAs, "Save As...", "Shift+Cmd+S", stopped));
+            m.addSeparator();
+            m.addItem(item(cmdImport, "Import Audio...", "Cmd+I", stopped));
+            m.addItem(item(cmdExport, "Export Mix...", "Cmd+E", stopped));
+            m.addSeparator();
+            m.addItem(item(cmdAudioSettings, "Audio Settings...", "Cmd+,"));
+            break;
+        case 1:
+            m.addItem(item(cmdUndo, "Undo", "Cmd+Z", stopped && project.canUndo()));
+            m.addItem(item(cmdRedo, "Redo", "Shift+Cmd+Z", stopped && project.canRedo()));
+            m.addSeparator();
+            m.addItem(item(cmdSplit, "Split at Playhead", "S"));
+            m.addItem(item(cmdDelete, "Delete", "Delete", !arrange->getLanes().getSelection().empty()));
+            m.addItem(item(cmdSelectAll, "Select All", "Cmd+A"));
+            break;
+        case 2:
+            m.addItem(item(cmdPlayStop, stopped ? "Play" : "Stop", "Space"));
+            m.addItem(item(cmdRecord, engine.getState() == AudioEngine::State::Recording ? "Stop Recording" : "Record", "R"));
+            m.addItem(item(cmdToStart, "Go to Start", "Return"));
+            m.addSeparator();
+            m.addItem(item(cmdPunch, "Punch In/Out", "P", true, engine.punchOn.load()));
+            m.addItem(item(cmdPunchIn, "Set Punch In at Playhead", "I"));
+            m.addItem(item(cmdPunchOut, "Set Punch Out at Playhead", "O"));
+            m.addSeparator();
+            m.addItem(item(cmdClick, "Metronome", "C", true, engine.metronomeOn.load()));
+            m.addItem(item(cmdCountIn, "Count-in", "", true, engine.countInOn.load()));
+            break;
+        case 3:
+            m.addItem(item(cmdZoomIn, "Zoom In", "="));
+            m.addItem(item(cmdZoomOut, "Zoom Out", "-"));
+            m.addItem(item(cmdZoomFit, "Zoom to Fit", "Z"));
+            m.addSeparator();
+            m.addItem(item(cmdMixer, "Mixer", "X", true, mixerVisible));
+            break;
+        default: break;
+    }
+    return m;
+}
+
+void MainComponent::menuItemSelected(int itemId, int)
+{
+    perform(itemId);
+}
+
+//==============================================================================
+void MainComponent::confirmDiscard(std::function<void()> proceed)
+{
+    if (!project.isDirty() || project.getArrangement().isEmpty())
+    {
+        proceed();
         return;
     }
 
-    // Let user choose output file
-    auto chooser = std::make_shared<juce::FileChooser>(
-        "Save Rendered Mix As...",
-        juce::File::getSpecialLocation(juce::File::userDocumentsDirectory).getChildFile("4track-mix.wav"),
-        "*.wav");
+    auto options = juce::MessageBoxOptions()
+                       .withIconType(juce::MessageBoxIconType::QuestionIcon)
+                       .withTitle("Save changes to \"" + project.getName() + "\"?")
+                       .withMessage("Your changes will be lost if you don't save them.")
+                       .withButton("Save")
+                       .withButton("Don't Save")
+                       .withButton("Cancel")
+                       .withAssociatedComponent(this);
 
-    auto chooserFlags = juce::FileBrowserComponent::saveMode | juce::FileBrowserComponent::canSelectFiles;
-
-    chooser->launchAsync(chooserFlags, [this, chooser, maxLength, sampleRate](const juce::FileChooser&)
+    juce::AlertWindow::showAsync(options, [this, proceed](int result)
     {
-        auto result = chooser->getResult();
-        if (result == juce::File())
-            return; // User cancelled
-
-        // Ensure .wav extension
-        if (!result.hasFileExtension(".wav"))
-            result = result.withFileExtension(".wav");
-
-        // Delete existing file
-        if (result.exists())
-            result.deleteFile();
-
-        // Create output buffer for the mix
-        juce::AudioBuffer<float> mixBuffer(2, maxLength);
-        mixBuffer.clear();
-
-        auto* trackManager = audioEngine->getTrackManager();
-
-        // Check solo state
-        bool soloActive = trackManager->anySoloEnabled();
-
-        // Mix all tracks
-        for (int i = 0; i < 4; ++i)
-        {
-            auto* track = trackManager->getTrack(i);
-            if (!track || !track->hasRecordedAudio())
-                continue;
-
-            // Skip if muted or if solo is active and this track isn't soloed
-            if (track->isMuted())
-                continue;
-            if (soloActive && !track->isSolo())
-                continue;
-
-            // Render this track into the mix
-            track->setPlaybackPosition(0);
-            track->processBlock(mixBuffer, 0, maxLength);
-        }
-
-        // Add reverb if there are sends
-        // Create reverb send buffer and process
-        juce::AudioBuffer<float> reverbSendBuffer(2, maxLength);
-        reverbSendBuffer.clear();
-
-        for (int i = 0; i < 4; ++i)
-        {
-            auto* track = trackManager->getTrack(i);
-            if (!track || !track->hasRecordedAudio())
-                continue;
-
-            if (track->isMuted())
-                continue;
-            if (soloActive && !track->isSolo())
-                continue;
-
-            float sendLevel = track->getReverbSend();
-            if (sendLevel > 0.001f)
-            {
-                track->setPlaybackPosition(0);
-                track->addToReverbSend(reverbSendBuffer, 0, maxLength, sendLevel);
-            }
-        }
-
-        // Process reverb and add to mix
-        if (reverbSendBuffer.getMagnitude(0, maxLength) > 0.0001f)
-        {
-            juce::Reverb renderReverb;
-            renderReverb.setSampleRate(sampleRate);
-
-            juce::Reverb::Parameters params;
-            params.roomSize = trackManager->getReverbRoomSize();
-            params.damping = trackManager->getReverbDamping();
-            params.wetLevel = trackManager->getReverbWetLevel();
-            params.dryLevel = 0.0f;
-            params.width = 1.0f;
-            params.freezeMode = 0.0f;
-            renderReverb.setParameters(params);
-
-            // Process reverb in chunks to handle long files
-            const int chunkSize = 512;
-            for (int pos = 0; pos < maxLength; pos += chunkSize)
-            {
-                int numSamples = juce::jmin(chunkSize, maxLength - pos);
-                renderReverb.processStereo(
-                    reverbSendBuffer.getWritePointer(0, pos),
-                    reverbSendBuffer.getWritePointer(1, pos),
-                    numSamples);
-            }
-
-            // Add reverb to mix
-            for (int ch = 0; ch < 2; ++ch)
-            {
-                mixBuffer.addFrom(ch, 0, reverbSendBuffer, ch, 0, maxLength);
-            }
-        }
-
-        // Write to WAV file
-        juce::WavAudioFormat wavFormat;
-        std::unique_ptr<juce::FileOutputStream> fileStream(result.createOutputStream());
-
-        if (fileStream == nullptr)
-        {
-            juce::NativeMessageBox::showMessageBoxAsync(
-                juce::AlertWindow::WarningIcon,
-                "Render Error",
-                "Could not create output file.");
-            return;
-        }
-
-        std::unique_ptr<juce::AudioFormatWriter> writer(
-            wavFormat.createWriterFor(fileStream.get(), sampleRate, 2, 24, {}, 0));
-
-        if (writer == nullptr)
-        {
-            juce::NativeMessageBox::showMessageBoxAsync(
-                juce::AlertWindow::WarningIcon,
-                "Render Error",
-                "Could not create WAV writer.");
-            return;
-        }
-
-        fileStream.release(); // Writer takes ownership
-
-        writer->writeFromAudioSampleBuffer(mixBuffer, 0, maxLength);
-
-        double durationSeconds = static_cast<double>(maxLength) / sampleRate;
-
-        juce::NativeMessageBox::showMessageBoxAsync(
-            juce::AlertWindow::InfoIcon,
-            "Render Complete",
-            "Rendered " + juce::String(durationSeconds, 1) + " seconds to:\n" + result.getFullPathName());
-
-        juce::Logger::writeToLog("Rendered mix to: " + result.getFullPathName());
+        if (result == 1)
+            saveProject(project.isUntitled(), [proceed](bool saved) { if (saved) proceed(); });
+        else if (result == 2)
+            proceed();
     });
 }
+
+void MainComponent::requestQuit(std::function<void()> quit)
+{
+    if (engine.getState() != AudioEngine::State::Stopped)
+        engine.stop();
+    confirmDiscard(std::move(quit));
+}
+
+void MainComponent::saveProject(bool chooseLocation, std::function<void(bool)> then)
+{
+    if (!chooseLocation)
+    {
+        juce::String error;
+        const bool ok = project.save(error);
+        if (!ok)
+            showError("Save failed", error);
+        if (then) then(ok);
+        return;
+    }
+
+    projectsRoot().createDirectory();
+    chooser = std::make_shared<juce::FileChooser>("Save project as (a folder will be created)",
+                                                  projectsRoot().getChildFile(project.isUntitled() ? "My Song" : project.getName()));
+    chooser->launchAsync(juce::FileBrowserComponent::saveMode | juce::FileBrowserComponent::canSelectFiles
+                             | juce::FileBrowserComponent::warnAboutOverwriting,
+                         [this, then](const juce::FileChooser& fc)
+    {
+        auto result = fc.getResult();
+        if (result == juce::File())
+        {
+            if (then) then(false);
+            return;
+        }
+
+        auto folder = result.withFileExtension("");
+        if (folder.existsAsFile())
+        {
+            showError("Save failed", folder.getFullPathName() + " is a file, not a folder.");
+            if (then) then(false);
+            return;
+        }
+
+        juce::String error;
+        const bool ok = project.saveAs(folder, error);
+        if (!ok)
+            showError("Save failed", error);
+        if (then) then(ok);
+    });
+}
+
+void MainComponent::openProject()
+{
+    chooser = std::make_shared<juce::FileChooser>("Open an 8track project", projectsRoot(), "*.8track;*.4track");
+    chooser->launchAsync(juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles
+                             | juce::FileBrowserComponent::canSelectDirectories,
+                         [this](const juce::FileChooser& fc)
+    {
+        auto result = fc.getResult();
+        if (result == juce::File())
+            return;
+
+        juce::String error;
+        if (!project.load(result, error))
+        {
+            showError("Couldn't open project", error);
+            return;
+        }
+        if (error.isNotEmpty())
+            showError("Project opened with problems", error);
+        arrange->zoomToFit();
+    });
+}
+
+void MainComponent::importAudio()
+{
+    chooser = std::make_shared<juce::FileChooser>("Import audio", juce::File::getSpecialLocation(juce::File::userMusicDirectory),
+                                                  "*.wav;*.aif;*.aiff;*.flac;*.ogg;*.mp3");
+    chooser->launchAsync(juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles
+                             | juce::FileBrowserComponent::canSelectMultipleItems,
+                         [this](const juce::FileChooser& fc)
+    {
+        int track = arrange->getSelectedTrack();
+        juce::StringArray errors;
+        for (auto& f : fc.getResults())
+        {
+            juce::String error;
+            if (!project.importAudio(f, track, engine.getPosition(), error))
+                errors.add(error);
+            track = juce::jmin(kNumTracks - 1, track + 1);
+        }
+        if (!errors.isEmpty())
+            showError("Import", errors.joinIntoString("\n"));
+    });
+}
+
+void MainComponent::exportMix()
+{
+    chooser = std::make_shared<juce::FileChooser>("Export mix",
+                                                  juce::File::getSpecialLocation(juce::File::userDocumentsDirectory)
+                                                      .getChildFile(project.getName() + ".wav"),
+                                                  "*.wav");
+    chooser->launchAsync(juce::FileBrowserComponent::saveMode | juce::FileBrowserComponent::canSelectFiles
+                             | juce::FileBrowserComponent::warnAboutOverwriting,
+                         [this](const juce::FileChooser& fc)
+    {
+        auto file = fc.getResult();
+        if (file == juce::File())
+            return;
+        file = file.withFileExtension(".wav");
+
+        juce::String error;
+        if (!project.exportMix(file, error))
+            showError("Export failed", error);
+        else
+            file.revealToUser();
+    });
+}
+
+void MainComponent::showAudioSettings()
+{
+    juce::DialogWindow::LaunchOptions options;
+    options.content.setOwned(new AudioSettingsDialog(engine.getDeviceManager()));
+    options.dialogTitle = "Audio Settings";
+    options.dialogBackgroundColour = Theme::panel;
+    options.escapeKeyTriggersCloseButton = true;
+    options.useNativeTitleBar = true;
+    options.resizable = false;
+    options.launchAsync();
+}
+
+#if JUCE_DEBUG
+void MainComponent::runDebugSnapshot(const juce::StringArray& args)
+{
+    juce::File output;
+    int track = 0;
+    for (int i = 0; i < args.size(); ++i)
+    {
+        if (args[i] == "--snapshot" && i + 1 < args.size())
+            output = juce::File(args[++i]);
+        else if (args[i] == "--import" && i + 1 < args.size())
+        {
+            juce::String error;
+            const auto at = (juce::int64) (engine.getSamplesPerBar() * track);
+            if (!project.importAudio(juce::File(args[++i]), track, at, error))
+                DBG(error);
+            ++track;
+        }
+        else if (args[i] == "--mixer" && !mixerVisible)
+            toggleMixer();
+    }
+
+    engine.punchIn = engine.getSamplesPerBar() * 2;
+    engine.punchOut = engine.getSamplesPerBar() * 4;
+    engine.punchOn = true;
+    engine.setPosition(engine.getSamplesPerBar() * 3);
+    arrange->zoomToFit();
+    if (!project.getArrangement().tracks[0].empty())
+    {
+        arrange->getLanes().selectAll();
+        arrange->getLanes().clearSelection();
+    }
+
+    juce::Timer::callAfterDelay(1200, [this, output]
+    {
+        auto image = createComponentSnapshot(getLocalBounds(), true, 2.0f);
+        output.deleteFile();
+        juce::FileOutputStream stream(output);
+        juce::PNGImageFormat().writeImageToStream(image, stream);
+        stream.flush();
+        juce::JUCEApplication::getInstance()->quit();
+    });
+}
+
+void MainComponent::runDiagnostics()
+{
+    juce::Timer::callAfterDelay(1500, [this]
+    {
+        auto& dm = engine.getDeviceManager();
+        auto setup = dm.getAudioDeviceSetup();
+        std::cout << "device type:   " << dm.getCurrentAudioDeviceType() << "\n"
+                  << "input device:  '" << setup.inputDeviceName << "'\n"
+                  << "output device: '" << setup.outputDeviceName << "'\n";
+
+        auto* device = dm.getCurrentAudioDevice();
+        if (device == nullptr)
+        {
+            std::cout << "NO DEVICE OPEN" << std::endl;
+            juce::JUCEApplication::getInstance()->quit();
+            return;
+        }
+        std::cout << "open device:   '" << device->getName() << "' running=" << device->isPlaying()
+                  << " sr=" << device->getCurrentSampleRate() << " block=" << device->getCurrentBufferSizeSamples() << "\n"
+                  << "input chans available: " << device->getInputChannelNames().joinIntoString(", ") << "\n"
+                  << "active input bits: " << device->getActiveInputChannels().toString(2) << "\n"
+                  << "active names: " << engine.getActiveInputNames().joinIntoString(", ") << "\n"
+                  << "latency in/out: " << device->getInputLatencyInSamples() << "/" << device->getOutputLatencyInSamples() << std::endl;
+
+        // Arm one track per active input (monitoring off) and watch the meters.
+        const int numIns = juce::jmin(kNumTracks, engine.getActiveInputNames().size());
+        for (int t = 0; t < numIns; ++t)
+        {
+            engine.getTrack(t).inputType = (int) InputType::Mono;
+            engine.getTrack(t).inputChannel = t;
+            engine.getTrack(t).monitor = (int) MonitorMode::Off;
+            engine.getTrack(t).armed = true;
+        }
+        stopTimer();   // keep the UI timer from draining the meters
+
+        auto peaks = std::make_shared<std::vector<float>>((size_t) juce::jmax(1, numIns), 0.0f);
+        for (int i = 1; i <= 30; ++i)
+            juce::Timer::callAfterDelay(i * 100, [this, peaks, numIns, i]
+            {
+                for (int t = 0; t < numIns; ++t)
+                    (*peaks)[(size_t) t] = juce::jmax((*peaks)[(size_t) t], engine.getTrack(t).peakL.exchange(0.0f));
+                if (i == 30)
+                {
+                    for (int t = 0; t < numIns; ++t)
+                        std::cout << "input " << t + 1 << " peak over 3s: " << (*peaks)[(size_t) t]
+                                  << " (" << juce::Decibels::gainToDecibels((*peaks)[(size_t) t], -120.0f) << " dB)\n";
+                    std::cout << std::flush;
+                    juce::JUCEApplication::getInstance()->quit();
+                }
+            });
+    });
+}
+#endif

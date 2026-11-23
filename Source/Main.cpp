@@ -1,74 +1,61 @@
 #include <juce_gui_extra/juce_gui_extra.h>
 #include "UI/MainComponent.h"
 
-class FourTrackApplication : public juce::JUCEApplication
+class EightTrackApplication : public juce::JUCEApplication
 {
 public:
-    FourTrackApplication() {}
+    const juce::String getApplicationName() override { return JUCE_APPLICATION_NAME_STRING; }
+    const juce::String getApplicationVersion() override { return JUCE_APPLICATION_VERSION_STRING; }
+    bool moreThanOneInstanceAllowed() override { return false; }
 
-    const juce::String getApplicationName() override { return "4Track Recorder"; }
-    const juce::String getApplicationVersion() override { return "1.0.0"; }
-    bool moreThanOneInstanceAllowed() override { return true; }
-
-    void initialise(const juce::String& commandLine) override
+    void initialise(const juce::String&) override
     {
-        juce::ignoreUnused(commandLine);
+        juce::LookAndFeel::setDefaultLookAndFeel(&lookAndFeel);
+        mainWindow = std::make_unique<MainWindow>(getApplicationName());
 
-        // Set up file logging - use Documents folder which we know works
-        auto logFile = juce::File::getSpecialLocation(juce::File::userDocumentsDirectory)
-                          .getChildFile("4track-debug.log");
-
-        fileLogger = std::make_unique<juce::FileLogger>(logFile, "4Track Recorder Log", 1024 * 1024);
-        juce::Logger::setCurrentLogger(fileLogger.get());
-
-        juce::Logger::writeToLog("========================================");
-        juce::Logger::writeToLog("4Track Recorder v0.5.0 Starting");
-        juce::Logger::writeToLog("Log file: " + logFile.getFullPathName());
-        juce::Logger::writeToLog("========================================");
-
-        // Also output to stderr for debugging
-        std::cerr << "4Track starting - log file: " << logFile.getFullPathName().toStdString() << std::endl;
-
-        mainWindow.reset(new MainWindow(getApplicationName()));
+       #if JUCE_DEBUG
+        const auto args = getCommandLineParameterArray();
+        if (args.contains("--snapshot"))
+            if (auto* content = dynamic_cast<MainComponent*>(mainWindow->getContentComponent()))
+                content->runDebugSnapshot(args);
+        if (args.contains("--diagnose"))
+            if (auto* content = dynamic_cast<MainComponent*>(mainWindow->getContentComponent()))
+                content->runDiagnostics();
+       #endif
     }
 
     void shutdown() override
     {
-        juce::Logger::writeToLog("4Track Recorder Shutting Down");
         mainWindow = nullptr;
-        juce::Logger::setCurrentLogger(nullptr);
-        fileLogger = nullptr;
+        juce::LookAndFeel::setDefaultLookAndFeel(nullptr);
     }
 
     void systemRequestedQuit() override
     {
-        quit();
+        if (mainWindow == nullptr)
+        {
+            quit();
+            return;
+        }
+        if (auto* content = dynamic_cast<MainComponent*>(mainWindow->getContentComponent()))
+            content->requestQuit([] { JUCEApplication::getInstance()->quit(); });
+        else
+            quit();
     }
 
-    void anotherInstanceStarted(const juce::String& commandLine) override
-    {
-        juce::ignoreUnused(commandLine);
-    }
+    void anotherInstanceStarted(const juce::String&) override {}
 
     class MainWindow : public juce::DocumentWindow
     {
     public:
-        MainWindow(juce::String name)
-            : DocumentWindow(name,
-                juce::Desktop::getInstance().getDefaultLookAndFeel()
-                    .findColour(juce::ResizableWindow::backgroundColourId),
-                DocumentWindow::allButtons)
+        explicit MainWindow(const juce::String& name)
+            : DocumentWindow(name, Theme::bg, DocumentWindow::allButtons)
         {
             setUsingNativeTitleBar(true);
             setContentOwned(new MainComponent(), true);
-
-#if JUCE_IOS || JUCE_ANDROID
-            setFullScreen(true);
-#else
             setResizable(true, true);
+            setResizeLimits(1200, 560, 10000, 10000);
             centreWithSize(getWidth(), getHeight());
-#endif
-
             setVisible(true);
         }
 
@@ -82,8 +69,8 @@ public:
     };
 
 private:
+    DawLookAndFeel lookAndFeel;
     std::unique_ptr<MainWindow> mainWindow;
-    std::unique_ptr<juce::FileLogger> fileLogger;
 };
 
-START_JUCE_APPLICATION(FourTrackApplication)
+START_JUCE_APPLICATION(EightTrackApplication)

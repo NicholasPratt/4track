@@ -1,103 +1,62 @@
-# 4track - Vintage 4-Track Tape Recorder
+# 8track
 
-A cross-platform desktop audio recorder inspired by classic 4-track tape recorders, built with C++ and JUCE.
+An 8-track recorder with clip-based, non-destructive editing, built with C++ and JUCE.
 
 ## Features
 
-- **4 Independent Tracks** - Record and playback on 4 separate tracks simultaneously
-- **Vintage UI** - Minimal black and white interface with analog-style VU meters
-- **Transport Controls** - Play, Stop (Pause), Record, RTZ (Return to Zero), FFD (Fast Forward), RWD (Rewind)
-- **Per-Track Controls**:
-  - ARM - Arm track for recording
-  - M - Mute track
-  - S - Solo track
-  - Volume slider (vertical)
-  - Pan control (rotary knob)
-  - VU meter with needle animation
-- **Real-time Audio Processing** - Lock-free audio engine for low-latency recording and playback
+- **8 tracks** with arm, mute, solo, input monitoring (off / auto / on), and a mono, stereo or master-mix (bounce) input
+- **Clips, non-destructive.** Every recording pass is a clip pointing at its own WAV. Move, trim, split, fade, change gain, delete, with undo/redo. Recording over existing audio trims what's underneath and never touches the file.
+- **Punch in/out.** Drag a range on the lower strip of the ruler, turn Punch on, press Record. You get one bar of pre-roll, and capture starts and stops on the exact sample.
+- **Latency compensation.** Takes are shifted by the device's input + output latency, so overdubs line up with what you heard.
+- **Tempo grid** with bars/beats ruler, snapping, metronome and count-in
+- **Mixer** with low cut, high cut, mid peak EQ, a reverb send, pan, faders and dB-scaled meters; a master strip with reverb controls
+- **Projects** are folders (`project.8track` + `Audio/`). Opening one at a different sample rate converts it. Projects saved by 4track (the earlier name) still open.
+- **Export mix** renders offline through the same mixer code as playback, including the reverb tail.
 
-## Requirements
+## Keyboard
 
-- CMake 3.15+
-- C++17 compatible compiler
-- JUCE Framework v7.0.12
-- macOS (CoreAudio), Windows (ASIO), or Linux (ALSA/JACK)
+| Key | Action | Key | Action |
+|---|---|---|---|
+| Space | Play / stop (stop returns to where you started) | R | Record / stop recording |
+| Return | Go to start | ← / → | Move playhead by grid step (Shift: by bar) |
+| S | Split selected clips at the playhead | Delete | Delete selected clips |
+| P | Punch on/off | I / O | Set punch in / out at the playhead |
+| C | Metronome | X | Show/hide mixer |
+| = / - / Z | Zoom in / out / to fit | Cmd+Z / Shift+Cmd+Z | Undo / redo |
+| Cmd+S / Shift+Cmd+S | Save / Save As | Cmd+O / Cmd+N | Open / New |
+| Cmd+I / Cmd+E | Import audio / Export mix | Cmd+, | Audio settings |
+
+Mouse: drag a clip to move it (to other tracks too), drag its edges to trim, drag its top corners to fade, and right-click for more. Hold Cmd while dragging to bypass snap. Cmd+scroll or pinch to zoom. Drop audio files onto a track to import them.
 
 ## Building
 
-1. Clone JUCE framework:
+Requires CMake 3.15+, a C++17 compiler and JUCE 7.0.12 cloned into `JUCE/`:
+
 ```bash
-git clone https://github.com/juce-framework/JUCE.git
-cd JUCE
-git checkout 7.0.12
-cd ..
+git clone --branch 7.0.12 https://github.com/juce-framework/JUCE.git
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+cmake --build build
+open build/8Track_artefacts/Debug/8track.app
 ```
 
-2. Create build directory and build:
+Tests (model, mixer, file I/O, and recording driven through the audio callback without a device):
+
 ```bash
-mkdir build
-cd build
-cmake .. -DCMAKE_BUILD_TYPE=Debug
-cmake --build .
+cmake --build build --target 8TrackTests && ./build/8TrackTests_artefacts/Debug/8TrackTests
 ```
 
-3. Run the application:
-- **macOS**: `open 4Track_artefacts/Debug/4track.app`
-- **Windows**: `4Track_artefacts\Debug\4track.exe`
-- **Linux**: `./4Track_artefacts/Debug/4track`
-
-## Project Structure
+## Source layout
 
 ```
-4track/
-├── CMakeLists.txt              # Build configuration
-├── Source/
-│   ├── Main.cpp                # Entry point
-│   ├── Audio/                  # Audio engine and processing
-│   │   ├── AudioEngine.cpp     # Main audio I/O
-│   │   ├── Track.cpp           # Individual track implementation
-│   │   ├── TrackManager.cpp    # Multi-track coordination
-│   │   └── TransportController.cpp  # Transport state management
-│   └── UI/                     # User interface components
-│       ├── MainComponent.cpp   # Root UI component
-│       ├── TrackStrip.cpp      # Per-track UI strip
-│       ├── TransportBar.cpp    # Transport controls
-│       └── VUMeter.cpp         # Analog VU meter
-└── JUCE/                       # JUCE Framework (not included)
+Source/
+├── Model/      Clip, Arrangement (lanes of non-overlapping clips, edit operations), EditHistory
+├── Audio/      MixEngine (shared by playback and export), AudioEngine (device, transport, recording,
+│               monitoring, metronome), Parameters (atomics shared with the audio thread)
+├── Project/    Project (undo, save/load, import/export), AudioFileIO (WAV I/O, resampling)
+└── UI/         MainComponent, TransportBar, ArrangeView (Ruler, TrackHeader, TrackLanes), MixerPanel
+Tests/          Unit tests (juce::UnitTest)
 ```
 
-## Version History
-
-- **v0.5.0** - Audio device selection and per-track input routing
-  - Audio settings dialog with full device configuration
-  - Per-track input channel selection (mono and stereo)
-  - Dynamic input selector updates on device changes
-  - Fixed recording/playback position synchronization
-  - Fixed RTZ (Return to Zero) functionality
-  - Fixed VU meter display during recording and playback
-- **v0.4.0** - Initial release with core recording/playback functionality
-
-## Technical Details
-
-- **Sample Rate**: 44.1kHz or 48kHz (configurable via audio device)
-- **Audio Format**: 32-bit float, stereo
-- **Buffer Size**: 512 samples (adjustable)
-- **Recording Capacity**: ~5 minutes per track (expandable)
-- **VU Meter Range**: -20 dB to +3 dB
-
-## Future Enhancements
-
-- VST3/AU plugin hosting (per-track)
-- Effect sends and master bus
-- Project save/load (XML)
-- Audio file export (WAV)
-- Waveform display
-- Undo/redo support
-
-## License
-
-[Add your license here]
-
-## Credits
-
-Built with [JUCE Framework](https://juce.com/)
+The audio thread never allocates, locks or touches the disk. Recordings stream to disk through
+`AudioFormatWriter::ThreadedWriter`, and the arrangement reaches the audio thread as an immutable
+snapshot that is swapped under the device's callback lock.

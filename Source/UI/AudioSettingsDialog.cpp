@@ -32,9 +32,7 @@ AudioSettingsDialog::~AudioSettingsDialog()
 
 void AudioSettingsDialog::paint(juce::Graphics& g)
 {
-    g.fillAll(juce::Colours::black);
-    g.setColour(juce::Colours::white);
-    g.drawRect(getLocalBounds(), 2);
+    g.fillAll(findColour(juce::ResizableWindow::backgroundColourId));
 }
 
 void AudioSettingsDialog::resized()
