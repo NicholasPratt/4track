@@ -29,6 +29,7 @@ namespace te = tracktion;
 */
 class AudioEngine : public juce::ChangeBroadcaster,
                     private juce::ChangeListener,
+                    private te::TransportControl::Listener,
                     private juce::Timer
 {
 public:
@@ -121,7 +122,29 @@ public:
     std::atomic<bool> metronomeOn { false };
     std::atomic<bool> countInOn { true };
     std::atomic<bool> punchOn { false };
-    std::atomic<juce::int64> punchIn { 0 }, punchOut { 0 };
+    std::atomic<bool> loopOn { false };   // never both: use setRangeMode
+    std::atomic<juce::int64> punchIn { 0 }, punchOut { 0 };   // the range punch and loop both use
+
+    /** What the range does: nothing, limits recording to it (punch), or repeats it (loop). */
+    enum class RangeMode { Off, Punch, Loop };
+    RangeMode getRangeMode() const { return loopOn.load() ? RangeMode::Loop : punchOn.load() ? RangeMode::Punch : RangeMode::Off; }
+    void setRangeMode(RangeMode);
+    bool hasRange() const { return punchOut.load() > punchIn.load(); }
+    /** Off -> Punch -> Loop -> Off: what the Punch/Loop button steps through. */
+    static RangeMode nextRangeMode(RangeMode m) { return m == RangeMode::Off ? RangeMode::Punch : m == RangeMode::Punch ? RangeMode::Loop : RangeMode::Off; }
+
+    /** Recording in loop mode works like a looper. Started from stop, recording begins at the
+        start of the loop; started while playing, at the start of the next pass. Each pass
+        records a take, and the last complete pass is kept. Record again to finish: recording
+        stops at the end of the current pass and playback carries on, ready for the next layer
+        (on another track). MIDI passes are merged: each pass overdubs the one before. */
+    enum class LoopRecord { Off, Waiting, Recording, Finishing };
+    LoopRecord getLoopRecord() const { return loopRecord; }
+    static constexpr double kMinLoopSeconds = 2.0;   // Tracktion's shortest loop for recording
+
+    /** Of a loop recording's takes, keeps the last full pass as the clip's audio (or the first,
+        if none is complete) and drops the takes list. Called after each loop recording. */
+    void keepLastFullPass(te::WaveAudioClip&);
 
     double getSamplesPerBeat() const { return getSampleRate() * 60.0 / bpm.load(); }
     juce::int64 getSamplesPerBar() const { return (juce::int64) (getSamplesPerBeat() * beatsPerBar.load()); }
@@ -132,7 +155,8 @@ public:
     void setPosition(juce::int64 newPosition);
     void play();
     void stop();
-    /** Starts recording on the armed tracks. New takes are written into takeFolder. */
+    /** Starts recording on the armed tracks. New takes are written into takeFolder.
+        In loop mode this also moves the looper on: see LoopRecord. */
     bool record(const juce::File& takeFolder, juce::String& error);
     std::vector<LiveTake> getLiveTakes() const;
 
@@ -209,10 +233,22 @@ private:
     // Transport settings last written to the Edit
     double syncedBpm = 0;
     int syncedBeatsPerBar = 0;
-    bool syncedClick = false, syncedPunchOn = false;
+    bool syncedClick = false, syncedPunchOn = false, syncedLoopOn = false;
     juce::int64 syncedPunchIn = -1, syncedPunchOut = -1;
 
     juce::int64 returnPosition = 0;   // where stop() sends the playhead
+
+    // Looper: watches for the playhead wrapping to the loop start, often, while the looper
+    // is waiting to start or finish.
+    void checkLoopWrap();
+    void recordingFinished(te::InputDeviceInstance&, te::EditItemID, const juce::ReferenceCountedArray<te::Clip>&) override;
+    struct LoopWatcher : juce::Timer
+    {
+        std::function<void()> tick;
+        void timerCallback() override { tick(); }
+    } loopWatcher;
+    LoopRecord loopRecord = LoopRecord::Off;
+    juce::int64 lastLoopPosition = 0;
     double lastSampleRate = 0;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(AudioEngine)

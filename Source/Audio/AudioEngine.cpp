@@ -66,12 +66,14 @@ AudioEngine::AudioEngine(std::unique_ptr<te::UIBehaviour> ui)
         tracks[(size_t) t].colour = kPalette[t];
     }
 
+    loopWatcher.tick = [this] { checkLoopWrap(); };
     startTimerHz(30);
 }
 
 AudioEngine::~AudioEngine()
 {
     stopTimer();
+    loopWatcher.stopTimer();
     getDeviceManager().removeChangeListener(this);
     engine.getDeviceManager().removeChangeListener(this);
     jassert(edit == nullptr);   // Project detaches its Edit before it is destroyed
@@ -205,6 +207,9 @@ void AudioEngine::attachEdit(te::Edit* newEdit, bool freshEdit)
         return;
 
     edit->playInStopEnabled = true;   // keeps monitoring and input meters running while stopped
+    edit->getTransport().addListener(this);   // the Edit's transport goes with the Edit, so it's never removed
+    loopRecord = LoopRecord::Off;
+    loopWatcher.stopTimer();
     edit->getTransport().ensureContextAllocated();
     buildStrips();
     attachMeters();
@@ -225,6 +230,7 @@ void AudioEngine::attachEdit(te::Edit* newEdit, bool freshEdit)
         master.reverbWet = 0.33f;
         countInOn = true;
         punchOn = false;
+        loopOn = false;
         punchIn = 0;
         punchOut = 0;
     }
@@ -396,6 +402,7 @@ void AudioEngine::pullAll()
     metronomeOn = syncedClick = edit->clickTrackEnabled.get();
     countInOn = edit->getCountInMode() != te::Edit::CountIn::none;
     punchOn = syncedPunchOn = edit->recordingPunchInOut.get();
+    loopOn = syncedLoopOn = edit->getTransport().looping.get() && !punchOn.load();
     const auto loop = edit->getTransport().getLoopRange();
     punchIn = syncedPunchIn = toSamples(loop.getStart());
     punchOut = syncedPunchOut = toSamples(loop.getEnd());
@@ -527,6 +534,16 @@ void AudioEngine::syncTransportSettings()
     {
         syncedPunchOn = punchOn.load();
         edit->recordingPunchInOut = syncedPunchOn;
+    }
+    auto& transport = edit->getTransport();
+    if (loopOn.load() != syncedLoopOn)
+    {
+        syncedLoopOn = loopOn.load();
+        transport.looping = syncedLoopOn && hasRange();
+    }
+    else if (transport.looping.get() != syncedLoopOn)
+    {
+        loopOn = syncedLoopOn = transport.looping.get();
     }
     if (punchIn.load() != syncedPunchIn || punchOut.load() != syncedPunchOut)
     {
@@ -811,6 +828,13 @@ void AudioEngine::timerCallback()
     }
     sync();
     drainMeters();
+
+    // The looper ends when the transport stops, however that happens.
+    if (loopRecord != LoopRecord::Off && !edit->getTransport().isPlaying())
+    {
+        loopRecord = LoopRecord::Off;
+        loopWatcher.stopTimer();
+    }
 }
 
 void AudioEngine::changeListenerCallback(juce::ChangeBroadcaster*)
@@ -851,11 +875,19 @@ void AudioEngine::setPosition(juce::int64 newPosition)
         edit->getTransport().setPosition(toTime(juce::jmax<juce::int64>(0, newPosition)));
 }
 
+void AudioEngine::setRangeMode(RangeMode mode)
+{
+    punchOn = mode == RangeMode::Punch;
+    loopOn = mode == RangeMode::Loop;
+}
+
 void AudioEngine::play()
 {
     if (edit == nullptr || getState() != State::Stopped)
         return;
     returnPosition = getPosition();
+    if (loopOn.load() && hasRange() && (getPosition() < punchIn.load() || getPosition() >= punchOut.load()))
+        setPosition(punchIn.load());   // looping starts at the loop
     edit->getTransport().play(false);
 }
 
@@ -864,6 +896,8 @@ void AudioEngine::stop()
     if (edit == nullptr)
         return;
     const bool wasRolling = getState() != State::Stopped;
+    loopRecord = LoopRecord::Off;
+    loopWatcher.stopTimer();
     edit->getTransport().stop(false, false);
     if (wasRolling)
         setPosition(returnPosition);
@@ -874,6 +908,24 @@ bool AudioEngine::record(const juce::File& takeFolder, juce::String& error)
     if (edit == nullptr)
     {
         error = "There's no project open.";
+        return false;
+    }
+
+    auto& transport = edit->getTransport();
+    const bool looper = loopOn.load() && hasRange();
+
+    // A looper that's already going: record toggles finishing at the end of this pass,
+    // and cancels a start that hasn't happened yet.
+    switch (loopRecord)
+    {
+        case LoopRecord::Recording: loopRecord = LoopRecord::Finishing; lastLoopPosition = getPosition(); loopWatcher.startTimer(1); return true;
+        case LoopRecord::Finishing: loopRecord = LoopRecord::Recording; loopWatcher.stopTimer(); return true;
+        case LoopRecord::Waiting:   loopRecord = LoopRecord::Off; loopWatcher.stopTimer(); return true;
+        case LoopRecord::Off:       break;
+    }
+    if (looper && toTime(punchOut.load() - punchIn.load()).inSeconds() < kMinLoopSeconds)
+    {
+        error = "To record in a loop, make the loop at least " + juce::String(kMinLoopSeconds, 0) + " seconds long.";
         return false;
     }
 
@@ -901,12 +953,30 @@ bool AudioEngine::record(const juce::File& takeFolder, juce::String& error)
     }
     for (auto& midiIn : engine.getDeviceManager().getMidiInDevices())
     {
-        midiIn->mergeRecordings = false;
-        midiIn->replaceExistingClips = true;
+        // Looping MIDI overdubs: each pass is merged into what's there.
+        midiIn->mergeRecordings = looper;
+        midiIn->replaceExistingClips = !looper;
     }
     sync();
 
-    auto& transport = edit->getTransport();
+    if (looper)
+    {
+        if (transport.isPlaying())
+        {
+            // Wait for the next pass, so the takes line up with the loop.
+            loopRecord = LoopRecord::Waiting;
+            lastLoopPosition = getPosition();
+            loopWatcher.startTimer(1);
+            return true;
+        }
+        returnPosition = getPosition();
+        setPosition(punchIn.load());
+        edit->setCountInMode(countInOn.load() ? te::Edit::CountIn::oneBar : te::Edit::CountIn::none);
+        transport.record(false);
+        loopRecord = LoopRecord::Recording;
+        return true;
+    }
+
     if (!transport.isPlaying())
     {
         returnPosition = getPosition();
@@ -917,6 +987,77 @@ bool AudioEngine::record(const juce::File& takeFolder, juce::String& error)
     }
     transport.record(false);
     return true;
+}
+
+void AudioEngine::checkLoopWrap()
+{
+    if (edit == nullptr || loopRecord == LoopRecord::Off || loopRecord == LoopRecord::Recording)
+    {
+        loopWatcher.stopTimer();
+        return;
+    }
+    auto& transport = edit->getTransport();
+    if (!transport.isPlaying())
+    {
+        loopRecord = LoopRecord::Off;
+        loopWatcher.stopTimer();
+        return;
+    }
+
+    // The playhead jumping back means a new pass has begun.
+    const auto pos = getPosition();
+    const bool wrapped = pos < lastLoopPosition - (juce::int64) (getSampleRate() * 0.1);
+    lastLoopPosition = pos;
+    if (!wrapped)
+        return;
+
+    loopWatcher.stopTimer();
+    if (loopRecord == LoopRecord::Waiting)
+    {
+        transport.record(false);
+        loopRecord = LoopRecord::Recording;
+    }
+    else
+    {
+        // A few milliseconds of the next pass get recorded too: Tracktion drops a take that
+        // short, and ends the clip at the loop end.
+        transport.stopRecording(false);
+        loopRecord = LoopRecord::Off;
+    }
+}
+
+void AudioEngine::recordingFinished(te::InputDeviceInstance&, te::EditItemID, const juce::ReferenceCountedArray<te::Clip>& clips)
+{
+    for (auto& clip : clips)
+        if (auto* wave = dynamic_cast<te::WaveAudioClip*>(clip))
+            keepLastFullPass(*wave);
+}
+
+void AudioEngine::keepLastFullPass(te::WaveAudioClip& clip)
+{
+    auto takes = clip.state.getChildWithName(te::IDs::TAKES);
+    if (!takes.isValid() || edit == nullptr)
+        return;
+
+    // Tracktion lists the first pass, the later passes in order, then the first pass again.
+    juce::Array<juce::File> passes;
+    for (auto take : takes)
+    {
+        const auto file = te::SourceFileReference(*edit, take, te::IDs::source).getFile();
+        if (file.existsAsFile())
+            passes.addIfNotAlreadyThere(file);
+    }
+
+    const double loopLength = edit->getTransport().getLoopRange().getLength().inSeconds();
+    juce::File keep = passes.isEmpty() ? juce::File() : passes.getFirst();
+    for (auto& file : passes)
+        if (te::AudioFile(engine, file).getLength() >= loopLength - 0.05)
+            keep = file;
+
+    auto* um = &edit->getUndoManager();
+    clip.state.removeChild(takes, um);
+    if (keep != juce::File() && keep != clip.getSourceFileReference().getFile())
+        clip.getSourceFileReference().setToFile(keep, te::SourceFileReference::PathStyle::chooseBest, false);
 }
 
 std::vector<AudioEngine::LiveTake> AudioEngine::getLiveTakes() const

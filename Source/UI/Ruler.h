@@ -6,9 +6,9 @@
 /**
     Timeline ruler.
       Top part:    bar numbers. Click or drag to move the playhead.
-      Bottom strip: punch range. Drag on empty space to draw a new range (this turns
-                    punch on). Drag an edge to adjust it, drag inside to move it, and
-                    double-click to toggle punch on/off.
+      Bottom strip: the punch / loop range. Drag on empty space to draw a new range (this
+                    turns punch on if the range was off). Drag an edge to adjust it, drag
+                    inside to move it, and double-click to step through off, punch and loop.
 */
 class Ruler : public juce::Component
 {

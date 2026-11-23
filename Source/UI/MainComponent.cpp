@@ -46,6 +46,7 @@ MainComponent::MainComponent()
     transport->onStop = [this] { engine.stop(); };
     transport->onRecord = [this] { toggleRecord(); };
     transport->onToStart = [this] { perform(cmdToStart); };
+    transport->onRangeMode = [this] { perform(cmdPunch); };
     transport->onZoomIn = [this] { arrange->zoom(0.6); };
     transport->onZoomOut = [this] { arrange->zoom(1.0 / 0.6); };
     transport->onToggleMixer = [this] { toggleMixer(); };
@@ -175,7 +176,8 @@ void MainComponent::togglePlay()
 
 void MainComponent::toggleRecord()
 {
-    if (engine.getState() == AudioEngine::State::Recording)
+    // The looper handles its own second press (finish at the end of the pass).
+    if (engine.getState() == AudioEngine::State::Recording && engine.getLoopRecord() == AudioEngine::LoopRecord::Off)
     {
         engine.stop();
         return;
@@ -309,8 +311,22 @@ void MainComponent::setPunchPoint(bool in)
         if (engine.punchIn.load() >= pos)
             engine.punchIn = juce::jmax<juce::int64>(0, pos - engine.getSamplesPerBar() * 2);
     }
-    engine.punchOn = true;
+    if (engine.getRangeMode() == AudioEngine::RangeMode::Off && engine.getState() != AudioEngine::State::Recording)
+        engine.setRangeMode(AudioEngine::RangeMode::Punch);
     project.markDirty();
+    arrange->viewChanged();
+}
+
+void MainComponent::setRangeMode(AudioEngine::RangeMode mode)
+{
+    // Tracktion can't switch between punch and loop in the middle of a recording.
+    if (engine.getState() == AudioEngine::State::Recording || engine.getLoopRecord() != AudioEngine::LoopRecord::Off)
+        return;
+    if (!engine.hasRange())
+        setPunchPoint(true);   // a two-bar range at the playhead
+    engine.setRangeMode(mode);
+    project.markDirty();
+    transport->showRangeMode();
     arrange->viewChanged();
 }
 
@@ -378,14 +394,9 @@ void MainComponent::perform(int command)
             arrange->getView().viewStart = 0.0;
             arrange->viewChanged();
             break;
-        case cmdPunch:
-            if (engine.punchOut.load() > engine.punchIn.load())
-                engine.punchOn = !engine.punchOn.load();
-            else
-                setPunchPoint(true);
-            project.markDirty();
-            arrange->viewChanged();
-            break;
+        case cmdPunch:     setRangeMode(AudioEngine::nextRangeMode(engine.getRangeMode())); break;
+        case cmdPunchMode: setRangeMode(engine.getRangeMode() == AudioEngine::RangeMode::Punch ? AudioEngine::RangeMode::Off : AudioEngine::RangeMode::Punch); break;
+        case cmdLoop:      setRangeMode(engine.getRangeMode() == AudioEngine::RangeMode::Loop ? AudioEngine::RangeMode::Off : AudioEngine::RangeMode::Loop); break;
         case cmdPunchIn:  setPunchPoint(true); break;
         case cmdPunchOut: setPunchPoint(false); break;
         case cmdClick:    engine.metronomeOn = !engine.metronomeOn.load(); project.markDirty(); break;
@@ -458,6 +469,7 @@ bool MainComponent::keyPressed(const juce::KeyPress& key, juce::Component* origi
         case 'r': perform(cmdRecord); return true;
         case 's': perform(cmdSplit); return true;
         case 'p': perform(cmdPunch); return true;
+        case 'l': perform(cmdLoop); return true;
         case 'i': perform(cmdPunchIn); return true;
         case 'o': perform(cmdPunchOut); return true;
         case 'c': perform(cmdClick); return true;
@@ -523,9 +535,11 @@ juce::PopupMenu MainComponent::getMenuForIndex(int index, const juce::String&)
             m.addItem(item(cmdRecord, engine.getState() == AudioEngine::State::Recording ? "Stop Recording" : "Record", "R"));
             m.addItem(item(cmdToStart, "Go to Start", "Return"));
             m.addSeparator();
-            m.addItem(item(cmdPunch, "Punch In/Out", "P", true, engine.punchOn.load()));
-            m.addItem(item(cmdPunchIn, "Set Punch In at Playhead", "I"));
-            m.addItem(item(cmdPunchOut, "Set Punch Out at Playhead", "O"));
+            m.addItem(item(cmdPunch, "Range: Off / Punch / Loop", "P"));
+            m.addItem(item(cmdPunchMode, "Punch In/Out", "", true, engine.getRangeMode() == AudioEngine::RangeMode::Punch));
+            m.addItem(item(cmdLoop, "Loop", "L", true, engine.getRangeMode() == AudioEngine::RangeMode::Loop));
+            m.addItem(item(cmdPunchIn, "Set Range Start at Playhead", "I"));
+            m.addItem(item(cmdPunchOut, "Set Range End at Playhead", "O"));
             m.addSeparator();
             m.addItem(item(cmdClick, "Metronome", "C", true, engine.metronomeOn.load()));
             m.addItem(item(cmdCountIn, "Count-in", "", true, engine.countInOn.load()));

@@ -11,6 +11,7 @@ An 8-track recorder with clip-based, non-destructive editing, built with C++ and
 - **Tempo grid** with bars/beats ruler, snapping, metronome and count-in
 - **Mixer** with low cut, high cut, mid peak EQ, a reverb send, pan, faders and dB-scaled meters; a master strip with reverb controls
 - **MIDI tracks.** Right-click a track's name to make it a MIDI track (while it has no clips). Pick its instrument (any VST3/AU instrument) where the input selector was. Arm it and record from any MIDI keyboard; new takes replace what they're recorded over, like audio. Double-click an empty spot on a MIDI track to add a one-bar clip, and double-click a MIDI clip to edit its notes in the piano roll (click to add, drag to move, drag the end to resize, double-click to delete; notes snap to sixteenths, hold Cmd for free placement). MIDI clips move, trim, split and delete like audio clips.
+- **Punch and loop.** The Punch button (P) steps through Off, Punch and Loop; drag on the lower strip of the ruler to set the range. Punch records only inside it. Loop repeats it, and recording in a loop works like a looper: start from stop and recording begins at the loop start (start while playing and it waits for the next pass); each pass is a take and the last complete pass is kept; press R again and recording stops at the end of the pass while the loop keeps playing, so you can arm the next track and add another layer. MIDI tracks overdub each pass into the same clip.
 - **Automation.** Click a track's **A** button and choose a control: volume, pan, reverb send, the EQ, or any parameter of the track's instrument and plugins. Its curve is drawn over the track's clips; click to add a point, drag to move it (snaps to the grid; hold Cmd for free), double-click to delete, right-click to clear or show the clips again. Faders and knobs follow the automation during playback, and the export includes it.
 - **Plugins (VST3 and AU).** Up to four effect plugins per track, after the EQ and before the fader, and four on the master bus (on the whole mix, before the master fader). Click **+** in a mixer strip to add one; click a plugin to open its window; right-click it to bypass or remove it. **File > Plugins...** scans for installed plugins (in a separate process, so a plugin that crashes during the scan can't take 8track down).
 - **Projects** are folders (`project.8track` + `Audio/`). Opening one at a different sample rate converts it. Projects saved by 4track (the earlier name) still open.
@@ -23,7 +24,7 @@ An 8-track recorder with clip-based, non-destructive editing, built with C++ and
 | Space | Play / stop (stop returns to where you started) | R | Record / stop recording |
 | Return | Go to start | ← / → | Move playhead by grid step (Shift: by bar) |
 | S | Split selected clips at the playhead | Delete | Delete selected clips |
-| P | Punch on/off | I / O | Set punch in / out at the playhead |
+| P / L | Range off → punch → loop / loop on-off | I / O | Set range start / end at the playhead |
 | C | Metronome | X | Show/hide mixer |
 | = / - / Z | Zoom in / out / to fit | Cmd+Z / Shift+Cmd+Z | Undo / redo |
 | Cmd+S / Shift+Cmd+S | Save / Save As | Cmd+O / Cmd+N | Open / New |

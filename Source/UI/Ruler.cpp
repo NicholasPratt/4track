@@ -63,15 +63,17 @@ void Ruler::paint(juce::Graphics& g)
     const auto pin = engine.punchIn.load(), pout = engine.punchOut.load();
     if (pout > pin)
     {
-        const bool on = engine.punchOn.load();
+        const auto mode = engine.getRangeMode();
+        const bool on = mode != AudioEngine::RangeMode::Off;
+        const auto colour = mode == AudioEngine::RangeMode::Loop ? Theme::monitor : Theme::record;
         auto r = strip.withX(view.xFor(pin)).withRight(view.xFor(pout)).reduced(0.0f, 2.0f);
-        g.setColour(Theme::record.withAlpha(on ? 0.85f : 0.3f));
+        g.setColour(colour.withAlpha(on ? 0.85f : 0.3f));
         g.fillRoundedRectangle(r, 2.0f);
         if (r.getWidth() > 50.0f)
         {
             g.setColour(on ? juce::Colours::white : Theme::text.withAlpha(0.6f));
             g.setFont(Theme::font(9.5f, true));
-            g.drawText(on ? "PUNCH" : "PUNCH (OFF)", r, juce::Justification::centred, false);
+            g.drawText(mode == AudioEngine::RangeMode::Loop ? "LOOP" : on ? "PUNCH" : "RANGE (OFF)", r, juce::Justification::centred, false);
         }
     }
 
@@ -148,7 +150,8 @@ void Ruler::mouseDrag(const juce::MouseEvent& e)
                 return;
             engine.punchIn = juce::jmin(dragAnchor, s);
             engine.punchOut = juce::jmax(dragAnchor, s);
-            engine.punchOn = true;
+            if (engine.getRangeMode() == AudioEngine::RangeMode::Off && engine.getState() != AudioEngine::State::Recording)
+                engine.setRangeMode(AudioEngine::RangeMode::Punch);
             break;
         case Drag::PunchIn:
             engine.punchIn = juce::jmin(s, engine.punchOut.load() - 1);
@@ -186,7 +189,8 @@ void Ruler::mouseDoubleClick(const juce::MouseEvent& e)
 {
     if (inPunchStrip(e.position.y) && engine.punchOut.load() > engine.punchIn.load())
     {
-        engine.punchOn = !engine.punchOn.load();
+        if (engine.getState() != AudioEngine::State::Recording)
+            engine.setRangeMode(AudioEngine::nextRangeMode(engine.getRangeMode()));
         project.markDirty();
         if (onPunchChanged) onPunchChanged();
         repaint();

@@ -44,7 +44,7 @@ private:
     {
         cmdNew = 1, cmdOpen, cmdSave, cmdSaveAs, cmdImport, cmdExport, cmdAudioSettings, cmdPlugins,
         cmdUndo, cmdRedo, cmdCut, cmdCopy, cmdPaste, cmdDuplicate, cmdSplit, cmdDelete, cmdSelectAll,
-        cmdPlayStop, cmdRecord, cmdToStart, cmdPunch, cmdPunchIn, cmdPunchOut, cmdClick, cmdCountIn,
+        cmdPlayStop, cmdRecord, cmdToStart, cmdPunch, cmdPunchMode, cmdLoop, cmdPunchIn, cmdPunchOut, cmdClick, cmdCountIn,
         cmdZoomIn, cmdZoomOut, cmdZoomFit, cmdMixer
     };
 
@@ -61,6 +61,7 @@ private:
     void duplicateSelection();
     void pasteClips(const std::vector<ClipboardClip>&, int track, juce::int64 position, bool movePlayhead);
     void setPunchPoint(bool in);
+    void setRangeMode(AudioEngine::RangeMode);
     void toggleMixer();
     void openPianoRoll(juce::int64 clipId);
     void closePianoRoll();

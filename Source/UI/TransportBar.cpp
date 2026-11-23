@@ -47,12 +47,8 @@ TransportBar::TransportBar(AudioEngine& e, Project& p, TimelineView& v) : engine
 
     click.onClick   = [this] { engine.metronomeOn = click.getToggleState(); project.markDirty(); };
     countIn.onClick = [this] { engine.countInOn = countIn.getToggleState(); project.markDirty(); };
-    punch.onClick   = [this]
-    {
-        engine.punchOn = punch.getToggleState();
-        project.markDirty();
-        if (onGridChanged) onGridChanged();
-    };
+    punch.setClickingTogglesState(false);   // it steps through off, punch and loop
+    punch.onClick   = [this] { if (onRangeMode) onRangeMode(); };
     snap.onClick    = [this] { view.snapOn = snap.getToggleState(); };
     mixer.onClick   = [this] { if (onToggleMixer) onToggleMixer(); };
     zoomIn.onClick  = [this] { if (onZoomIn) onZoomIn(); };
@@ -75,16 +71,32 @@ void TransportBar::refresh()
     timeSig.setSelectedId(engine.beatsPerBar.load(), juce::dontSendNotification);
     click.setToggleState(engine.metronomeOn.load(), juce::dontSendNotification);
     countIn.setToggleState(engine.countInOn.load(), juce::dontSendNotification);
-    punch.setToggleState(engine.punchOn.load(), juce::dontSendNotification);
+    showRangeMode();
     snap.setToggleState(view.snapOn, juce::dontSendNotification);
+}
+
+void TransportBar::showRangeMode()
+{
+    const auto mode = engine.getRangeMode();
+    const auto text = mode == AudioEngine::RangeMode::Loop ? "Loop" : "Punch";
+    if (punch.getButtonText() != text)
+        punch.setButtonText(text);
+    punch.setColour(juce::TextButton::buttonOnColourId, mode == AudioEngine::RangeMode::Loop ? Theme::monitor : Theme::record);
+    punch.setToggleState(mode != AudioEngine::RangeMode::Off, juce::dontSendNotification);
 }
 
 void TransportBar::tick()
 {
     const auto state = engine.getState();
     play.setToggleState(state != AudioEngine::State::Stopped, juce::dontSendNotification);
-    record.setToggleState(state == AudioEngine::State::Recording, juce::dontSendNotification);
-    punch.setToggleState(engine.punchOn.load(), juce::dontSendNotification);
+    // The looper waiting to start or finish blinks the record button.
+    const auto looper = engine.getLoopRecord();
+    const bool blink = (juce::Time::getMillisecondCounter() / 250) % 2 == 0;
+    if (looper == AudioEngine::LoopRecord::Waiting || looper == AudioEngine::LoopRecord::Finishing)
+        record.setToggleState(blink, juce::dontSendNotification);
+    else
+        record.setToggleState(state == AudioEngine::State::Recording, juce::dontSendNotification);
+    showRangeMode();
     click.setToggleState(engine.metronomeOn.load(), juce::dontSendNotification);
     bpm.setEnabled(state == AudioEngine::State::Stopped);
     timeSig.setEnabled(state == AudioEngine::State::Stopped);

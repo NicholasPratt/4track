@@ -814,6 +814,76 @@ public:
     }
 };
 
+/** Punch / loop modes and the looper's choice of take. */
+class LoopTests : public juce::UnitTest
+{
+public:
+    LoopTests() : juce::UnitTest("Loop", "8track") {}
+
+    void runTest() override
+    {
+        AudioEngine engine;
+        const double sr = engine.getSampleRate();
+        auto dir = juce::File::createTempFile("8track-loop");
+        dir.createDirectory();
+        {
+            Project project(engine);
+            const auto untitledFolder = project.getFolder();
+            juce::String error;
+
+            beginTest("The range steps through off, punch and loop, never both");
+            using Mode = AudioEngine::RangeMode;
+            expect(AudioEngine::nextRangeMode(Mode::Off) == Mode::Punch);
+            expect(AudioEngine::nextRangeMode(Mode::Punch) == Mode::Loop);
+            expect(AudioEngine::nextRangeMode(Mode::Loop) == Mode::Off);
+            engine.punchIn = 0;
+            engine.punchOut = (juce::int64) (sr * 3);
+            engine.setRangeMode(Mode::Loop);
+            engine.syncNow();
+            expect(project.getEdit().getTransport().looping.get(), "Tracktion loops");
+            expect(!project.getEdit().recordingPunchInOut.get(), "and doesn't punch");
+            engine.setRangeMode(Mode::Punch);
+            engine.syncNow();
+            expect(!project.getEdit().getTransport().looping.get());
+            expect(project.getEdit().recordingPunchInOut.get());
+
+            beginTest("Loop mode is saved with the project");
+            engine.setRangeMode(Mode::Loop);
+            auto saved = dir.getChildFile("Looped");
+            expect(project.saveAs(saved, error), error);
+            project.newProject();
+            expect(engine.getRangeMode() == Mode::Off, "a new project has no range");
+            expect(project.load(saved, error), error);
+            expect(engine.getRangeMode() == Mode::Loop, "loop is back");
+            expectEquals(engine.punchOut.load(), (juce::int64) (sr * 3));
+
+            beginTest("A loop recording keeps its last complete pass");
+            {
+                const int loopLen = (int) (sr * 3);
+                auto audio = project.getAudioFolder();
+                audio.createDirectory();
+                auto pass1 = writeWav(audio.getChildFile("take.wav"), sr, loopLen, 0.1f);
+                auto pass2 = writeWav(audio.getChildFile("take_take_2.wav"), sr, loopLen, 0.2f);
+                auto pass3 = writeWav(audio.getChildFile("take_take_3.wav"), sr, loopLen / 3, 0.3f);   // stopped part way
+
+                auto clip = engine.getAudioTrack(0)->insertWaveClip("take", pass1, { { te::TimePosition(), te::TimePosition::fromSeconds(3.0) }, {} }, false);
+                expect(clip != nullptr);
+                if (clip != nullptr)
+                {
+                    for (auto& f : { pass1, pass2, pass3, pass1 })   // the order Tracktion lists them in
+                        clip->addTake(f);
+                    engine.keepLastFullPass(*clip);
+                    expect(clip->getSourceFileReference().getFile() == pass2, "the second pass, not the unfinished third");
+                    expect(!clip->state.getChildWithName(te::IDs::TAKES).isValid(), "no takes left");
+                }
+            }
+            untitledFolder.deleteRecursively();
+        }
+        dir.deleteRecursively();
+    }
+};
+
+static LoopTests loopTests;
 static ArrangementTests arrangementTests;
 static TracktionProjectTests tracktionProjectTests;
 static PluginInsertTests pluginInsertTests;

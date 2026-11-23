@@ -98,9 +98,12 @@ void TrackLanes::paint(juce::Graphics& g)
     if (pout > pin)
     {
         auto r = juce::Rectangle<float>(view.xFor(pin), 0.0f, view.xFor(pout) - view.xFor(pin), contentBottom);
-        g.setColour(Theme::record.withAlpha(engine.punchOn.load() ? 0.08f : 0.03f));
+        const auto mode = engine.getRangeMode();
+        const bool on = mode != AudioEngine::RangeMode::Off;
+        const auto colour = mode == AudioEngine::RangeMode::Loop ? Theme::monitor : Theme::record;
+        g.setColour(colour.withAlpha(on ? 0.08f : 0.03f));
         g.fillRect(r);
-        g.setColour(Theme::record.withAlpha(engine.punchOn.load() ? 0.5f : 0.15f));
+        g.setColour(colour.withAlpha(on ? 0.5f : 0.15f));
         g.drawVerticalLine((int) r.getX(), 0.0f, contentBottom);
         g.drawVerticalLine((int) r.getRight(), 0.0f, contentBottom);
     }

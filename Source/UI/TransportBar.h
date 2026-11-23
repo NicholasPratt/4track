@@ -17,8 +17,9 @@ public:
     void tick();
     /** Re-reads tempo/toggles after a project load. */
     void refresh();
+    void showRangeMode();
 
-    std::function<void()> onPlay, onStop, onRecord, onToStart;
+    std::function<void()> onPlay, onStop, onRecord, onToStart, onRangeMode;
     std::function<void()> onZoomIn, onZoomOut, onToggleMixer, onGridChanged;
 
     void setMasterPeaks(float l, float r) { masterMeter.setPeaks(l, r); }
@@ -43,7 +44,8 @@ private:
 
     ToggleChip click   { "Click", Theme::accent, "Metronome (C)" },
                countIn { "Count-in", Theme::accent, "One bar of click before recording starts" },
-               punch   { "Punch", Theme::record, "Record only inside the punch range (P). Drag on the lower strip of the ruler to set it." },
+               punch   { "Punch", Theme::record, "Off / Punch / Loop (P). Punch records only inside the range; Loop repeats it, "
+                                                 "and recording in a loop works like a looper. Drag on the lower strip of the ruler to set the range." },
                snap    { "Snap", Theme::accent, "Snap edits to the grid (hold Cmd while dragging to bypass)" },
                mixer   { "Mixer", Theme::accent, "Show the mixer (X)" };
     juce::TextButton zoomOut { "-" }, zoomIn { "+" };
