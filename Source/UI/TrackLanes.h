@@ -15,7 +15,8 @@
       drag a clip's edge      trim it
       drag a top corner       adjust the fade-in or fade-out
       click empty space       move the playhead there
-      right-click a clip      split / delete / reset fades
+      right-click a clip      cut / copy / paste / duplicate / split / delete / fades / gain
+      right-click empty space paste the copied clips there
       wheel / trackpad        scroll;  cmd + wheel or pinch to zoom
       hold cmd while dragging to turn snapping off for that drag
       drop audio files        import them at the drop point
@@ -49,6 +50,11 @@ public:
     std::function<void(int)> onTrackClicked;
     std::function<void(juce::int64)> onEditMidiClip;   // open the note editor for this clip
 
+    // The clipboard lives with the Edit menu; the right-click menus use it through these.
+    std::function<void()> onCut, onCopy, onDuplicate;
+    std::function<void(int track, juce::int64 position)> onPaste;
+    std::function<bool()> canPaste;
+
     void paint(juce::Graphics&) override;
     void mouseMove(const juce::MouseEvent&) override;
     void mouseExit(const juce::MouseEvent&) override;
@@ -70,7 +76,8 @@ private:
     juce::Rectangle<float> clipRect(const Clip& c, int track) const;
     juce::int64 snapped(juce::int64 s, const juce::ModifierKeys& mods) const;
     std::function<bool(Arrangement&)> editForDrag(const juce::MouseEvent& e) const;
-    void showClipMenu(juce::int64 clipId);
+    void showClipMenu(juce::int64 clipId, int track, juce::int64 position);
+    void showEmptyMenu(int track, juce::int64 position);
 
     void paintGrid(juce::Graphics&, float top, float bottom);
     void paintClip(juce::Graphics&, const Clip&, int track, bool selected, bool hovered);

@@ -394,6 +394,8 @@ void TrackLanes::mouseDown(const juce::MouseEvent& e)
             engine.setPosition(juce::jmax<juce::int64>(0, snapped(dragDownSample, e.mods)));
         repaint();
         if (onViewChanged) onViewChanged();
+        if (e.mods.isPopupMenu())
+            showEmptyMenu(dragDownTrack, juce::jmax<juce::int64>(0, snapped(dragDownSample, e.mods)));
         return;
     }
 
@@ -410,8 +412,11 @@ void TrackLanes::mouseDown(const juce::MouseEvent& e)
 
     if (e.mods.isPopupMenu())
     {
-        selection = { dragHit.clipId };
-        showClipMenu(dragHit.clipId);
+        // Right-clicking one of several selected clips keeps them all selected, for copying.
+        if (selection.count(dragHit.clipId) == 0)
+            selection = { dragHit.clipId };
+        repaint();
+        showClipMenu(dragHit.clipId, dragDownTrack, juce::jmax<juce::int64>(0, snapped(dragDownSample, e.mods)));
         dragHit = {};
     }
 }
@@ -558,7 +563,18 @@ void TrackLanes::mouseUp(const juce::MouseEvent& e)
     repaint();
 }
 
-void TrackLanes::showClipMenu(juce::int64 clipId)
+void TrackLanes::showEmptyMenu(int track, juce::int64 position)
+{
+    juce::PopupMenu menu;
+    menu.addItem(1, "Paste Here", canPaste != nullptr && canPaste());
+    menu.showMenuAsync(juce::PopupMenu::Options(), [safe = juce::Component::SafePointer<TrackLanes>(this), track, position](int result)
+    {
+        if (safe != nullptr && result == 1 && safe->onPaste)
+            safe->onPaste(track, position);
+    });
+}
+
+void TrackLanes::showClipMenu(juce::int64 clipId, int track, juce::int64 position)
 {
     const auto* c = project.getArrangement().findClip(clipId);
     if (c == nullptr)
@@ -567,14 +583,20 @@ void TrackLanes::showClipMenu(juce::int64 clipId)
     const auto playhead = engine.getPosition();
     const bool canSplit = playhead > c->start && playhead < c->end();
 
+    const bool several = selection.size() > 1;
     juce::PopupMenu menu;
-    if (c->midi)
+    if (c->midi && !several)
     {
         menu.addItem(7, "Edit Notes...");
         menu.addSeparator();
     }
+    menu.addItem(10, several ? "Cut Clips" : "Cut");
+    menu.addItem(11, several ? "Copy Clips" : "Copy");
+    menu.addItem(12, "Paste Here", canPaste != nullptr && canPaste());
+    menu.addItem(13, several ? "Duplicate Clips" : "Duplicate");
+    menu.addSeparator();
     menu.addItem(1, "Split at Playhead", canSplit);
-    menu.addItem(2, "Delete");
+    menu.addItem(2, several ? "Delete Clips" : "Delete");
     if (!c->midi)
     {
         menu.addItem(3, "Reset Fades");
@@ -585,10 +607,36 @@ void TrackLanes::showClipMenu(juce::int64 clipId)
     }
 
     juce::Component::SafePointer<TrackLanes> safe(this);
-    menu.showMenuAsync(juce::PopupMenu::Options(), [safe, clipId, playhead](int result)
+    menu.showMenuAsync(juce::PopupMenu::Options(), [safe, clipId, playhead, track, position](int result)
     {
         if (safe == nullptr || result == 0)
             return;
+
+        // These act on the whole selection.
+        auto call = [](const std::function<void()>& f) { if (f) f(); };
+        switch (result)
+        {
+            case 10: call(safe->onCut); return;
+            case 11: call(safe->onCopy); return;
+            case 12: if (safe->onPaste) safe->onPaste(track, position); return;
+            case 13: call(safe->onDuplicate); return;
+            case 2:
+            {
+                const auto ids = safe->selection;
+                safe->project.perform([ids](Arrangement& a)
+                {
+                    bool any = false;
+                    for (auto id : ids)
+                        any = a.removeClip(id) || any;
+                    return any;
+                });
+                safe->pruneSelection();
+                safe->repaint();
+                return;
+            }
+            default: break;
+        }
+
         auto& proj = safe->project;
         const auto* clip = proj.getArrangement().findClip(clipId);
         if (clip == nullptr)
@@ -598,7 +646,6 @@ void TrackLanes::showClipMenu(juce::int64 clipId)
         switch (result)
         {
             case 1: proj.perform([=](Arrangement& a) { return a.splitClip(clipId, playhead); }); break;
-            case 2: proj.perform([=](Arrangement& a) { return a.removeClip(clipId); }); break;
             case 3: proj.perform([=](Arrangement& a) { return a.setFades(clipId, Arrangement::kEdgeFade, Arrangement::kEdgeFade); }); break;
             case 4: proj.perform([=](Arrangement& a) { return a.setGain(clipId, gain * 1.4125f); }); break;
             case 5: proj.perform([=](Arrangement& a) { return a.setGain(clipId, gain / 1.4125f); }); break;

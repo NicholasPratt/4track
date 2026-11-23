@@ -36,6 +36,11 @@ MainComponent::MainComponent()
     pianoRoll->onClose = [this] { closePianoRoll(); };
     addChildComponent(*pianoRoll);
     arrange->getLanes().onEditMidiClip = [this](juce::int64 id) { openPianoRoll(id); };
+    arrange->getLanes().onCut = [this] { perform(cmdCut); };
+    arrange->getLanes().onCopy = [this] { perform(cmdCopy); };
+    arrange->getLanes().onDuplicate = [this] { perform(cmdDuplicate); };
+    arrange->getLanes().onPaste = [this](int track, juce::int64 position) { pasteClips(clipboard, track, position, false); };
+    arrange->getLanes().canPaste = [this] { return !clipboard.empty(); };
 
     transport->onPlay = [this] { if (engine.getState() == AudioEngine::State::Stopped) engine.play(); };
     transport->onStop = [this] { engine.stop(); };
