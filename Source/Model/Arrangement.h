@@ -2,9 +2,17 @@
 
 #include "Clip.h"
 #include <array>
+#include <set>
 #include <vector>
 
 static constexpr int kNumTracks = 8;
+
+/** Copied clips: positions are relative to the earliest clip and the topmost track copied. */
+struct ClipboardClip
+{
+    int trackOffset = 0;
+    Clip clip;   // id 0, start relative to the copy; a MIDI clip holds its own copy of its notes
+};
 
 /**
     The editable timeline: kNumTracks lanes, each a list of non-overlapping clips
@@ -37,6 +45,18 @@ struct Arrangement
     bool splitClip(juce::int64 id, juce::int64 position);
     bool setFades(juce::int64 id, juce::int64 fadeIn, juce::int64 fadeOut);
     bool setGain(juce::int64 id, float gain);
+
+    /** Copies these clips for pasting. Empty if none of them exist. */
+    std::vector<ClipboardClip> copyClips(const std::set<juce::int64>& ids) const;
+
+    /** Pastes copied clips with the earliest at `position` and the topmost on `track`, over
+        whatever is there. Clips that would land below the last track, or on a track of the
+        other kind (MIDI on audio, audio on MIDI), are left out. Returns the new clips' ids. */
+    std::vector<juce::int64> pasteClips(const std::vector<ClipboardClip>& clips, int track, juce::int64 position,
+                                        const std::array<bool, kNumTracks>& midiTracks);
+
+    /** The end of the last copied clip, relative to the start of the copy. */
+    static juce::int64 lengthOf(const std::vector<ClipboardClip>& clips);
 
     /** Removes the given range from a lane, trimming or splitting clips that overlap it. */
     void clearRange(int track, juce::int64 rangeStart, juce::int64 rangeEnd);

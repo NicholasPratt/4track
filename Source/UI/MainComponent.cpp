@@ -214,6 +214,78 @@ void MainComponent::deleteSelection()
     arrange->getLanes().clearSelection();
 }
 
+void MainComponent::copySelection()
+{
+    auto copied = project.getArrangement().copyClips(arrange->getLanes().getSelection());
+    if (!copied.empty())
+        clipboard = std::move(copied);
+}
+
+void MainComponent::paste()
+{
+    // The topmost copied clip goes on the selected track, the earliest at the playhead.
+    pasteClips(clipboard, arrange->getSelectedTrack(), engine.getPosition(), true);
+}
+
+void MainComponent::duplicateSelection()
+{
+    // A copy straight after the selection, on the same tracks. Repeating it repeats the copy.
+    const auto& arr = project.getArrangement();
+    const auto& ids = arrange->getLanes().getSelection();
+    auto copied = arr.copyClips(ids);
+    if (copied.empty())
+        return;
+
+    juce::int64 end = 0;
+    int top = kNumTracks;
+    for (int t = 0; t < kNumTracks; ++t)
+        for (auto& c : arr.tracks[(size_t) t])
+            if (ids.count(c.id) != 0)
+            {
+                end = std::max(end, c.end());
+                top = std::min(top, t);
+            }
+    pasteClips(copied, top, end, false);
+}
+
+void MainComponent::pasteClips(const std::vector<ClipboardClip>& clips, int track, juce::int64 position, bool movePlayhead)
+{
+    if (clips.empty())
+        return;
+
+    std::array<bool, kNumTracks> midiTracks {};
+    for (int t = 0; t < kNumTracks; ++t)
+        midiTracks[(size_t) t] = engine.getTrack(t).midi.load();
+
+    // Where each pasted clip will be, to select them afterwards: their ids change once
+    // they are in the Edit.
+    std::vector<std::pair<int, juce::int64>> placed;
+    if (!project.perform([&](Arrangement& a)
+        {
+            const auto ids = a.pasteClips(clips, track, position, midiTracks);
+            for (auto id : ids)
+            {
+                int t = -1;
+                if (auto* c = a.findClip(id, &t))
+                    placed.emplace_back(t, c->start);
+            }
+            return !ids.empty();
+        }))
+        return;
+
+    std::set<juce::int64> selection;
+    for (auto [t, start] : placed)
+        for (auto& c : project.getArrangement().tracks[(size_t) t])
+            if (c.start == start)
+                selection.insert(c.id);
+    arrange->getLanes().setSelection(std::move(selection));
+
+    // Move the playhead past the paste, so pasting again carries on from there.
+    if (movePlayhead && engine.getState() == AudioEngine::State::Stopped)
+        engine.setPosition(std::max<juce::int64>(0, position) + Arrangement::lengthOf(clips));
+    arrange->viewChanged();
+}
+
 void MainComponent::setPunchPoint(bool in)
 {
     auto pos = engine.getPosition();
@@ -284,6 +356,10 @@ void MainComponent::perform(int command)
 
         case cmdUndo:     if (stopped) project.undo(); break;
         case cmdRedo:     if (stopped) project.redo(); break;
+        case cmdCut:      copySelection(); deleteSelection(); break;
+        case cmdCopy:     copySelection(); break;
+        case cmdPaste:    paste(); break;
+        case cmdDuplicate: duplicateSelection(); break;
         case cmdSplit:    splitSelection(); break;
         case cmdDelete:   deleteSelection(); break;
         case cmdSelectAll: arrange->getLanes().selectAll(); break;
@@ -346,6 +422,10 @@ bool MainComponent::keyPressed(const juce::KeyPress& key, juce::Component* origi
             case 'o': perform(cmdOpen); return true;
             case 'n': perform(cmdNew); return true;
             case 'a': perform(cmdSelectAll); return true;
+            case 'x': perform(cmdCut); return true;
+            case 'c': perform(cmdCopy); return true;
+            case 'v': perform(cmdPaste); return true;
+            case 'd': perform(cmdDuplicate); return true;
             case 'i': perform(cmdImport); return true;
             case 'e': perform(cmdExport); return true;
             case ',': perform(cmdAudioSettings); return true;
@@ -423,6 +503,11 @@ juce::PopupMenu MainComponent::getMenuForIndex(int index, const juce::String&)
         case 1:
             m.addItem(item(cmdUndo, "Undo", "Cmd+Z", stopped && project.canUndo()));
             m.addItem(item(cmdRedo, "Redo", "Shift+Cmd+Z", stopped && project.canRedo()));
+            m.addSeparator();
+            m.addItem(item(cmdCut, "Cut", "Cmd+X", !arrange->getLanes().getSelection().empty()));
+            m.addItem(item(cmdCopy, "Copy", "Cmd+C", !arrange->getLanes().getSelection().empty()));
+            m.addItem(item(cmdPaste, "Paste at Playhead", "Cmd+V", !clipboard.empty()));
+            m.addItem(item(cmdDuplicate, "Duplicate", "Cmd+D", !arrange->getLanes().getSelection().empty()));
             m.addSeparator();
             m.addItem(item(cmdSplit, "Split at Playhead", "S"));
             m.addItem(item(cmdDelete, "Delete", "Delete", !arrange->getLanes().getSelection().empty()));

@@ -1,6 +1,7 @@
 #include "Arrangement.h"
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 const Clip* Arrangement::findClip(juce::int64 id, int* trackOut) const
 {
@@ -265,4 +266,61 @@ void Arrangement::rescalePositions(double ratio)
             clampFades(c);
         }
     }
+}
+
+//==============================================================================
+std::vector<ClipboardClip> Arrangement::copyClips(const std::set<juce::int64>& ids) const
+{
+    std::vector<ClipboardClip> out;
+    juce::int64 first = std::numeric_limits<juce::int64>::max();
+    int top = kNumTracks;
+
+    for (int t = 0; t < kNumTracks; ++t)
+        for (auto& c : tracks[(size_t) t])
+            if (ids.count(c.id) != 0)
+            {
+                ClipboardClip copy { t, c };
+                copy.clip.id = 0;
+                if (c.midi && c.midiState.isValid())
+                    copy.clip.midiState = c.midiState.createCopy();   // later edits to the original don't change the copy
+                out.push_back(copy);
+                first = std::min(first, c.start);
+                top = std::min(top, t);
+            }
+
+    for (auto& c : out)
+    {
+        c.trackOffset -= top;
+        c.clip.start -= first;
+    }
+    return out;
+}
+
+std::vector<juce::int64> Arrangement::pasteClips(const std::vector<ClipboardClip>& clips, int track, juce::int64 position,
+                                                 const std::array<bool, kNumTracks>& midiTracks)
+{
+    std::vector<juce::int64> ids;
+    for (auto& c : clips)
+    {
+        const int t = track + c.trackOffset;
+        if (t < 0 || t >= kNumTracks || midiTracks[(size_t) t] != c.clip.midi)
+            continue;
+
+        auto clip = c.clip;
+        clip.id = 0;
+        clip.start = std::max<juce::int64>(0, position) + c.clip.start;
+        if (clip.midi && clip.midiState.isValid())
+            clip.midiState = clip.midiState.createCopy();
+        if (auto id = insertClip(t, clip))
+            ids.push_back(id);
+    }
+    return ids;
+}
+
+juce::int64 Arrangement::lengthOf(const std::vector<ClipboardClip>& clips)
+{
+    juce::int64 end = 0;
+    for (auto& c : clips)
+        end = std::max(end, c.clip.end());
+    return end;
 }

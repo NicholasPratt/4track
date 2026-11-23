@@ -42,6 +42,7 @@ public:
     const std::set<juce::int64>& getSelection() const { return selection; }
     void selectAll();
     void clearSelection() { selection.clear(); repaint(); }
+    void setSelection(std::set<juce::int64> ids) { selection = std::move(ids); repaint(); }
     void pruneSelection();
 
     std::function<void()> onViewChanged;    // scrolled or zoomed

@@ -152,6 +152,45 @@ public:
             expectEquals((int) a.tracks[0].size(), 2);
         }
 
+        beginTest("Copy and paste keep the clips' spacing across tracks");
+        {
+            Arrangement a;
+            auto src = makeSource(100000);
+            const auto first = a.insertClip(1, clip(src, 1000, 2000));
+            const auto second = a.insertClip(3, clip(src, 4000, 1000, 500));
+            a.insertClip(1, clip(src, 9000, 1000));   // not copied
+
+            auto copied = a.copyClips({ first, second });
+            expectEquals((int) copied.size(), 2);
+            expectEquals(Arrangement::lengthOf(copied), (juce::int64) 4000, "from the first start to the last end");
+
+            std::array<bool, kNumTracks> allAudio {};
+            const auto ids = a.pasteClips(copied, 4, 20000, allAudio);
+            expectEquals((int) ids.size(), 2);
+            expectEquals((int) a.tracks[4].size(), 1);
+            expectEquals((int) a.tracks[6].size(), 1);
+            expectEquals(a.tracks[4][0].start, (juce::int64) 20000);
+            expectEquals(a.tracks[6][0].start, (juce::int64) 23000, "same distance after the first clip");
+            expectEquals(a.tracks[6][0].sourceOffset, (juce::int64) 500, "plays the same part of the file");
+            expect(a.tracks[4][0].id != first && a.tracks[6][0].id != second, "new clips");
+            expectEquals((int) a.tracks[1].size(), 2, "originals stay");
+
+            beginTest("Pasting goes over what's there, and skips tracks it doesn't fit");
+            Arrangement b = a;
+            b.pasteClips(copied, 6, 23500, allAudio);   // the second clip would be on track 9
+            expectEquals((int) b.tracks[6].size(), 2, "the old clip is trimmed, not deleted");
+            expectEquals(b.tracks[6][0].end(), (juce::int64) 23500);
+            expectEquals(b.tracks[6][1].start, (juce::int64) 23500);
+
+            std::array<bool, kNumTracks> midiOn4 {};
+            midiOn4[4] = true;
+            Arrangement c = a;
+            const auto some = c.pasteClips(copied, 4, 40000, midiOn4);
+            expectEquals((int) some.size(), 1, "audio isn't pasted onto a MIDI track");
+            expectEquals((int) c.tracks[4].size(), 1);
+            expectEquals((int) c.tracks[6].size(), 2);
+        }
+
         beginTest("Fades never exceed the clip");
         {
             Arrangement a;
@@ -226,6 +265,26 @@ public:
                 expect(std::abs(right->fadeIn - 1000) <= 1, "fade-in stored");
                 expect(std::abs(right->fadeOut - 2000) <= 1, "fade-out stored");
                 expectWithinAbsoluteError(right->gain, 0.5f, 0.001f, "gain stored");
+            }
+
+            beginTest("Pasted audio clips are new clips in the Edit, with the same settings");
+            {
+                const auto copied = project.getArrangement().copyClips({ rightId });
+                std::array<bool, kNumTracks> allAudio {};
+                expect(project.perform([&](Arrangement& a) { return !a.pasteClips(copied, 0, 0, allAudio).empty(); }));
+                expectEquals(engine.getAudioTrack(0)->getClips().size(), 1);
+                const auto& pasted = project.getArrangement().tracks[0];
+                expectEquals((int) pasted.size(), 1);
+                if (pasted.size() == 1)
+                {
+                    expectEquals(pasted[0].sourceOffset, (juce::int64) (len / 4));
+                    expectWithinAbsoluteError(pasted[0].gain, 0.5f, 0.001f);
+                    expect(std::abs(pasted[0].fadeIn - 1000) <= 1);
+                    expect(pasted[0].id != rightId);
+                }
+                expectEquals((int) project.getArrangement().tracks[5].size(), 2, "the original is still there");
+                expect(project.undo());
+                expectEquals(engine.getAudioTrack(0)->getClips().size(), 0, "undo removes the paste");
             }
 
             beginTest("Mixer settings reach Tracktion's plugins and come back after undo");
@@ -555,6 +614,35 @@ public:
             expect(project.undo());
             expectEquals((int) project.getArrangement().tracks[(size_t) t].size(), 1, "undo joins it again");
             expect(project.redo());
+
+            beginTest("A pasted MIDI clip has its own copy of the notes");
+            {
+                const auto leftId = project.getArrangement().tracks[(size_t) t].front().id;
+                const auto copied = project.getArrangement().copyClips({ leftId });
+                std::array<bool, kNumTracks> midiTracks {};
+                midiTracks[(size_t) t] = true;
+                expect(project.perform([&](Arrangement& a) { return !a.pasteClips(copied, t, 4 * bar, midiTracks).empty(); }));
+                const auto& lane3 = project.getArrangement().tracks[(size_t) t];
+                expectEquals((int) lane3.size(), 3);
+                auto* pasted = lane3.size() == 3 ? project.getMidiClip(lane3[2].id) : nullptr;
+                auto* original = project.getMidiClip(leftId);
+                expect(pasted != nullptr && original != nullptr && pasted != original);
+                if (pasted != nullptr && original != nullptr)
+                {
+                    bool c4AtEight = false;
+                    for (auto* n : pasted->getSequence().getNotes())
+                        if (n->getNoteNumber() == 60 && std::abs(n->getEditStartTime(*pasted).inSeconds() - 8.0) < 0.001)
+                            c4AtEight = true;
+                    expect(c4AtEight, "C4 plays at the start of the copy, 8 s");
+
+                    const int before = pasted->getSequence().getNumNotes();
+                    original->getSequence().addNote(72, te::BeatPosition::fromBeats(1.0), te::BeatDuration::fromBeats(1.0), 100, 0, um);
+                    expectEquals(pasted->getSequence().getNumNotes(), before, "editing the original leaves the copy alone");
+                    project.undo();
+                }
+                project.undo();
+                expectEquals((int) project.getArrangement().tracks[(size_t) t].size(), 2, "undo removes the paste");
+            }
 
             beginTest("MIDI clips have no fades or gain");
             const auto rightId = project.getArrangement().tracks[(size_t) t].back().id;

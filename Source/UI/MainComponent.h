@@ -43,7 +43,7 @@ private:
     enum Command
     {
         cmdNew = 1, cmdOpen, cmdSave, cmdSaveAs, cmdImport, cmdExport, cmdAudioSettings, cmdPlugins,
-        cmdUndo, cmdRedo, cmdSplit, cmdDelete, cmdSelectAll,
+        cmdUndo, cmdRedo, cmdCut, cmdCopy, cmdPaste, cmdDuplicate, cmdSplit, cmdDelete, cmdSelectAll,
         cmdPlayStop, cmdRecord, cmdToStart, cmdPunch, cmdPunchIn, cmdPunchOut, cmdClick, cmdCountIn,
         cmdZoomIn, cmdZoomOut, cmdZoomFit, cmdMixer
     };
@@ -56,6 +56,10 @@ private:
     void toggleRecord();
     void splitSelection();
     void deleteSelection();
+    void copySelection();
+    void paste();
+    void duplicateSelection();
+    void pasteClips(const std::vector<ClipboardClip>&, int track, juce::int64 position, bool movePlayhead);
     void setPunchPoint(bool in);
     void toggleMixer();
     void openPianoRoll(juce::int64 clipId);
@@ -80,6 +84,8 @@ private:
     std::unique_ptr<juce::MenuBarComponent> menuBar;   // non-mac only
     juce::TooltipWindow tooltips { this, 600 };
     std::shared_ptr<juce::FileChooser> chooser;
+
+    std::vector<ClipboardClip> clipboard;
 
     bool mixerVisible = false;
     bool pianoRollVisible = false;
