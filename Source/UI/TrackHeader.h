@@ -25,12 +25,16 @@ public:
 
     void paint(juce::Graphics&) override;
     void resized() override;
-    void mouseDown(const juce::MouseEvent&) override { if (onClicked) onClicked(); }
+    void mouseDown(const juce::MouseEvent&) override;
     std::function<void()> onClicked;
 
 private:
     void edited();
     void styleMonitorButton();
+    void showTrackMenu();
+    void showInstrumentMenu();
+    void setMidi(bool);
+    void updateKind();
 
     AudioEngine& engine;
     Project& project;
@@ -41,6 +45,9 @@ private:
     juce::Label name;
     juce::TextButton arm { "R" }, mute { "M" }, solo { "S" }, monitor { "I" };
     juce::ComboBox input;
+    juce::TextButton instrument;   // MIDI tracks show this instead of the input
+    bool shownAsMidi = false;
+    juce::String shownInstrument;
     juce::Slider volume, pan;
     LevelMeter meter { false };
 };

@@ -6,6 +6,8 @@ namespace
         0xff4f9dff, 0xff34c79a, 0xfff2b84b, 0xffef6f6c, 0xffb084f5, 0xff4fd1e0, 0xfff58fc7, 0xffa3d65c
     };
 
+    const juce::Identifier kMidiTrackProperty { "eightTrackMidi" };   // on a track's state: it's a MIDI track
+
     constexpr float kMinDb = -60.0f;   // the UI treats this as -inf
     constexpr float kOffDb = -100.0f;  // Tracktion's silence
 
@@ -361,6 +363,7 @@ void AudioEngine::pullAll()
         p.volumeDb = last.volumeDb = toUiDb(s.volume->getVolumeDb());
         p.pan = last.pan = s.volume->getPan();
         p.mute = last.mute = s.track->isMuted(false);
+        p.midi = last.midi = (bool) s.track->state.getProperty(kMidiTrackProperty, false);
         p.solo = last.solo = s.track->isSolo(false);
         p.lowCut = last.lowCut = s.lowCut->isEnabled() ? s.lowCut->frequency->getCurrentValue() : 20.0f;
         p.highCut = last.highCut = s.highCut->isEnabled() ? s.highCut->frequency->getCurrentValue() : 20000.0f;
@@ -430,6 +433,13 @@ void AudioEngine::syncTrack(int t)
     twoWay(p.pan, last.pan, s.volume->getPan(), [&](float v) { s.volume->setPan(v); });
     twoWay(p.mute, last.mute, s.track->isMuted(false), [&](bool v) { s.track->setMute(v); });
     twoWay(p.solo, last.solo, s.track->isSolo(false), [&](bool v) { s.track->setSolo(v); });
+    const bool wasMidi = last.midi;
+    twoWay(p.midi, last.midi, (bool) s.track->state.getProperty(kMidiTrackProperty, false), [&](bool v)
+    {
+        s.track->state.setProperty(kMidiTrackProperty, v, &edit->getUndoManager());
+    });
+    if (wasMidi != last.midi)
+        inputsDirty = true;
 
     const float lowCut = s.lowCut->isEnabled() ? s.lowCut->frequency->getCurrentValue() : 20.0f;
     twoWay(p.lowCut, last.lowCut, lowCut, [&](float v)
@@ -526,7 +536,9 @@ void AudioEngine::applyInputs()
     for (auto* instance : edit->getAllInputDevices())
     {
         auto& device = instance->getInputDevice();
-        if (device.getDeviceType() != te::InputDevice::waveDevice)
+        const bool isWave = device.getDeviceType() == te::InputDevice::waveDevice;
+        const bool isMidi = device.isMidi();
+        if (!isWave && !isMidi)
             continue;
 
         juce::Array<int> wanted;
@@ -534,7 +546,12 @@ void AudioEngine::applyInputs()
         for (int t = 0; t < kNumTracks; ++t)
         {
             auto& p = tracks[(size_t) t];
-            if (p.inputType.load() == (int) InputType::Mix || inputForChannel(p.inputChannel.load()) != &device)
+            // MIDI tracks take every MIDI input; audio tracks take the input carrying their channel.
+            const bool wants = p.midi.load()
+                                   ? isMidi
+                                   : isWave && p.inputType.load() != (int) InputType::Mix
+                                         && inputForChannel(p.inputChannel.load()) == &device;
+            if (!wants)
                 continue;
             wanted.add(t);
             const auto mode = (MonitorMode) p.monitor.load();
@@ -573,11 +590,74 @@ std::vector<te::Plugin*> AudioEngine::getInserts(int track) const
     if (s.track == nullptr)
         return inserts;
 
+    auto* instrument = getInstrument(track);
     for (auto* p : s.track->pluginList.getPlugins())
-        if (p != s.lowCut && p != s.eq && p != s.highCut && p != s.volume && p != s.send
+        if (p != s.lowCut && p != s.eq && p != s.highCut && p != s.volume && p != s.send && p != instrument
             && dynamic_cast<te::LevelMeterPlugin*>(p) == nullptr)
             inserts.push_back(p);
     return inserts;
+}
+
+te::Plugin::Ptr AudioEngine::loadPlugin(const juce::PluginDescription& description, juce::String& error)
+{
+    // Tracktion finds a plugin's binary through the scanned list, so make sure it's there.
+    if (getKnownPlugins().getTypeForIdentifierString(description.createIdentifierString()) == nullptr)
+        getKnownPlugins().addType(description);
+
+    auto plugin = edit->getPluginCache().createNewPlugin(te::ExternalPlugin::xmlTypeName, description);
+    auto* external = dynamic_cast<te::ExternalPlugin*>(plugin.get());
+    if (external == nullptr || external->getAudioPluginInstance() == nullptr)
+    {
+        error = description.name + " couldn't be loaded";
+        if (external != nullptr && external->getLoadError().isNotEmpty())
+            error << ": " << external->getLoadError();
+        return {};
+    }
+    return plugin;
+}
+
+te::Plugin* AudioEngine::getInstrument(int track) const
+{
+    auto& s = strips[(size_t) track];
+    if (s.track == nullptr)
+        return nullptr;
+    for (auto* p : s.track->pluginList.getPlugins())
+        if (auto* external = dynamic_cast<te::ExternalPlugin*>(p); external != nullptr && external->isSynth())
+            return p;
+    return nullptr;
+}
+
+te::Plugin* AudioEngine::setInstrument(int track, const juce::PluginDescription& description, juce::String& error)
+{
+    if (edit == nullptr)
+    {
+        error = "There's no project open.";
+        return nullptr;
+    }
+    auto plugin = loadPlugin(description, error);
+    if (plugin == nullptr)
+        return nullptr;
+
+    edit->getUndoManager().beginNewTransaction("Set instrument " + description.name);
+    if (auto* old = getInstrument(track))
+        old->deleteFromParent();
+    strips[(size_t) track].track->pluginList.insertPlugin(plugin, 0, nullptr);
+    return plugin.get();
+}
+
+void AudioEngine::removeInstrument(int track)
+{
+    if (auto* instrument = getInstrument(track))
+        removeInsert(*instrument);
+}
+
+juce::StringArray AudioEngine::getMidiInputNames() const
+{
+    juce::StringArray names;
+    for (auto& device : engine.getDeviceManager().getMidiInDevices())
+        if (device->isEnabled())
+            names.add(device->getName());
+    return names;
 }
 
 te::Plugin* AudioEngine::addInsert(int track, const juce::PluginDescription& description, juce::String& error)
@@ -593,19 +673,9 @@ te::Plugin* AudioEngine::addInsert(int track, const juce::PluginDescription& des
         return nullptr;
     }
 
-    // Tracktion finds a plugin's binary through the scanned list, so make sure it's there.
-    if (getKnownPlugins().getTypeForIdentifierString(description.createIdentifierString()) == nullptr)
-        getKnownPlugins().addType(description);
-
-    auto plugin = edit->getPluginCache().createNewPlugin(te::ExternalPlugin::xmlTypeName, description);
-    auto* external = dynamic_cast<te::ExternalPlugin*>(plugin.get());
-    if (external == nullptr || external->getAudioPluginInstance() == nullptr)
-    {
-        error = description.name + " couldn't be loaded";
-        if (external != nullptr && external->getLoadError().isNotEmpty())
-            error << ": " << external->getLoadError();
+    auto plugin = loadPlugin(description, error);
+    if (plugin == nullptr)
         return nullptr;
-    }
 
     edit->getUndoManager().beginNewTransaction("Add " + description.name);
     auto& s = strips[(size_t) track];
@@ -634,7 +704,7 @@ void AudioEngine::drainMeters()
         atomicMax(p.peakR, levelToGain(s.meter.getAndClearAudioLevel(1)));
 
         // An armed track shows its input level even when it isn't monitored.
-        if (p.armed.load() && p.inputType.load() != (int) InputType::Mix)
+        if (p.armed.load() && !p.midi.load() && p.inputType.load() != (int) InputType::Mix)
         {
             if (auto* device = inputForChannel(p.inputChannel.load()))
             {
@@ -754,6 +824,11 @@ bool AudioEngine::record(const juce::File& takeFolder, juce::String& error)
         device->setFilenameMask(takeFolder.getChildFile("%track%_%date%_%time%").getFullPathName());
         device->setMergeMode(replaceMode);
     }
+    for (auto& midiIn : engine.getDeviceManager().getMidiInDevices())
+    {
+        midiIn->mergeRecordings = false;
+        midiIn->replaceExistingClips = true;
+    }
     sync();
 
     auto& transport = edit->getTransport();
@@ -779,7 +854,7 @@ std::vector<AudioEngine::LiveTake> AudioEngine::getLiveTakes() const
         for (int t = 0; t < kNumTracks; ++t)
         {
             const auto id = strips[(size_t) t].track->itemID;
-            if (instance->isRecording(id))
+            if (instance->isRecording(id) && instance->getInputDevice().getDeviceType() == te::InputDevice::waveDevice)
                 takes.push_back({ t, instance->getRecordingFile(id), toSamples(instance->getPunchInTime(id)) });
         }
     return takes;

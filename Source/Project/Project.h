@@ -47,6 +47,12 @@ public:
         exists, so call this before audio is recorded into the project. */
     bool prepareFolder(juce::String& error);
 
+    /** Adds an empty MIDI clip to a MIDI track, as one undo step. Returns its Tracktion clip, or nullptr. */
+    te::MidiClip* createMidiClip(int track, juce::int64 start, juce::int64 length);
+
+    /** The Tracktion MIDI clip for an Arrangement clip id, for editing its notes. */
+    te::MidiClip* getMidiClip(juce::int64 clipId) const;
+
     /** Copies an audio file into the project and places it as a clip. */
     bool importAudio(const juce::File& file, int track, juce::int64 position, juce::String& error);
 

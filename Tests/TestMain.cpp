@@ -472,10 +472,136 @@ public:
     }
 };
 
+/** MIDI tracks, using Apple's DLS synth (on every Mac) as the instrument. */
+class MidiTrackTests : public juce::UnitTest
+{
+public:
+    MidiTrackTests() : juce::UnitTest("MidiTracks", "8track") {}
+
+    void runTest() override
+    {
+        AudioEngine engine;
+        juce::OwnedArray<juce::PluginDescription> found;
+        for (auto* format : engine.getTracktion().getPluginManager().pluginFormatManager.getFormats())
+            if (format->getName() == "AudioUnit")
+                format->findAllTypesForFile(found, "AudioUnit:Synths/aumu,dls ,appl");
+        if (found.isEmpty())
+        {
+            logMessage("DLSMusicDevice not available; skipping MIDI tests");
+            return;
+        }
+        const auto synth = *found[0];
+        auto& known = engine.getKnownPlugins();
+        const bool wasKnown = known.getTypeForIdentifierString(synth.createIdentifierString()) != nullptr;
+
+        auto dir = juce::File::createTempFile("8track-midi");
+        dir.createDirectory();
+        {
+            Project project(engine);
+            const auto untitledFolder = project.getFolder();
+            juce::String error;
+            const auto bar = engine.getSamplesPerBar();   // 2 s at 120 bpm
+            const int t = 4;
+
+            beginTest("A track becomes a MIDI track with an instrument");
+            engine.getTrack(t).midi = true;
+            engine.syncNow();
+            auto* instrument = engine.setInstrument(t, synth, error);
+            expect(instrument != nullptr, error);
+            expect(engine.getInstrument(t) == instrument);
+            expect(engine.getInserts(t).empty(), "the instrument isn't an insert");
+            expectEquals(engine.getAudioTrack(t)->pluginList.indexOf(instrument), 0, "first in the chain");
+
+            beginTest("An empty MIDI clip takes notes");
+            auto* clip = project.createMidiClip(t, 0, 2 * bar);
+            expect(clip != nullptr);
+            if (clip == nullptr)
+                return;
+            auto* um = &project.getEdit().getUndoManager();
+            clip->getSequence().addNote(60, te::BeatPosition::fromBeats(0.0), te::BeatDuration::fromBeats(1.0), 100, 0, um);
+            clip->getSequence().addNote(64, te::BeatPosition::fromBeats(4.0), te::BeatDuration::fromBeats(1.0), 100, 0, um);
+            expectEquals((int) project.getArrangement().tracks[(size_t) t].size(), 1);
+            expect(project.getArrangement().tracks[(size_t) t].front().midi);
+
+            beginTest("Splitting a MIDI clip keeps every note where it was");
+            const auto id = project.getArrangement().tracks[(size_t) t].front().id;
+            expect(project.perform([&](Arrangement& a) { return a.splitClip(id, bar); }));
+            auto lane = project.getArrangement().tracks[(size_t) t];
+            expectEquals((int) lane.size(), 2);
+            if (lane.size() == 2)
+            {
+                expect(lane[0].midi && lane[1].midi);
+                auto* left = project.getMidiClip(lane[0].id);
+                auto* right = project.getMidiClip(lane[1].id);
+                expect(left != nullptr && right != nullptr);
+                if (left != nullptr && right != nullptr)
+                {
+                    auto heardIn = [&](te::MidiClip& c, int pitch) -> double
+                    {
+                        for (auto* n : c.getSequence().getNotes())
+                            if (n->getNoteNumber() == pitch)
+                            {
+                                const auto time = n->getEditStartTime(c);
+                                if (c.getPosition().time.contains(time))
+                                    return time.inSeconds();
+                            }
+                        return -1.0;
+                    };
+                    expectWithinAbsoluteError(heardIn(*left, 60), 0.0, 0.001, "C4 at 0 s in the left half");
+                    expectWithinAbsoluteError(heardIn(*right, 64), 2.0, 0.001, "E4 at 2 s in the right half");
+                    expectEquals(heardIn(*left, 64), -1.0, "E4 not in the left half");
+                }
+            }
+            expect(project.undo());
+            expectEquals((int) project.getArrangement().tracks[(size_t) t].size(), 1, "undo joins it again");
+            expect(project.redo());
+
+            beginTest("MIDI clips have no fades or gain");
+            const auto rightId = project.getArrangement().tracks[(size_t) t].back().id;
+            expect(!project.perform([&](Arrangement& a) { return a.setFades(rightId, 100, 100); }));
+
+            beginTest("MIDI track, instrument and notes survive save and reopen");
+            auto saved = dir.getChildFile("WithMidi");
+            expect(project.saveAs(saved, error), error);
+            project.newProject();
+            expect(!engine.getTrack(t).midi.load(), "a new project's tracks are audio");
+            expect(project.load(saved, error), error);
+            expect(engine.getTrack(t).midi.load(), "still a MIDI track");
+            expect(engine.getInstrument(t) != nullptr, "instrument reloaded");
+            int notes = 0;
+            for (auto& c : project.getArrangement().tracks[(size_t) t])
+                if (auto* mc = project.getMidiClip(c.id))
+                    notes += mc->getSequence().getNumNotes();
+            expectEquals(notes, 4, "both halves keep their copy of the two notes");
+
+            beginTest("Export plays the instrument");
+            auto out = dir.getChildFile("midi.wav");
+            expect(project.exportMix(out, error), error);
+            if (auto reader = std::unique_ptr<juce::AudioFormatReader>(juce::WavAudioFormat().createReaderFor(out.createInputStream().release(), true)))
+            {
+                juce::AudioBuffer<float> buf(2, (int) reader->lengthInSamples);
+                reader->read(&buf, 0, buf.getNumSamples(), 0, true, true);
+                const auto sr = engine.getSampleRate();
+                expect(buf.getMagnitude(0, (int) (0.05 * sr), (int) (0.3 * sr)) > 0.01f, "the first note sounds");
+                expect(buf.getMagnitude(0, (int) (2.05 * sr), (int) (0.3 * sr)) > 0.01f, "the second note sounds");
+            }
+            else
+            {
+                expect(false, "export produced a readable WAV");
+            }
+            untitledFolder.deleteRecursively();
+        }
+        dir.deleteRecursively();
+        if (!wasKnown)
+            known.removeType(synth);
+    }
+};
+
 static ArrangementTests arrangementTests;
 static TracktionProjectTests tracktionProjectTests;
 static PluginInsertTests pluginInsertTests;
 static StereoInputTests stereoInputTests;
+static MidiTrackTests midiTrackTests;
 
 int main()
 {

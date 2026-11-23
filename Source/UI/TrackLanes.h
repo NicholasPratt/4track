@@ -19,6 +19,7 @@
       wheel / trackpad        scroll;  cmd + wheel or pinch to zoom
       hold cmd while dragging to turn snapping off for that drag
       drop audio files        import them at the drop point
+      double-click            on a MIDI clip: edit its notes; on an empty MIDI lane: add a one-bar clip
 
     During a drag the edit is applied to a preview copy of the arrangement. It's
     committed as one undo step on mouse-up.
@@ -41,6 +42,7 @@ public:
 
     std::function<void()> onViewChanged;    // scrolled or zoomed
     std::function<void(int)> onTrackClicked;
+    std::function<void(juce::int64)> onEditMidiClip;   // open the note editor for this clip
 
     void paint(juce::Graphics&) override;
     void mouseMove(const juce::MouseEvent&) override;
@@ -48,6 +50,7 @@ public:
     void mouseDown(const juce::MouseEvent&) override;
     void mouseDrag(const juce::MouseEvent&) override;
     void mouseUp(const juce::MouseEvent&) override;
+    void mouseDoubleClick(const juce::MouseEvent&) override;
     void mouseWheelMove(const juce::MouseEvent&, const juce::MouseWheelDetails&) override;
     void mouseMagnify(const juce::MouseEvent&, float scale) override;
 
@@ -67,6 +70,7 @@ private:
     void paintGrid(juce::Graphics&, float top, float bottom);
     void paintClip(juce::Graphics&, const Clip&, int track, bool selected, bool hovered);
     void paintLiveTakes(juce::Graphics&);
+    void paintNotes(juce::Graphics&, const Clip&, juce::Rectangle<float> area, juce::Colour);
     te::SmartThumbnail& thumbnailFor(const juce::File&);
 
     AudioEngine& engine;

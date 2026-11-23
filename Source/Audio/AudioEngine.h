@@ -86,7 +86,19 @@ public:
     std::vector<te::Plugin*> getInserts(int track) const;
     /** Loads a plugin and adds it after the track's other inserts, as one undo step. */
     te::Plugin* addInsert(int track, const juce::PluginDescription&, juce::String& error);
+    /** Loads a plugin, or explains why it couldn't be. */
+    te::Plugin::Ptr loadPlugin(const juce::PluginDescription&, juce::String& error);
     void removeInsert(te::Plugin&);
+
+    // MIDI tracks: TrackParams::midi switches a track to MIDI (only do that while it has no
+    // clips). A MIDI track records from every MIDI input and plays through its instrument,
+    // which sits at the start of the track's chain, before the EQ.
+    te::Plugin* getInstrument(int track) const;
+    /** Loads an instrument plugin and makes it the track's instrument (replacing any other), as one undo step. */
+    te::Plugin* setInstrument(int track, const juce::PluginDescription&, juce::String& error);
+    void removeInstrument(int track);
+    /** Names of the enabled MIDI inputs. */
+    juce::StringArray getMidiInputNames() const;
 
     // Tempo, metronome, punch (synced to the Edit by the timer)
     std::atomic<double> bpm { 120.0 };
@@ -137,7 +149,7 @@ private:
     struct Synced
     {
         float volumeDb = 0, pan = 0, send = 0, lowCut = 20, highCut = 20000, midFreq = 1000, midGainDb = 0;
-        bool mute = false, solo = false;
+        bool mute = false, solo = false, midi = false;
         juce::String name;
         juce::uint32 colour = 0;
     };

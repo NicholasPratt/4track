@@ -1,9 +1,10 @@
 #pragma once
 
 #include <juce_core/juce_core.h>
+#include <juce_data_structures/juce_data_structures.h>
 
 /**
-    View of one audio clip on the timeline, in samples at the current device rate.
+    View of one clip (audio or MIDI) on the timeline, in samples at the current device rate.
     Built from the Tracktion Edit (see Project) and edited by the Arrangement
     operations; the result is written back to the Edit. Cheap to copy.
 */
@@ -18,6 +19,13 @@ struct Clip
     juce::int64 fadeIn = 0;
     juce::int64 fadeOut = 0;
     float gain = 1.0f;
+
+    // MIDI clips have no file: they play the notes stored in the Edit. A MIDI clip made by
+    // an edit (e.g. the right half of a split) is created from a copy of midiState, the
+    // state of the clip it came from.
+    bool midi = false;
+    juce::ValueTree midiState;
+    static constexpr juce::int64 kMidiSourceLength = (juce::int64) 1 << 50;   // MIDI clips can be extended freely
 
     juce::int64 end() const { return start + length; }
 

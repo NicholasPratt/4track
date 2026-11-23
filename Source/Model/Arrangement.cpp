@@ -77,7 +77,7 @@ void Arrangement::clearRange(int track, juce::int64 a, juce::int64 b)
         {
             Clip left = c;
             left.length = a - c.start;
-            left.fadeOut = kEdgeFade;
+            left.fadeOut = c.midi ? 0 : kEdgeFade;
             clampFades(left);
             out.push_back(left);
         }
@@ -89,7 +89,7 @@ void Arrangement::clearRange(int track, juce::int64 a, juce::int64 b)
             right.start = b;
             right.sourceOffset += cut;
             right.length = c.end() - b;
-            right.fadeIn = kEdgeFade;
+            right.fadeIn = c.midi ? 0 : kEdgeFade;
             right.id = keepLeft ? nextClipId++ : c.id;
             clampFades(right);
             out.push_back(right);
@@ -224,7 +224,7 @@ bool Arrangement::splitClip(juce::int64 id, juce::int64 position)
 bool Arrangement::setFades(juce::int64 id, juce::int64 fadeIn, juce::int64 fadeOut)
 {
     auto* c = findMutable(id);
-    if (c == nullptr)
+    if (c == nullptr || c->midi)
         return false;
 
     fadeIn  = juce::jlimit<juce::int64>(0, c->length, fadeIn);
@@ -240,7 +240,7 @@ bool Arrangement::setFades(juce::int64 id, juce::int64 fadeIn, juce::int64 fadeO
 bool Arrangement::setGain(juce::int64 id, float gain)
 {
     auto* c = findMutable(id);
-    if (c == nullptr || juce::exactlyEqual(c->gain, gain))
+    if (c == nullptr || c->midi || juce::exactlyEqual(c->gain, gain))
         return false;
     c->gain = gain;
     return true;
@@ -259,7 +259,8 @@ void Arrangement::rescalePositions(double ratio)
             c.length = std::max<juce::int64>(1, scale(c.length));
             c.fadeIn = scale(c.fadeIn);
             c.fadeOut = scale(c.fadeOut);
-            c.sourceLength = scale(c.sourceLength);
+            if (!c.midi)
+                c.sourceLength = scale(c.sourceLength);
             c.length = std::min(c.length, c.sourceLength - c.sourceOffset);
             clampFades(c);
         }

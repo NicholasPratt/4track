@@ -19,7 +19,7 @@ namespace
             {
                 const auto& x = a.tracks[t][i];
                 const auto& y = b.tracks[t][i];
-                if (x.id != y.id || x.file != y.file || x.start != y.start || x.length != y.length
+                if (x.id != y.id || x.midi != y.midi || x.file != y.file || x.start != y.start || x.length != y.length
                     || x.sourceOffset != y.sourceOffset || x.sourceLength != y.sourceLength
                     || x.fadeIn != y.fadeIn || x.fadeOut != y.fadeOut || std::abs(x.gain - y.gain) > 1.0e-5f)
                     return false;
@@ -113,6 +113,22 @@ void Project::rebuild()
 
         for (auto* teClip : track->getClips())
         {
+            if (auto* midiClip = dynamic_cast<te::MidiClip*>(teClip))
+            {
+                const auto pos = midiClip->getPosition();
+                Clip c;
+                c.id = (juce::int64) midiClip->itemID.getRawID();
+                c.midi = true;
+                c.midiState = midiClip->state;
+                c.sourceLength = Clip::kMidiSourceLength;
+                c.start = engine.toSamples(pos.getStart());
+                c.length = engine.toSamples(pos.getLength());
+                c.sourceOffset = engine.toSamples(pos.getOffset());
+                next.tracks[(size_t) t].push_back(c);
+                maxId = juce::jmax(maxId, c.id);
+                continue;
+            }
+
             auto* wave = dynamic_cast<te::WaveAudioClip*>(teClip);
             if (wave == nullptr)
                 continue;
@@ -149,12 +165,12 @@ void Project::rebuild()
 void Project::writeToEdit(const Arrangement& target)
 {
     // Clips currently in the Edit, by id, with the track they are on.
-    std::map<juce::int64, std::pair<te::AudioClipBase*, int>> existing;
+    std::map<juce::int64, std::pair<te::Clip*, int>> existing;
     for (int t = 0; t < kNumTracks; ++t)
         if (auto* track = engine.getAudioTrack(t))
             for (auto* c : track->getClips())
-                if (auto* audio = dynamic_cast<te::AudioClipBase*>(c))
-                    existing[(juce::int64) c->itemID.getRawID()] = { audio, t };
+                if (dynamic_cast<te::AudioClipBase*>(c) != nullptr || dynamic_cast<te::MidiClip*>(c) != nullptr)
+                    existing[(juce::int64) c->itemID.getRawID()] = { c, t };
 
     std::set<juce::int64> kept;
     for (int t = 0; t < kNumTracks; ++t)
@@ -164,7 +180,7 @@ void Project::writeToEdit(const Arrangement& target)
         {
             const te::ClipPosition position { { engine.toTime(c.start), engine.toTime(c.end()) },
                                               engine.toDuration(c.sourceOffset) };
-            te::AudioClipBase* clip = nullptr;
+            te::Clip* clip = nullptr;
 
             if (auto it = existing.find(c.id); it != existing.end())
             {
@@ -173,6 +189,18 @@ void Project::writeToEdit(const Arrangement& target)
                 if (it->second.second != t)
                     clip->moveTo(*track);
                 clip->setPosition(position);
+            }
+            else if (c.midi)
+            {
+                // A new MIDI clip: a copy of the clip it was cut from (split, trimmed by a
+                // move), or an empty one.
+                if (c.midiState.isValid())
+                    clip = track->insertClipWithState(c.midiState.createCopy(), c.midiState[te::IDs::name].toString(),
+                                                      te::TrackItem::Type::midi, position, false, false);
+                else
+                    clip = track->insertMIDIClip(position.time, nullptr).get();
+                if (clip != nullptr)
+                    clip->setPosition(position);
             }
             else
             {
@@ -183,9 +211,12 @@ void Project::writeToEdit(const Arrangement& target)
                 clip = made.get();
             }
 
-            clip->setFadeIn(engine.toDuration(c.fadeIn));
-            clip->setFadeOut(engine.toDuration(c.fadeOut));
-            clip->setGainDB(gainToDb(c.gain));
+            if (auto* audio = dynamic_cast<te::AudioClipBase*>(clip))
+            {
+                audio->setFadeIn(engine.toDuration(c.fadeIn));
+                audio->setFadeOut(engine.toDuration(c.fadeOut));
+                audio->setGainDB(gainToDb(c.gain));
+            }
         }
     }
 
@@ -256,8 +287,43 @@ bool Project::prepareFolder(juce::String& error)
     return true;
 }
 
+te::MidiClip* Project::createMidiClip(int track, juce::int64 start, juce::int64 length)
+{
+    juce::int64 newId = 0;
+    perform([&](Arrangement& a)
+    {
+        Clip c;
+        c.midi = true;
+        c.sourceLength = Clip::kMidiSourceLength;
+        c.start = juce::jmax<juce::int64>(0, start);
+        c.length = length;
+        newId = a.insertClip(track, c);
+        return newId != 0;
+    });
+    if (newId == 0)
+        return nullptr;
+
+    // The Edit gave the new clip its own id; it's the MIDI clip now at that position.
+    for (auto& c : arrangement.tracks[(size_t) track])
+        if (c.midi && std::abs(c.start - juce::jmax<juce::int64>(0, start)) <= 1)
+            return getMidiClip(c.id);
+    return nullptr;
+}
+
+te::MidiClip* Project::getMidiClip(juce::int64 clipId) const
+{
+    if (edit == nullptr)
+        return nullptr;
+    return dynamic_cast<te::MidiClip*>(te::findClipForID(*edit, te::EditItemID::fromRawID((juce::uint64) clipId)));
+}
+
 bool Project::importAudio(const juce::File& file, int track, juce::int64 position, juce::String& error)
 {
+    if (engine.getTrack(track).midi.load())
+    {
+        error = engine.getTrack(track).name + " is a MIDI track; audio goes on audio tracks";
+        return false;
+    }
     if (!te::AudioFile(engine.getTracktion(), file).isValid())
     {
         error = "Couldn't read " + file.getFileName() + " as audio";

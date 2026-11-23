@@ -36,6 +36,7 @@ struct TrackParams
     std::atomic<int>  monitor { (int) MonitorMode::Off };
     std::atomic<int>  inputType { (int) InputType::Mono };
     std::atomic<int>  inputChannel { 0 };    // mono channel, or left of a stereo pair
+    std::atomic<bool> midi { false };        // a MIDI track: records from MIDI inputs, plays an instrument
 
     // Meters: max peak since the UI last read them (UI calls exchange(0)).
     std::atomic<float> peakL { 0.0f }, peakR { 0.0f };

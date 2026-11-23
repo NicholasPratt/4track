@@ -53,9 +53,9 @@ TrackLanes::Hit TrackLanes::findHit(juce::Point<float> p) const
         const float fadeInX = view.xFor(c.start + c.fadeIn);
         const float fadeOutX = view.xFor(c.end() - c.fadeOut);
 
-        if (p.y < r.getY() + 12.0f && std::abs(p.x - fadeInX) <= 6.0f && p.x < r.getCentreX())
+        if (!c.midi && p.y < r.getY() + 12.0f && std::abs(p.x - fadeInX) <= 6.0f && p.x < r.getCentreX())
             hit.zone = Zone::FadeIn;
-        else if (p.y < r.getY() + 12.0f && std::abs(p.x - fadeOutX) <= 6.0f && p.x > r.getCentreX())
+        else if (!c.midi && p.y < r.getY() + 12.0f && std::abs(p.x - fadeOutX) <= 6.0f && p.x > r.getCentreX())
             hit.zone = Zone::FadeOut;
         else if (p.x < r.getX() + edge)
             hit.zone = Zone::TrimStart;
@@ -177,13 +177,21 @@ void TrackLanes::paintClip(juce::Graphics& g, const Clip& c, int track, bool sel
     {
         g.setColour(juce::Colours::black.withAlpha(0.75f));
         g.setFont(Theme::font(10.0f, true));
-        g.drawText(c.file.getFileNameWithoutExtension(),
+        g.drawText(c.midi ? juce::String("MIDI") : c.file.getFileNameWithoutExtension(),
                    header.reduced(5.0f, 0.0f).withX(juce::jmax(header.getX() + 5.0f, 2.0f)),
                    juce::Justification::centredLeft, true);
     }
 
-    // Waveform: only the visible part of the clip, mapped to the matching part of the file.
     auto waveArea = r.withTrimmedTop(15.0f).reduced(0.0f, 2.0f);
+    if (c.midi)
+    {
+        paintNotes(g, c, waveArea.reduced(0.0f, 2.0f), base.brighter(0.5f));
+        g.setColour(selected ? Theme::text : base.withAlpha(0.7f));
+        g.drawRoundedRectangle(r, 4.0f, selected ? 1.6f : 1.0f);
+        return;
+    }
+
+    // Waveform: only the visible part of the clip, mapped to the matching part of the file.
     const auto visible = waveArea.getIntersection(getLocalBounds().toFloat());
     if (visible.getWidth() >= 1.0f && c.file.existsAsFile())
     {
@@ -231,6 +239,45 @@ void TrackLanes::paintClip(juce::Graphics& g, const Clip& c, int track, bool sel
 
     g.setColour(selected ? Theme::text : base.withAlpha(0.7f));
     g.drawRoundedRectangle(r, 4.0f, selected ? 1.6f : 1.0f);
+}
+
+void TrackLanes::paintNotes(juce::Graphics& g, const Clip& c, juce::Rectangle<float> area, juce::Colour colour)
+{
+    auto* mc = project.getMidiClip(c.id);   // (pieces that only exist in a drag preview have no notes yet)
+    if (mc == nullptr || area.getHeight() < 4.0f)
+        return;
+    auto& notes = mc->getSequence().getNotes();
+    if (notes.isEmpty())
+        return;
+
+    int lo = 127, hi = 0;
+    for (auto* n : notes)
+    {
+        lo = juce::jmin(lo, n->getNoteNumber());
+        hi = juce::jmax(hi, n->getNoteNumber());
+    }
+    const int mid = (lo + hi) / 2;
+    lo = juce::jmin(lo, mid - 6);
+    hi = juce::jmax(hi, mid + 6);
+    const float rowH = area.getHeight() / (float) (hi - lo + 1);
+
+    // Positions come from the Edit's clip; the arrangement clip may be mid-drag elsewhere.
+    const auto teStart = mc->getPosition().getStart();
+    g.setColour(colour);
+    for (auto* n : notes)
+    {
+        const auto range = n->getEditTimeRange(*mc);
+        const auto from = c.start + engine.toSamples(range.getStart() - teStart);
+        const auto to = c.start + engine.toSamples(range.getEnd() - teStart);
+        if (to <= c.start || from >= c.end())
+            continue;
+        const float x0 = view.xFor(juce::jmax(from, c.start));
+        const float x1 = view.xFor(juce::jmin(to, c.end()));
+        if (x1 < 0.0f || x0 > (float) getWidth())
+            continue;
+        const float y = area.getBottom() - (float) (n->getNoteNumber() - lo + 1) * rowH;
+        g.fillRect(juce::Rectangle<float>(x0, y, juce::jmax(1.5f, x1 - x0 - 1.0f), juce::jmax(1.5f, rowH - 1.0f)));
+    }
 }
 
 void TrackLanes::paintLiveTakes(juce::Graphics& g)
@@ -363,8 +410,11 @@ std::function<bool(Arrangement&)> TrackLanes::editForDrag(const juce::MouseEvent
             const int trackShift = trackAtY(e.position.y) - dragDownTrack;
             auto ids = selection;
             ids.insert(id);
+            std::array<bool, kNumTracks> midiTrack {};
+            for (int t = 0; t < kNumTracks; ++t)
+                midiTrack[(size_t) t] = engine.getTrack(t).midi.load();
 
-            return [ids, shift, trackShift](Arrangement& a)
+            return [ids, shift, trackShift, midiTrack](Arrangement& a)
             {
                 std::vector<std::pair<int, Clip>> moving;
                 int minTrack = kNumTracks, maxTrack = -1;
@@ -380,7 +430,10 @@ std::function<bool(Arrangement&)> TrackLanes::editForDrag(const juce::MouseEvent
                         allowedShift = juce::jmax(allowedShift, -m->start);   // nothing before zero
                     }
                 }
-                const int ts = juce::jlimit(-minTrack, kNumTracks - 1 - maxTrack, trackShift);
+                int ts = juce::jlimit(-minTrack, kNumTracks - 1 - maxTrack, trackShift);
+                for (auto& m : moving)   // audio clips stay on audio tracks, MIDI clips on MIDI tracks
+                    if (midiTrack[(size_t) (m.first + ts)] != m.second.midi)
+                        ts = 0;
                 if (moving.empty() || (allowedShift == 0 && ts == 0))
                     return false;
 
@@ -467,13 +520,21 @@ void TrackLanes::showClipMenu(juce::int64 clipId)
     const bool canSplit = playhead > c->start && playhead < c->end();
 
     juce::PopupMenu menu;
+    if (c->midi)
+    {
+        menu.addItem(7, "Edit Notes...");
+        menu.addSeparator();
+    }
     menu.addItem(1, "Split at Playhead", canSplit);
     menu.addItem(2, "Delete");
-    menu.addItem(3, "Reset Fades");
-    menu.addSeparator();
-    menu.addItem(4, "Gain +3 dB");
-    menu.addItem(5, "Gain -3 dB");
-    menu.addItem(6, "Reset Gain", std::abs(c->gain - 1.0f) > 0.0001f);
+    if (!c->midi)
+    {
+        menu.addItem(3, "Reset Fades");
+        menu.addSeparator();
+        menu.addItem(4, "Gain +3 dB");
+        menu.addItem(5, "Gain -3 dB");
+        menu.addItem(6, "Reset Gain", std::abs(c->gain - 1.0f) > 0.0001f);
+    }
 
     juce::Component::SafePointer<TrackLanes> safe(this);
     menu.showMenuAsync(juce::PopupMenu::Options(), [safe, clipId, playhead](int result)
@@ -494,6 +555,7 @@ void TrackLanes::showClipMenu(juce::int64 clipId)
             case 4: proj.perform([=](Arrangement& a) { return a.setGain(clipId, gain * 1.4125f); }); break;
             case 5: proj.perform([=](Arrangement& a) { return a.setGain(clipId, gain / 1.4125f); }); break;
             case 6: proj.perform([=](Arrangement& a) { return a.setGain(clipId, 1.0f); }); break;
+            case 7: if (safe->onEditMidiClip) safe->onEditMidiClip(clipId); break;
             default: break;
         }
         safe->pruneSelection();
@@ -526,6 +588,34 @@ void TrackLanes::mouseMagnify(const juce::MouseEvent& e, float scale)
 {
     view.zoomAround(e.position.x, 1.0 / juce::jmax(0.1f, scale));
     if (onViewChanged) onViewChanged();
+}
+
+void TrackLanes::mouseDoubleClick(const juce::MouseEvent& e)
+{
+    const auto hit = findHit(e.position);
+    const int track = trackAtY(e.position.y);
+    if (!engine.getTrack(track).midi.load() || onEditMidiClip == nullptr)
+        return;
+
+    if (hit.clipId != 0)
+    {
+        onEditMidiClip(hit.clipId);
+        return;
+    }
+
+    // A one-bar clip at the bar that was clicked.
+    const auto bar = engine.getSamplesPerBar();
+    const auto start = (juce::jmax<juce::int64>(0, view.sampleAt(e.position.x)) / bar) * bar;
+    if (auto* clip = project.createMidiClip(track, start, bar))
+    {
+        for (auto& c : project.getArrangement().tracks[(size_t) track])
+            if (project.getMidiClip(c.id) == clip)
+            {
+                selection = { c.id };
+                onEditMidiClip(c.id);
+            }
+    }
+    repaint();
 }
 
 bool TrackLanes::isInterestedInFileDrag(const juce::StringArray& files)

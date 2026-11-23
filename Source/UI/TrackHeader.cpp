@@ -1,4 +1,5 @@
 #include "TrackHeader.h"
+#include "PluginWindows.h"
 
 namespace
 {
@@ -90,6 +91,13 @@ TrackHeader::TrackHeader(AudioEngine& e, Project& pr, int trackIndex)
     input.onChange = [this] { applyInputSelection(input, params); edited(); };
     addAndMakeVisible(input);
 
+    instrument.setTooltip("The instrument this MIDI track plays. It records from every MIDI input.");
+    instrument.onClick = [this] { showInstrumentMenu(); };
+    addChildComponent(instrument);
+
+    name.addMouseListener(this, false);   // right-click the name for the track menu
+    name.setTooltip("Double-click to rename, right-click for audio/MIDI");
+
     volume.setSliderStyle(juce::Slider::LinearHorizontal);
     volume.setTextBoxStyle(juce::Slider::NoTextBox, false, 0, 0);
     volume.setRange(-60.0, 6.0, 0.1);
@@ -116,6 +124,137 @@ TrackHeader::TrackHeader(AudioEngine& e, Project& pr, int trackIndex)
 
     addAndMakeVisible(meter);
     refresh();
+}
+
+void TrackHeader::mouseDown(const juce::MouseEvent& e)
+{
+    if (onClicked)
+        onClicked();
+    if (e.mods.isPopupMenu())
+        showTrackMenu();
+}
+
+void TrackHeader::showTrackMenu()
+{
+    const bool hasClips = !project.getArrangement().tracks[(size_t) index].empty();
+    const bool midi = params.midi.load();
+    const bool recording = engine.getState() == AudioEngine::State::Recording;
+
+    juce::PopupMenu menu;
+    menu.addSectionHeader(params.name);
+    menu.addItem(1, "Audio Track", !recording && (midi ? !hasClips : true), !midi);
+    menu.addItem(2, "MIDI Track", !recording && (midi ? true : !hasClips), midi);
+    if (hasClips)
+        menu.addItem(3, "(A track can change type only when it has no clips)", false);
+
+    menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&name),
+                       [safe = SafePointer<TrackHeader>(this)](int result)
+    {
+        if (safe != nullptr && (result == 1 || result == 2))
+            safe->setMidi(result == 2);
+    });
+}
+
+void TrackHeader::setMidi(bool midi)
+{
+    if (params.midi.load() == midi || !project.getArrangement().tracks[(size_t) index].empty())
+        return;
+    if (!midi)
+        engine.removeInstrument(index);   // an instrument would replace an audio track's sound
+    params.armed = false;
+    params.midi = midi;
+    params.monitor = (int) (midi ? MonitorMode::Auto : MonitorMode::Off);   // hear the keyboard while armed
+    engine.syncNow();
+    updateKind();
+    edited();
+}
+
+void TrackHeader::showInstrumentMenu()
+{
+    juce::Array<juce::PluginDescription> instruments;
+    for (auto& type : engine.getKnownPlugins().getTypes())
+        if (type.isInstrument)
+            instruments.add(type);
+
+    auto* current = engine.getInstrument(index);
+    juce::PopupMenu choose;
+    if (instruments.isEmpty())
+        choose.addItem(-1, "No instruments found yet", false);
+    else
+        juce::KnownPluginList::addToMenu(choose, instruments, juce::KnownPluginList::sortByManufacturer,
+                                         current != nullptr ? current->getIdentifierString() : juce::String());
+
+    juce::PopupMenu menu;
+    if (current != nullptr)
+    {
+        menu.addItem(-3, "Open " + current->getName());
+        menu.addItem(-4, "Remove Instrument");
+        menu.addSeparator();
+        menu.addSubMenu("Change Instrument", choose);
+    }
+    else
+    {
+        menu = choose;
+    }
+    menu.addSeparator();
+    menu.addItem(-2, "Scan for Plugins...");
+
+    menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&instrument),
+                       [safe = SafePointer<TrackHeader>(this), instruments](int result)
+    {
+        if (safe == nullptr || result == 0)
+            return;
+        auto& eng = safe->engine;
+        const int track = safe->index;
+        if (result == -2)
+            showPluginManager(eng);
+        else if (result == -3)
+        {
+            if (auto* p = eng.getInstrument(track))
+                p->showWindowExplicitly();
+        }
+        else if (result == -4)
+        {
+            eng.removeInstrument(track);
+            safe->edited();
+        }
+        else if (const int chosen = juce::KnownPluginList::getIndexChosenByMenu(instruments, result); chosen >= 0)
+        {
+            juce::String error;
+            if (auto* p = eng.setInstrument(track, instruments.getReference(chosen), error))
+            {
+                p->showWindowExplicitly();
+                safe->edited();
+            }
+            else
+            {
+                juce::AlertWindow::showAsync(juce::MessageBoxOptions()
+                                                 .withIconType(juce::MessageBoxIconType::WarningIcon)
+                                                 .withTitle("Couldn't load instrument")
+                                                 .withMessage(error)
+                                                 .withButton("OK", 0),
+                                             nullptr);
+            }
+        }
+        safe->updateKind();
+    });
+}
+
+void TrackHeader::updateKind()
+{
+    const bool midi = params.midi.load();
+    auto* inst = engine.getInstrument(index);
+    const auto instName = inst != nullptr ? inst->getName() : juce::String();
+    if (midi == shownAsMidi && instName == shownInstrument)
+        return;
+    shownAsMidi = midi;
+    shownInstrument = instName;
+
+    input.setVisible(!midi);
+    instrument.setVisible(midi);
+    instrument.setButtonText(instName.isNotEmpty() ? instName : juce::String("Choose instrument..."));
+    instrument.setColour(juce::TextButton::textColourOffId, instName.isNotEmpty() ? Theme::text : Theme::textDim);
+    repaint();
 }
 
 void TrackHeader::edited()
@@ -153,6 +292,7 @@ void TrackHeader::refresh()
     solo.setToggleState(params.solo.load(), juce::dontSendNotification);
     styleMonitorButton();
 
+    updateKind();
     if (!input.isPopupActive())
         showTrackInput(input, params);
     input.setEnabled(engine.getState() != AudioEngine::State::Recording);
@@ -190,6 +330,7 @@ void TrackHeader::resized()
 
     r.removeFromTop(4);
     input.setBounds(r.removeFromTop(20));
+    instrument.setBounds(input.getBounds());
 
     r.removeFromTop(4);
     auto row3 = r.removeFromTop(18);

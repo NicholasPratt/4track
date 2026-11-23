@@ -2,6 +2,7 @@
 
 #include "ArrangeView.h"
 #include "MixerPanel.h"
+#include "PianoRoll.h"
 #include "PluginWindows.h"
 #include "TransportBar.h"
 
@@ -57,6 +58,8 @@ private:
     void deleteSelection();
     void setPunchPoint(bool in);
     void toggleMixer();
+    void openPianoRoll(juce::int64 clipId);
+    void closePianoRoll();
 
     void confirmDiscard(std::function<void()> proceed);
     void saveProject(bool chooseLocation, std::function<void(bool saved)> then = {});
@@ -73,11 +76,13 @@ private:
     std::unique_ptr<ArrangeView> arrange;
     std::unique_ptr<TransportBar> transport;
     std::unique_ptr<MixerPanel> mixer;
+    std::unique_ptr<PianoRoll> pianoRoll;   // replaces the mixer in the bottom panel while open
     std::unique_ptr<juce::MenuBarComponent> menuBar;   // non-mac only
     juce::TooltipWindow tooltips { this, 600 };
     std::shared_ptr<juce::FileChooser> chooser;
 
     bool mixerVisible = false;
+    bool pianoRollVisible = false;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(MainComponent)
 };

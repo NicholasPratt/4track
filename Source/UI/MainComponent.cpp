@@ -32,6 +32,10 @@ MainComponent::MainComponent()
     addAndMakeVisible(*transport);
     addAndMakeVisible(*arrange);
     addChildComponent(*mixer);
+    pianoRoll = std::make_unique<PianoRoll>(engine, project);
+    pianoRoll->onClose = [this] { closePianoRoll(); };
+    addChildComponent(*pianoRoll);
+    arrange->getLanes().onEditMidiClip = [this](juce::int64 id) { openPianoRoll(id); };
 
     transport->onPlay = [this] { if (engine.getState() == AudioEngine::State::Stopped) engine.play(); };
     transport->onStop = [this] { engine.stop(); };
@@ -54,6 +58,7 @@ MainComponent::MainComponent()
 
     disableFocus(*this);
     setWantsKeyboardFocus(true);
+    pianoRoll->setWantsKeyboardFocus(true);   // Delete removes the selected note while it has focus
 
     arrange->setInputs(engine.getInputs());
     setSize(1320, 820);
@@ -90,7 +95,9 @@ void MainComponent::resized()
     if (menuBar != nullptr)
         menuBar->setBounds(r.removeFromTop(24));
     transport->setBounds(r.removeFromTop(52));
-    if (mixerVisible)
+    if (pianoRollVisible)
+        pianoRoll->setBounds(r.removeFromBottom(MixerPanel::kHeight));
+    else if (mixerVisible)
         mixer->setBounds(r.removeFromBottom(MixerPanel::kHeight));
     arrange->setBounds(r);
 }
@@ -118,6 +125,8 @@ void MainComponent::timerCallback()
 
     transport->tick();
     arrange->tick();
+    if (pianoRollVisible && engine.getState() != AudioEngine::State::Stopped)
+        pianoRoll->repaint();   // playhead
 
     if (auto* window = findParentComponentOfClass<juce::DocumentWindow>())
     {
@@ -140,6 +149,8 @@ void MainComponent::projectChanged()
     arrange->projectChanged();
     transport->refresh();
     mixer->refresh();
+    if (pianoRollVisible)
+        pianoRoll->refresh();
     menuItemsChanged();
 }
 
@@ -226,8 +237,29 @@ void MainComponent::setPunchPoint(bool in)
     arrange->viewChanged();
 }
 
+void MainComponent::openPianoRoll(juce::int64 clipId)
+{
+    pianoRoll->setVisible(true);
+    pianoRollVisible = true;
+    mixer->setVisible(false);
+    resized();
+    pianoRoll->setClip(clipId);
+    pianoRoll->grabKeyboardFocus();
+}
+
+void MainComponent::closePianoRoll()
+{
+    pianoRollVisible = false;
+    pianoRoll->setVisible(false);
+    mixer->setVisible(mixerVisible);
+    resized();
+    grabKeyboardFocus();
+}
+
 void MainComponent::toggleMixer()
 {
+    if (pianoRollVisible)
+        closePianoRoll();
     mixerVisible = !mixerVisible;
     mixer->setVisible(mixerVisible);
     transport->setMixerVisible(mixerVisible);
@@ -292,6 +324,11 @@ bool MainComponent::keyPressed(const juce::KeyPress& key, juce::Component* origi
     // Let text fields have their keys.
     if (dynamic_cast<juce::TextEditor*>(origin) != nullptr)
         return false;
+
+    // The note editor handles Delete and Escape itself.
+    if (pianoRollVisible && pianoRoll->hasKeyboardFocus(true)
+        && (key == juce::KeyPress::deleteKey || key == juce::KeyPress::backspaceKey || key == juce::KeyPress::escapeKey))
+        return pianoRoll->keyPressed(key);
 
     const auto mods = key.getModifiers();
     const bool cmd = mods.isCommandDown();
@@ -595,6 +632,33 @@ void MainComponent::runDebugSnapshot(const juce::StringArray& args)
         }
         else if (args[i] == "--mixer" && !mixerVisible)
             toggleMixer();
+        else if (args[i] == "--midi" && i + 1 < args.size())   // --midi <track>: a MIDI track with notes, piano roll open
+        {
+            const int t = args[++i].getIntValue();
+            engine.getTrack(t).midi = true;
+            engine.syncNow();
+            juce::OwnedArray<juce::PluginDescription> found;
+            for (auto* format : engine.getTracktion().getPluginManager().pluginFormatManager.getFormats())
+                if (format->getName() == "AudioUnit")
+                    format->findAllTypesForFile(found, "AudioUnit:Synths/aumu,dls ,appl");
+            juce::String error;
+            if (!found.isEmpty())
+                engine.setInstrument(t, *found[0], error);
+            const auto bar = engine.getSamplesPerBar();
+            if (auto* clip = project.createMidiClip(t, bar, 2 * bar))
+            {
+                const int pitches[] = { 60, 64, 67, 72, 71, 67, 64, 62 };
+                for (int n = 0; n < 8; ++n)
+                    clip->getSequence().addNote(pitches[n], te::BeatPosition::fromBeats(n), te::BeatDuration::fromBeats(n % 4 == 3 ? 1.0 : 0.5),
+                                                90 + n * 4, 0, &project.getEdit().getUndoManager());
+                juce::Timer::callAfterDelay(300, [this, t]
+                {
+                    for (auto& c : project.getArrangement().tracks[(size_t) t])
+                        if (c.midi)
+                            openPianoRoll(c.id);
+                });
+            }
+        }
         else if (args[i] == "--insert" && i + 2 < args.size())   // --insert <track> <AU id, e.g. aufx,dely,appl>
         {
             const int t = args[++i].getIntValue();
