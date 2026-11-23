@@ -21,6 +21,10 @@
       drop audio files        import them at the drop point
       double-click            on a MIDI clip: edit its notes; on an empty MIDI lane: add a one-bar clip
 
+    A track showing automation (chosen with the A button in its header) draws the curve over
+    its clips, and the mouse edits the curve instead: click to add a point, drag a point to
+    move it, double-click a point to delete it, right-click to clear or go back to the clips.
+
     During a drag the edit is applied to a preview copy of the arrangement. It's
     committed as one undo step on mouse-up.
 */
@@ -71,6 +75,17 @@ private:
     void paintClip(juce::Graphics&, const Clip&, int track, bool selected, bool hovered);
     void paintLiveTakes(juce::Graphics&);
     void paintNotes(juce::Graphics&, const Clip&, juce::Rectangle<float> area, juce::Colour);
+
+    // Automation
+    te::AutomatableParameter* automationFor(int track) const;
+    juce::Rectangle<float> automationArea(int track) const;
+    float yForValue(const te::AutomatableParameter&, float value, int track) const;
+    float valueAtY(const te::AutomatableParameter&, float y, int track) const;
+    int automationPointAt(const te::AutomatableParameter&, int track, juce::Point<float>) const;
+    void paintAutomation(juce::Graphics&, int track, te::AutomatableParameter&);
+    void automationMouseDown(const juce::MouseEvent&, int track, te::AutomatableParameter&);
+    void showAutomationMenu(int track, te::AutomatableParameter&);
+    struct AutomationDrag { int track = -1, index = -1; te::AutomatableParameter::Ptr param; } autoDrag;
     te::SmartThumbnail& thumbnailFor(const juce::File&);
 
     AudioEngine& engine;

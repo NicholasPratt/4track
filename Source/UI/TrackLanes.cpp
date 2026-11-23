@@ -117,6 +117,10 @@ void TrackLanes::paint(juce::Graphics& g)
 
     paintLiveTakes(g);
 
+    for (int t = 0; t < kNumTracks; ++t)
+        if (auto* param = automationFor(t))
+            paintAutomation(g, t, *param);
+
     if (arr.isEmpty() && engine.getState() != AudioEngine::State::Recording)
     {
         g.setColour(Theme::textDim);
@@ -326,6 +330,19 @@ void TrackLanes::paintLiveTakes(juce::Graphics& g)
 //==============================================================================
 void TrackLanes::mouseMove(const juce::MouseEvent& e)
 {
+    const int track = trackAtY(e.position.y);
+    if (auto* param = automationFor(track))
+    {
+        if (hover.clipId != 0)
+        {
+            hover = {};
+            repaint();
+        }
+        setMouseCursor(automationPointAt(*param, track, e.position) >= 0 ? juce::MouseCursor::DraggingHandCursor
+                                                                         : juce::MouseCursor::CrosshairCursor);
+        return;
+    }
+
     const auto hit = findHit(e.position);
     if (hit.clipId != hover.clipId || hit.zone != hover.zone)
     {
@@ -352,6 +369,15 @@ void TrackLanes::mouseExit(const juce::MouseEvent&)
 
 void TrackLanes::mouseDown(const juce::MouseEvent& e)
 {
+    autoDrag = {};
+    if (auto* param = automationFor(trackAtY(e.position.y)))
+    {
+        if (onTrackClicked)
+            onTrackClicked(trackAtY(e.position.y));
+        automationMouseDown(e, trackAtY(e.position.y), *param);
+        return;
+    }
+
     dragHit = findHit(e.position);
     dragActive = false;
     dragDownSample = view.sampleAt(e.position.x);
@@ -477,6 +503,20 @@ std::function<bool(Arrangement&)> TrackLanes::editForDrag(const juce::MouseEvent
 
 void TrackLanes::mouseDrag(const juce::MouseEvent& e)
 {
+    if (autoDrag.param != nullptr)
+    {
+        auto& param = *autoDrag.param;
+        auto& curve = param.getCurve();
+        if (autoDrag.index < 0 || autoDrag.index >= curve.getNumPoints())
+            return;
+        const auto time = engine.toTime(juce::jmax<juce::int64>(0, snapped(view.sampleAt(e.position.x), e.mods)));
+        const float value = valueAtY(param, e.position.y, autoDrag.track);
+        autoDrag.index = curve.movePoint(param, autoDrag.index, time, value, false, &project.getEdit().getUndoManager());
+        project.markDirty();
+        repaint();
+        return;
+    }
+
     if (dragHit.clipId == 0)
     {
         // Dragging on empty space scrubs the playhead.
@@ -498,6 +538,14 @@ void TrackLanes::mouseDrag(const juce::MouseEvent& e)
 
 void TrackLanes::mouseUp(const juce::MouseEvent& e)
 {
+    if (autoDrag.param != nullptr)
+    {
+        autoDrag = {};
+        project.getEdit().getUndoManager().beginNewTransaction();
+        repaint();
+        return;
+    }
+
     if (dragActive && dragHit.clipId != 0)
     {
         if (auto edit = editForDrag(e))
@@ -592,6 +640,22 @@ void TrackLanes::mouseMagnify(const juce::MouseEvent& e, float scale)
 
 void TrackLanes::mouseDoubleClick(const juce::MouseEvent& e)
 {
+    if (auto* param = automationFor(trackAtY(e.position.y)))
+    {
+        // mouseDown already added a point if the click missed one; a double-click on a point removes it.
+        const int i = automationPointAt(*param, trackAtY(e.position.y), e.position);
+        if (i >= 0)
+        {
+            auto& um = project.getEdit().getUndoManager();
+            um.beginNewTransaction("Delete automation point");
+            param->getCurve().removePoint(i, &um);
+            um.beginNewTransaction();
+            project.markDirty();
+            repaint();
+        }
+        return;
+    }
+
     const auto hit = findHit(e.position);
     const int track = trackAtY(e.position.y);
     if (!engine.getTrack(track).midi.load() || onEditMidiClip == nullptr)
@@ -616,6 +680,151 @@ void TrackLanes::mouseDoubleClick(const juce::MouseEvent& e)
             }
     }
     repaint();
+}
+
+//==============================================================================
+te::AutomatableParameter* TrackLanes::automationFor(int track) const
+{
+    return engine.findAutomationTarget(track, engine.getTrack(track).automationShown);
+}
+
+juce::Rectangle<float> TrackLanes::automationArea(int track) const
+{
+    return juce::Rectangle<float>(0.0f, (float) (track * kTrackHeight - scrollY), (float) getWidth(), (float) kTrackHeight)
+               .reduced(0.0f, 8.0f);
+}
+
+float TrackLanes::yForValue(const te::AutomatableParameter& param, float value, int track) const
+{
+    const auto range = param.getValueRange();
+    const auto area = automationArea(track);
+    const float norm = range.getLength() > 0.0f ? (value - range.getStart()) / range.getLength() : 0.5f;
+    return area.getBottom() - juce::jlimit(0.0f, 1.0f, norm) * area.getHeight();
+}
+
+float TrackLanes::valueAtY(const te::AutomatableParameter& param, float y, int track) const
+{
+    const auto range = param.getValueRange();
+    const auto area = automationArea(track);
+    const float norm = juce::jlimit(0.0f, 1.0f, (area.getBottom() - y) / juce::jmax(1.0f, area.getHeight()));
+    return range.getStart() + norm * range.getLength();
+}
+
+int TrackLanes::automationPointAt(const te::AutomatableParameter& param, int track, juce::Point<float> p) const
+{
+    auto& curve = param.getCurve();
+    for (int i = curve.getNumPoints(); --i >= 0;)
+    {
+        const juce::Point<float> point { view.xFor(engine.toSamples(curve.getPointTime(i))), yForValue(param, curve.getPointValue(i), track) };
+        if (point.getDistanceFrom(p) <= 7.0f)
+            return i;
+    }
+    return -1;
+}
+
+void TrackLanes::paintAutomation(juce::Graphics& g, int track, te::AutomatableParameter& param)
+{
+    const auto lane = automationArea(track).expanded(0.0f, 8.0f);
+    if (lane.getBottom() < 0.0f || lane.getY() > (float) getHeight())
+        return;
+    const auto colour = juce::Colour(0xfff2b84b);
+
+    // Dim the clips: the curve is what's being edited.
+    g.setColour(Theme::bg.withAlpha(0.55f));
+    g.fillRect(lane.withTrimmedBottom(1.0f));
+
+    auto& curve = param.getCurve();
+    const float fallback = param.getCurrentBaseValue();
+    juce::Path line;
+    const float width = (float) getWidth();
+    for (float x = 0.0f; x <= width + 2.0f; x += 2.0f)
+    {
+        const auto time = engine.toTime(juce::jmax<juce::int64>(0, view.sampleAt(x)));
+        const float value = curve.getNumPoints() > 0 ? curve.getValueAt(time, fallback) : param.getCurrentValue();
+        const float y = yForValue(param, value, track);
+        if (x == 0.0f) line.startNewSubPath(x, y);
+        else           line.lineTo(x, y);
+    }
+    g.setColour(colour.withAlpha(curve.getNumPoints() > 0 ? 1.0f : 0.5f));
+    g.strokePath(line, juce::PathStrokeType(curve.getNumPoints() > 0 ? 1.8f : 1.2f));
+
+    for (int i = 0; i < curve.getNumPoints(); ++i)
+    {
+        const float x = view.xFor(engine.toSamples(curve.getPointTime(i)));
+        if (x < -6.0f || x > width + 6.0f)
+            continue;
+        const float y = yForValue(param, curve.getPointValue(i), track);
+        const bool active = autoDrag.param.get() == &param && autoDrag.index == i;
+        g.setColour(Theme::bg);
+        g.fillEllipse(x - 4.5f, y - 4.5f, 9.0f, 9.0f);
+        g.setColour(colour);
+        if (active) g.fillEllipse(x - 4.0f, y - 4.0f, 8.0f, 8.0f);
+        else        g.drawEllipse(x - 3.5f, y - 3.5f, 7.0f, 7.0f, 1.6f);
+    }
+
+    // What's shown, and its value at the playhead (or the dragged point).
+    juce::String text = param.getParameterName();
+    for (auto& target : engine.getAutomationTargets(track))
+        if (target.param == &param)
+            text = (target.group == "Mixer" ? juce::String() : target.group + ": ") + target.name;
+    const float shown = autoDrag.param.get() == &param && autoDrag.index >= 0 && autoDrag.index < curve.getNumPoints()
+                            ? curve.getPointValue(autoDrag.index)
+                            : param.getCurrentValue();
+    text << "  " << param.valueToString(shown);
+    g.setFont(Theme::font(11.0f, true));
+    const auto label = juce::Rectangle<float>(6.0f, lane.getY() + 3.0f, juce::jmin(320.0f, width - 12.0f), 15.0f);
+    g.setColour(Theme::bg.withAlpha(0.8f));
+    g.fillRoundedRectangle(label.withWidth(juce::jmin(label.getWidth(), juce::GlyphArrangement::getStringWidth(g.getCurrentFont(), text) + 12.0f)), 3.0f);
+    g.setColour(colour);
+    g.drawText(text, label.withTrimmedLeft(6.0f), juce::Justification::centredLeft, true);
+}
+
+void TrackLanes::automationMouseDown(const juce::MouseEvent& e, int track, te::AutomatableParameter& param)
+{
+    if (e.mods.isPopupMenu())
+    {
+        showAutomationMenu(track, param);
+        return;
+    }
+
+    auto& um = project.getEdit().getUndoManager();
+    um.beginNewTransaction("Edit automation");
+    int index = automationPointAt(param, track, e.position);
+    if (index < 0)
+    {
+        const auto time = engine.toTime(juce::jmax<juce::int64>(0, snapped(view.sampleAt(e.position.x), e.mods)));
+        index = param.getCurve().addPoint(time, valueAtY(param, e.position.y, track), 0.0f, &um);
+        project.markDirty();
+    }
+    autoDrag = { track, index, &param };
+    repaint();
+}
+
+void TrackLanes::showAutomationMenu(int track, te::AutomatableParameter& param)
+{
+    juce::PopupMenu menu;
+    menu.addSectionHeader(param.getParameterName());
+    menu.addItem(1, "Clear Automation", param.getCurve().getNumPoints() > 0);
+    menu.addItem(2, "Show Clips");
+    menu.showMenuAsync(juce::PopupMenu::Options(),
+                       [safe = juce::Component::SafePointer<TrackLanes>(this), track, ref = te::AutomatableParameter::Ptr(&param)](int result)
+    {
+        if (safe == nullptr)
+            return;
+        if (result == 1)
+        {
+            auto& um = safe->project.getEdit().getUndoManager();
+            um.beginNewTransaction("Clear automation");
+            ref->getCurve().clear(&um);
+            um.beginNewTransaction();
+            safe->project.markDirty();
+        }
+        else if (result == 2)
+        {
+            safe->engine.getTrack(track).automationShown = {};
+        }
+        safe->repaint();
+    });
 }
 
 bool TrackLanes::isInterestedInFileDrag(const juce::StringArray& files)

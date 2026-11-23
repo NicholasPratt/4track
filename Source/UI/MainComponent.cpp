@@ -659,6 +659,24 @@ void MainComponent::runDebugSnapshot(const juce::StringArray& args)
                 });
             }
         }
+        else if (args[i] == "--automate" && i + 1 < args.size())   // --automate <track>: a volume curve, shown
+        {
+            const int t = args[++i].getIntValue();
+            for (auto& target : engine.getAutomationTargets(t))
+                if (target.name == "Volume")
+                {
+                    auto& curve = target.param->getCurve();
+                    auto* um = &project.getEdit().getUndoManager();
+                    const float unity = target.param->getCurrentValue();
+                    const double bar = (double) engine.getSamplesPerBar() / engine.getSampleRate();
+                    curve.addPoint(te::TimePosition::fromSeconds(0.0), unity, 0.0f, um);
+                    curve.addPoint(te::TimePosition::fromSeconds(bar), unity, 0.0f, um);
+                    curve.addPoint(te::TimePosition::fromSeconds(bar * 2.0), unity * 0.35f, 0.0f, um);
+                    curve.addPoint(te::TimePosition::fromSeconds(bar * 3.0), unity * 0.35f, 0.0f, um);
+                    curve.addPoint(te::TimePosition::fromSeconds(bar * 3.5), unity, 0.0f, um);
+                    engine.getTrack(t).automationShown = target.key;
+                }
+        }
         else if (args[i] == "--insert" && i + 2 < args.size())   // --insert <track> <AU id, e.g. aufx,dely,appl>
         {
             const int t = args[++i].getIntValue();

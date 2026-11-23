@@ -1,5 +1,6 @@
 #include "TrackHeader.h"
 #include "PluginWindows.h"
+#include <map>
 
 namespace
 {
@@ -84,7 +85,10 @@ TrackHeader::TrackHeader(AudioEngine& e, Project& pr, int trackIndex)
         edited();
     };
 
-    for (auto* b : { &arm, &mute, &solo, &monitor })
+    automation.setTooltip("Automation: choose a control to draw its changes over time on this track");
+    automation.onClick = [this] { showAutomationMenu(); };
+
+    for (auto* b : { &arm, &mute, &solo, &monitor, &automation })
         addAndMakeVisible(b);
 
     input.setTooltip("Recording input");
@@ -240,6 +244,62 @@ void TrackHeader::showInstrumentMenu()
     });
 }
 
+void TrackHeader::showAutomationMenu()
+{
+    const auto targets = engine.getAutomationTargets(index);
+    const auto current = params.automationShown;
+
+    juce::PopupMenu menu;
+    menu.addItem(1, "Clips (no automation shown)", true, current.isEmpty());
+    menu.addSeparator();
+
+    std::map<juce::String, juce::PopupMenu> pluginMenus;
+    juce::StringArray pluginOrder;
+    for (size_t i = 0; i < targets.size(); ++i)
+    {
+        auto& target = targets[i];
+        const bool automated = target.param->hasAutomationPoints();
+        juce::PopupMenu::Item item(target.name + (automated ? juce::String(" (automated)") : juce::String()));
+        item.itemID = (int) i + 10;
+        item.isTicked = target.key == current;
+        if (target.group == "Mixer")
+        {
+            menu.addItem(item);
+        }
+        else
+        {
+            if (!pluginOrder.contains(target.group))
+                pluginOrder.add(target.group);
+            pluginMenus[target.group].addItem(item);
+        }
+    }
+    if (!pluginOrder.isEmpty())
+        menu.addSeparator();
+    for (auto& group : pluginOrder)
+        menu.addSubMenu(group, pluginMenus[group]);
+
+    menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&automation),
+                       [safe = SafePointer<TrackHeader>(this), targets](int result)
+    {
+        if (safe == nullptr || result == 0)
+            return;
+        safe->params.automationShown = result == 1 ? juce::String() : targets[(size_t) (result - 10)].key;
+        safe->styleAutomationButton();
+        if (safe->onChanged)
+            safe->onChanged();
+    });
+}
+
+void TrackHeader::styleAutomationButton()
+{
+    // Off when nothing is shown, or the shown control has gone (its plugin was removed).
+    if (params.automationShown.isNotEmpty() && engine.findAutomationTarget(index, params.automationShown) == nullptr)
+        params.automationShown = {};
+    const bool on = params.automationShown.isNotEmpty();
+    automation.setColour(juce::TextButton::buttonColourId, on ? juce::Colour(0xfff2b84b) : Theme::control);
+    automation.setColour(juce::TextButton::textColourOffId, on ? juce::Colours::black : Theme::text);
+}
+
 void TrackHeader::updateKind()
 {
     const bool midi = params.midi.load();
@@ -291,7 +351,7 @@ void TrackHeader::refresh()
     mute.setToggleState(params.mute.load(), juce::dontSendNotification);
     solo.setToggleState(params.solo.load(), juce::dontSendNotification);
     styleMonitorButton();
-
+    styleAutomationButton();
     updateKind();
     if (!input.isPopupActive())
         showTrackInput(input, params);
@@ -321,7 +381,7 @@ void TrackHeader::resized()
 
     auto row1 = r.removeFromTop(22);
     const int bw = 24;
-    for (auto* b : { &monitor, &solo, &mute, &arm })
+    for (auto* b : { &automation, &monitor, &solo, &mute, &arm })
     {
         b->setBounds(row1.removeFromRight(bw));
         row1.removeFromRight(3);

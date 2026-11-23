@@ -33,6 +33,8 @@ private:
     void styleMonitorButton();
     void showTrackMenu();
     void showInstrumentMenu();
+    void showAutomationMenu();
+    void styleAutomationButton();
     void setMidi(bool);
     void updateKind();
 
@@ -43,7 +45,7 @@ private:
     bool selected = false;
 
     juce::Label name;
-    juce::TextButton arm { "R" }, mute { "M" }, solo { "S" }, monitor { "I" };
+    juce::TextButton arm { "R" }, mute { "M" }, solo { "S" }, monitor { "I" }, automation { "A" };
     juce::ComboBox input;
     juce::TextButton instrument;   // MIDI tracks show this instead of the input
     bool shownAsMidi = false;

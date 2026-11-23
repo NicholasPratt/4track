@@ -597,11 +597,113 @@ public:
     }
 };
 
+/** Parameter automation on mixer controls, through Tracktion's curves. */
+class AutomationTests : public juce::UnitTest
+{
+public:
+    AutomationTests() : juce::UnitTest("Automation", "8track") {}
+
+    void runTest() override
+    {
+        auto dir = juce::File::createTempFile("8track-auto");
+        dir.createDirectory();
+        AudioEngine engine;
+        const double sr = engine.getSampleRate();
+        auto wav = writeWav(dir.getChildFile("tone.wav"), sr, (int) (2 * sr), 0.5f);
+        {
+            Project project(engine);
+            const auto untitledFolder = project.getFolder();
+            juce::String error;
+            expect(project.importAudio(wav, 0, 0, error), error);
+
+            beginTest("A track lists its mixer controls for automation");
+            auto targets = engine.getAutomationTargets(0);
+            expect(targets.size() >= 7);
+            const AudioEngine::AutomationTarget* volume = nullptr;
+            for (auto& t : targets)
+                if (t.name == "Volume")
+                    volume = &t;
+            expect(volume != nullptr && volume->group == "Mixer");
+            if (volume == nullptr)
+                return;
+            const auto key = volume->key;
+            expect(engine.findAutomationTarget(0, key) == volume->param);
+            expect(engine.findAutomationTarget(1, key) == nullptr, "keys belong to one track");
+
+            beginTest("Volume automation is heard in the export");
+            auto* param = volume->param;
+            auto* um = &project.getEdit().getUndoManager();
+            const float unity = param->getCurrentValue();
+            const float silent = param->getValueRange().getStart();
+            um->beginNewTransaction("Automation");
+            auto& curve = param->getCurve();
+            curve.addPoint(te::TimePosition::fromSeconds(0.0), unity, 0.0f, um);
+            curve.addPoint(te::TimePosition::fromSeconds(1.0), unity, 0.0f, um);
+            curve.addPoint(te::TimePosition::fromSeconds(1.01), silent, 0.0f, um);
+            um->beginNewTransaction();
+            expectEquals(curve.getNumPoints(), 3);
+
+            auto out = dir.getChildFile("auto.wav");
+            expect(project.exportMix(out, error), error);
+            if (auto reader = std::unique_ptr<juce::AudioFormatReader>(juce::WavAudioFormat().createReaderFor(out.createInputStream().release(), true)))
+            {
+                juce::AudioBuffer<float> buf(2, (int) reader->lengthInSamples);
+                reader->read(&buf, 0, buf.getNumSamples(), 0, true, true);
+                expect(buf.getMagnitude(0, (int) (0.4 * sr), (int) (0.2 * sr)) > 0.1f, "full level before 1 s");
+                expect(buf.getMagnitude(0, (int) (1.4 * sr), (int) (0.4 * sr)) < 0.01f, "silent after the curve drops");
+            }
+            else
+            {
+                expect(false, "export produced a readable WAV");
+            }
+
+            beginTest("Automation survives save and reopen, under the same key");
+            auto saved = dir.getChildFile("Automated");
+            expect(project.saveAs(saved, error), error);
+            project.newProject();
+            expect(project.load(saved, error), error);
+            auto* reloaded = engine.findAutomationTarget(0, key);
+            expect(reloaded != nullptr);
+            if (reloaded != nullptr)
+                expectEquals(reloaded->getCurve().getNumPoints(), 3);
+
+            beginTest("Adding a point is undoable");
+            if (reloaded != nullptr)
+            {
+                auto* um2 = &project.getEdit().getUndoManager();
+                um2->beginNewTransaction("Point");
+                reloaded->getCurve().addPoint(te::TimePosition::fromSeconds(1.5), unity, 0.0f, um2);
+                um2->beginNewTransaction();
+                expectEquals(reloaded->getCurve().getNumPoints(), 4);
+                expect(project.undo());
+                expectEquals(reloaded->getCurve().getNumPoints(), 3);
+            }
+
+            beginTest("Automating a filter switches it on");
+            for (auto& t : engine.getAutomationTargets(0))
+                if (t.name == "Low Cut")
+                {
+                    auto* um3 = &project.getEdit().getUndoManager();
+                    t.param->getCurve().addPoint(te::TimePosition::fromSeconds(0.0), 200.0f, 0.0f, um3);
+                    engine.syncNow();
+                    bool on = false;
+                    for (auto* plugin : engine.getAudioTrack(0)->pluginList.getPlugins())
+                        if (auto* lp = dynamic_cast<te::LowPassPlugin*>(plugin); lp != nullptr && !lp->isLowPass())
+                            on = lp->isEnabled();
+                    expect(on, "the low-cut filter is running");
+                }
+            untitledFolder.deleteRecursively();
+        }
+        dir.deleteRecursively();
+    }
+};
+
 static ArrangementTests arrangementTests;
 static TracktionProjectTests tracktionProjectTests;
 static PluginInsertTests pluginInsertTests;
 static StereoInputTests stereoInputTests;
 static MidiTrackTests midiTrackTests;
+static AutomationTests automationTests;
 
 int main()
 {

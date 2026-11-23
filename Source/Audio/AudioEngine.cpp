@@ -322,6 +322,7 @@ void AudioEngine::attachMeters()
     edit->getTransport().ensureContextAllocated();
     if (auto* context = edit->getCurrentPlaybackContext())
     {
+        meteredContext = context;
         masterMeasurer = &context->masterLevels;
         masterMeasurer->addClient(masterMeter);
     }
@@ -335,9 +336,11 @@ void AudioEngine::detachMeters()
             s.measurer->removeClient(s.meter);
         s.measurer = nullptr;
     }
-    if (masterMeasurer != nullptr)
+    // Only detach from the master meter if its playback context is still the Edit's.
+    if (masterMeasurer != nullptr && edit != nullptr && edit->getCurrentPlaybackContext() == meteredContext)
         masterMeasurer->removeClient(masterMeter);
     masterMeasurer = nullptr;
+    meteredContext = nullptr;
 
     // After a device change some of these inputs may have been deleted, so only detach
     // from the ones that still exist. Nothing refers to the clients of deleted inputs.
@@ -440,6 +443,12 @@ void AudioEngine::syncTrack(int t)
     });
     if (wasMidi != last.midi)
         inputsDirty = true;
+
+    // A filter only runs while it's switched on, so automating it switches it on.
+    if (s.lowCut->frequency->hasAutomationPoints() && !s.lowCut->isEnabled())
+        s.lowCut->setEnabled(true);
+    if (s.highCut->frequency->hasAutomationPoints() && !s.highCut->isEnabled())
+        s.highCut->setEnabled(true);
 
     const float lowCut = s.lowCut->isEnabled() ? s.lowCut->frequency->getCurrentValue() : 20.0f;
     twoWay(p.lowCut, last.lowCut, lowCut, [&](float v)
@@ -651,6 +660,50 @@ void AudioEngine::removeInstrument(int track)
         removeInsert(*instrument);
 }
 
+std::vector<AudioEngine::AutomationTarget> AudioEngine::getAutomationTargets(int track) const
+{
+    std::vector<AutomationTarget> targets;
+    auto& s = strips[(size_t) track];
+    if (s.track == nullptr)
+        return targets;
+
+    auto add = [&targets](te::AutomatableParameter* param, const juce::String& name, const juce::String& group)
+    {
+        if (param == nullptr)
+            return;
+        targets.push_back({ param, name, group,
+                            juce::String((juce::int64) param->getOwnerID().getRawID()) + "/" + param->paramID });
+    };
+
+    add(s.volume->volParam.get(), "Volume", "Mixer");
+    add(s.volume->panParam.get(), "Pan", "Mixer");
+    add(s.send->gain.get(), "Reverb Send", "Mixer");
+    add(s.lowCut->frequency.get(), "Low Cut", "Mixer");
+    add(s.highCut->frequency.get(), "High Cut", "Mixer");
+    add(s.eq->midFreq1.get(), "EQ Freq", "Mixer");
+    add(s.eq->midGain1.get(), "EQ Gain", "Mixer");
+
+    std::vector<te::Plugin*> plugins;
+    if (auto* instrument = getInstrument(track))
+        plugins.push_back(instrument);
+    for (auto* p : getInserts(track))
+        plugins.push_back(p);
+    for (auto* plugin : plugins)
+        for (auto* param : plugin->getAutomatableParameters())
+            add(param, param->getParameterName(), plugin->getName());
+    return targets;
+}
+
+te::AutomatableParameter* AudioEngine::findAutomationTarget(int track, const juce::String& key) const
+{
+    if (key.isEmpty())
+        return nullptr;
+    for (auto& target : getAutomationTargets(track))
+        if (target.key == key)
+            return target.param;
+    return nullptr;
+}
+
 juce::StringArray AudioEngine::getMidiInputNames() const
 {
     juce::StringArray names;
@@ -734,6 +787,13 @@ void AudioEngine::timerCallback()
 {
     if (edit == nullptr)
         return;
+    if (edit->getCurrentPlaybackContext() != meteredContext)
+    {
+        // Tracktion made a new playback context (after rendering, or a device change).
+        detachMeters();
+        attachMeters();
+        inputsDirty = true;
+    }
     sync();
     drainMeters();
 }

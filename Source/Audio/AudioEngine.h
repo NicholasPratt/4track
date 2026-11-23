@@ -97,6 +97,18 @@ public:
     /** Loads an instrument plugin and makes it the track's instrument (replacing any other), as one undo step. */
     te::Plugin* setInstrument(int track, const juce::PluginDescription&, juce::String& error);
     void removeInstrument(int track);
+    // Automation: any of a track's parameters can follow a curve. The mixer's controls come
+    // first, then every parameter of the track's instrument and inserts.
+    struct AutomationTarget
+    {
+        te::AutomatableParameter* param = nullptr;
+        juce::String name;    // e.g. "Volume" or "Cutoff"
+        juce::String group;   // "Mixer", or the plugin's name
+        juce::String key;     // stable across undo and reloading: plugin id + "/" + parameter id
+    };
+    std::vector<AutomationTarget> getAutomationTargets(int track) const;
+    te::AutomatableParameter* findAutomationTarget(int track, const juce::String& key) const;
+
     /** Names of the enabled MIDI inputs. */
     juce::StringArray getMidiInputNames() const;
 
@@ -182,6 +194,7 @@ private:
     te::ReverbPlugin* reverb = nullptr;
     te::LevelMeasurer::Client masterMeter;
     te::LevelMeasurer* masterMeasurer = nullptr;
+    te::EditPlaybackContext* meteredContext = nullptr;   // owner of masterMeasurer: Tracktion replaces it (e.g. around a render)
     struct { float volumeDb = 0, room = 0.5f, damping = 0.5f, wet = 0.33f; } syncedMaster;
     // Input meters for armed tracks, keyed by the Tracktion input they listen to.
     std::map<te::WaveInputDevice*, std::unique_ptr<te::LevelMeasurer::Client>> inputMeters;

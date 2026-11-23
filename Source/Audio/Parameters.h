@@ -44,6 +44,7 @@ struct TrackParams
     // Message-thread only
     juce::String name;
     juce::uint32 colour = 0xff4f9dff;   // ARGB (the audio layer has no juce_graphics)
+    juce::String automationShown;       // key of the parameter whose automation the lane shows; empty = clips
 
     void resetMixer()
     {
