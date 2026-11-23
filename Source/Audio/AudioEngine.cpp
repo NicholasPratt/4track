@@ -248,14 +248,16 @@ bool AudioEngine::record(const juce::File& takeFolder, juce::String& error)
             return false;
         };
 
-        auto stream = take->file.createOutputStream();
+        std::unique_ptr<juce::OutputStream> stream = take->file.createOutputStream();
         if (stream == nullptr)
             return fail("Couldn't create " + take->file.getFullPathName());
 
-        std::unique_ptr<juce::AudioFormatWriter> writer(wav.createWriterFor(stream.get(), sr, 2, 24, {}, 0));
+        auto writer = wav.createWriterFor(stream, juce::AudioFormatWriterOptions()
+                                                      .withSampleRate(sr)
+                                                      .withNumChannels(2)
+                                                      .withBitsPerSample(24));
         if (writer == nullptr)
             return fail("Couldn't create a WAV writer for " + take->file.getFileName());
-        stream.release();   // the writer owns it now
 
         take->writer = std::make_unique<juce::AudioFormatWriter::ThreadedWriter>(writer.release(), diskThread,
                                                                                  (int) (sr * 10.0));

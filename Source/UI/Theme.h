@@ -24,7 +24,7 @@ namespace Theme
 
     inline juce::Font font(float size, bool bold = false)
     {
-        return juce::Font(size, bold ? juce::Font::bold : juce::Font::plain);
+        return juce::Font(juce::FontOptions(size, bold ? juce::Font::bold : juce::Font::plain));
     }
 }
 

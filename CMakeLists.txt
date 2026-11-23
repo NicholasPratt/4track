@@ -1,12 +1,18 @@
-cmake_minimum_required(VERSION 3.15)
+cmake_minimum_required(VERSION 3.22)
 
 project(8Track VERSION 0.7.0)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)   # Tracktion Engine requires C++20
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
+    set(CMAKE_OSX_DEPLOYMENT_TARGET "12.0" CACHE STRING "Minimum macOS version")
+endif()
 
-add_subdirectory(JUCE)
+# Tracktion Engine (git submodule) and the JUCE version it is pinned to.
+#   git submodule update --init --recursive
+add_subdirectory(tracktion_engine/modules/juce)
+add_subdirectory(tracktion_engine/modules)
 
 # ---------------------------------------------------------------------------
 # App

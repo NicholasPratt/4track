@@ -30,10 +30,14 @@ Mouse: drag a clip to move it (to other tracks too), drag its edges to trim, dra
 
 ## Building
 
-Requires CMake 3.15+, a C++17 compiler and JUCE 7.0.12 cloned into `JUCE/`:
+Requires CMake 3.22+ and a C++20 compiler (Xcode 14+). Tracktion Engine is a git submodule and
+brings the JUCE version it needs (9.0.5):
 
 ```bash
-git clone --branch 7.0.12 https://github.com/juce-framework/JUCE.git
+git submodule update --init tracktion_engine
+# Tracktion's JUCE submodule uses an SSH URL; this fetches it over HTTPS instead:
+git -C tracktion_engine config submodule.modules/juce.url https://github.com/juce-framework/JUCE.git
+git -C tracktion_engine submodule update --init modules/juce
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
 cmake --build build
 open build/8Track_artefacts/Debug/8track.app

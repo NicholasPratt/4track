@@ -432,9 +432,9 @@ void MainComponent::confirmDiscard(std::function<void()> proceed)
                        .withIconType(juce::MessageBoxIconType::QuestionIcon)
                        .withTitle("Save changes to \"" + project.getName() + "\"?")
                        .withMessage("Your changes will be lost if you don't save them.")
-                       .withButton("Save")
-                       .withButton("Don't Save")
-                       .withButton("Cancel")
+                       .withButton("Save", 1)
+                       .withButton("Don't Save", 2)
+                       .withButton("Cancel", 0)
                        .withAssociatedComponent(this);
 
     juce::AlertWindow::showAsync(options, [this, proceed](int result)

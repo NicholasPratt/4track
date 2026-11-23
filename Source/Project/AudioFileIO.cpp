@@ -77,7 +77,7 @@ bool writeWav(const juce::File& file, const juce::AudioBuffer<float>& audio, dou
               int bitsPerSample, juce::String& error)
 {
     file.deleteFile();
-    auto stream = file.createOutputStream();
+    std::unique_ptr<juce::OutputStream> stream = file.createOutputStream();
     if (stream == nullptr)
     {
         error = "Couldn't write to " + file.getFullPathName();
@@ -85,14 +85,15 @@ bool writeWav(const juce::File& file, const juce::AudioBuffer<float>& audio, dou
     }
 
     juce::WavAudioFormat wav;
-    std::unique_ptr<juce::AudioFormatWriter> writer(
-        wav.createWriterFor(stream.get(), sampleRate, (unsigned int) audio.getNumChannels(), bitsPerSample, {}, 0));
+    auto writer = wav.createWriterFor(stream, juce::AudioFormatWriterOptions()
+                                                  .withSampleRate(sampleRate)
+                                                  .withNumChannels(audio.getNumChannels())
+                                                  .withBitsPerSample(bitsPerSample));
     if (writer == nullptr)
     {
         error = "Couldn't create a WAV writer for " + file.getFileName();
         return false;
     }
-    stream.release();
 
     if (!writer->writeFromAudioSampleBuffer(audio, 0, audio.getNumSamples()))
     {

@@ -123,10 +123,10 @@ void TransportBar::paint(juce::Graphics& g)
 
     auto r = displayArea.reduced(10, 3);
     g.setColour(recording ? Theme::record.brighter(0.4f) : Theme::text);
-    g.setFont(juce::Font(juce::Font::getDefaultMonospacedFontName(), 19.0f, juce::Font::bold));
+    g.setFont(juce::Font(juce::FontOptions(juce::Font::getDefaultMonospacedFontName(), 19.0f, juce::Font::bold)));
     g.drawText(barsText, r.removeFromTop(r.getHeight() * 3 / 5), juce::Justification::centredLeft, false);
     g.setColour(Theme::textDim);
-    g.setFont(juce::Font(juce::Font::getDefaultMonospacedFontName(), 11.0f, juce::Font::plain));
+    g.setFont(juce::Font(juce::FontOptions(juce::Font::getDefaultMonospacedFontName(), 11.0f, juce::Font::plain)));
     g.drawText(timeText, r, juce::Justification::centredLeft, false);
 }
 
