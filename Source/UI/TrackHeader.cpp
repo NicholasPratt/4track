@@ -2,9 +2,6 @@
 
 namespace
 {
-    constexpr int kStereoBase = 1000;
-    constexpr int kMixId = 2000;
-
     juce::String dbText(double db)
     {
         return db <= -59.9 ? juce::String("-inf dB") : juce::String(db, 1) + " dB";
@@ -17,31 +14,18 @@ namespace
     }
 }
 
+// Each track records one input channel. (Stereo pairs and recording the master mix
+// aren't wired to the Tracktion engine yet.)
 void fillInputSelector(juce::ComboBox& box, const juce::StringArray& names)
 {
     box.clear(juce::dontSendNotification);
-    const int n = names.size();
-
-    for (int ch = 0; ch < n; ++ch)
+    for (int ch = 0; ch < names.size(); ++ch)
         box.addItem("In " + juce::String(ch + 1) + (names[ch].isNotEmpty() ? "  " + names[ch] : juce::String()), ch + 1);
-
-    if (n >= 2)
-    {
-        box.addSeparator();
-        for (int ch = 0; ch + 1 < n; ch += 2)
-            box.addItem("In " + juce::String(ch + 1) + "+" + juce::String(ch + 2) + " (stereo)", kStereoBase + ch);
-    }
-
-    box.addSeparator();
-    box.addItem("Master mix (bounce)", kMixId);
 }
 
 void showTrackInput(juce::ComboBox& box, const TrackParams& p)
 {
-    const auto type = (InputType) p.inputType.load();
-    const int ch = p.inputChannel.load();
-    const int id = type == InputType::Mix ? kMixId : type == InputType::Stereo ? kStereoBase + ch : ch + 1;
-
+    const int id = p.inputChannel.load() + 1;
     if (box.indexOfItemId(id) >= 0)
         box.setSelectedId(id, juce::dontSendNotification);
     else if (box.getNumItems() > 0)
@@ -50,17 +34,7 @@ void showTrackInput(juce::ComboBox& box, const TrackParams& p)
 
 void applyInputSelection(const juce::ComboBox& box, TrackParams& p)
 {
-    const int id = box.getSelectedId();
-    if (id == kMixId)
-    {
-        p.inputType = (int) InputType::Mix;
-    }
-    else if (id >= kStereoBase)
-    {
-        p.inputType = (int) InputType::Stereo;
-        p.inputChannel = id - kStereoBase;
-    }
-    else if (id > 0)
+    if (const int id = box.getSelectedId(); id > 0)
     {
         p.inputType = (int) InputType::Mono;
         p.inputChannel = id - 1;

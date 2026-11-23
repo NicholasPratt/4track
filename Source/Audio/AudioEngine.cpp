@@ -1,596 +1,653 @@
 #include "AudioEngine.h"
-#include "../Project/AudioFileIO.h"
 
 namespace
 {
-    juce::File deviceStateFile()
-    {
-        return juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
-                   .getChildFile("8track").getChildFile("audioDevice.xml");
-    }
-
-    /** Where the app saved its device settings when it was called 4track. */
-    juce::File legacyDeviceStateFile()
-    {
-        return juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
-                   .getChildFile("4track").getChildFile("audioDevice.xml");
-    }
-
-    constexpr int kMaxPrepared = 4096;
-}
-
-AudioEngine::AudioEngine(bool openDevice)
-{
-    const juce::uint32 palette[kNumTracks] = {
+    constexpr juce::uint32 kPalette[kNumTracks] = {
         0xff4f9dff, 0xff34c79a, 0xfff2b84b, 0xffef6f6c, 0xffb084f5, 0xff4fd1e0, 0xfff58fc7, 0xffa3d65c
     };
+
+    constexpr float kMinDb = -60.0f;   // the UI treats this as -inf
+    constexpr float kOffDb = -100.0f;  // Tracktion's silence
+
+    float toUiDb(float db) { return db <= kMinDb ? kMinDb : db; }
+    float toEngineDb(float db) { return db <= kMinDb ? kOffDb : db; }
+    float levelToGain(const te::DbTimePair& p) { return p.dB <= -99.0f ? 0.0f : juce::Decibels::decibelsToGain(p.dB); }
+
+    bool differs(float a, float b) { return std::abs(a - b) > 1.0e-3f * juce::jmax(1.0f, std::abs(b)); }
+
+    /** Keeps one value in step between the UI and the Edit. Whichever side changed since
+        the last exchange wins: a UI change is pushed, otherwise an Edit change (undo,
+        loading) is pulled. */
+    template <typename T, typename Push>
+    void twoWay(std::atomic<T>& ui, T& last, T engineValue, Push&& push)
+    {
+        const T uiValue = ui.load();
+        if constexpr (std::is_floating_point_v<T>)
+        {
+            if (differs(uiValue, last)) { push(uiValue); last = uiValue; }
+            else if (differs(engineValue, last)) { ui = engineValue; last = engineValue; }
+        }
+        else
+        {
+            if (uiValue != last) { push(uiValue); last = uiValue; }
+            else if (engineValue != last) { ui = engineValue; last = engineValue; }
+        }
+    }
+
+    template <typename PluginType>
+    PluginType* insertPlugin(te::Edit& edit, te::PluginList& list, int index)
+    {
+        auto plugin = edit.getPluginCache().createNewPlugin(PluginType::xmlTypeName, {});
+        list.insertPlugin(plugin, index, nullptr);
+        return dynamic_cast<PluginType*>(plugin.get());
+    }
+}
+
+AudioEngine::AudioEngine()
+{
+    // One input per hardware channel: each track picks the channel it records.
+    engine.getDeviceManager().setAllWaveInputsToNumChannels(1);
+    getDeviceManager().addChangeListener(this);
+    lastSampleRate = getSampleRate();
+
     for (int t = 0; t < kNumTracks; ++t)
     {
-        paramArray[(size_t) t] = &tracks[(size_t) t];
         tracks[(size_t) t].name = "Track " + juce::String(t + 1);
-        tracks[(size_t) t].colour = palette[t];
-        tracks[(size_t) t].inputChannel = t % 2;   // alternate Ch 1 / Ch 2 by default
+        tracks[(size_t) t].colour = kPalette[t];
     }
 
-    audioArrangement = std::make_shared<Arrangement>();
-    mixer.prepare(sampleRate.load(), kMaxPrepared);
-    scratch.setSize(3, kMaxPrepared);
-    scratch.clear();
-    scratchSize = kMaxPrepared;
-
-    diskThread.startThread(juce::Thread::Priority::high);
-    deviceManager.addChangeListener(this);
-
-    if (!openDevice)
-        return;
-
-    if (juce::RuntimePermissions::isGranted(juce::RuntimePermissions::recordAudio)
-        || !juce::RuntimePermissions::isRequired(juce::RuntimePermissions::recordAudio))
-    {
-        initialiseDevice();
-    }
-    else
-    {
-        juce::RuntimePermissions::request(juce::RuntimePermissions::recordAudio, [this](bool granted)
-        {
-            if (!granted)
-                DBG("Microphone permission denied - recording will be silent");
-            juce::MessageManager::callAsync([this] { initialiseDevice(); });
-        });
-    }
+    startTimerHz(30);
 }
 
 AudioEngine::~AudioEngine()
 {
-    cancelPendingUpdate();
-    if (getState() == State::Recording)
-        stop();
-    deviceManager.removeChangeListener(this);
-    deviceManager.removeAudioCallback(this);
-    deviceManager.closeAudioDevice();
-    diskThread.stopThread(2000);
+    stopTimer();
+    getDeviceManager().removeChangeListener(this);
+    jassert(edit == nullptr);   // Project detaches its Edit before it is destroyed
 }
 
-//==============================================================================
-void AudioEngine::initialiseDevice()
+double AudioEngine::getSampleRate() const
 {
-    if (deviceInitialised)
-        return;
-
-    juce::String error;
-    std::unique_ptr<juce::XmlElement> saved;
-    if (deviceStateFile().existsAsFile())
-        saved = juce::XmlDocument::parse(deviceStateFile());
-    else if (legacyDeviceStateFile().existsAsFile())
-        saved = juce::XmlDocument::parse(legacyDeviceStateFile());
-
-    if (saved != nullptr)
-    {
-        error = deviceManager.initialise(8, 2, saved.get(), true);
-    }
-    else
-    {
-        juce::AudioDeviceManager::AudioDeviceSetup setup;
-        deviceManager.getAudioDeviceSetup(setup);
-        setup.inputChannels.setRange(0, 8, true);
-        setup.outputChannels.setRange(0, 2, true);
-        setup.useDefaultInputChannels = false;
-        setup.useDefaultOutputChannels = true;
-        error = deviceManager.initialise(8, 2, nullptr, true, {}, &setup);
-    }
-
-    if (error.isNotEmpty())
-        error = deviceManager.initialiseWithDefaultDevices(2, 2);
-
-    if (error.isNotEmpty())
-    {
-        DBG("Audio device error: " << error);
-        return;
-    }
-
-    deviceManager.addAudioCallback(this);
-    deviceInitialised = true;
-    sendChangeMessage();
-}
-
-void AudioEngine::saveDeviceState()
-{
-    if (auto xml = deviceManager.createStateXml())
-    {
-        deviceStateFile().getParentDirectory().createDirectory();
-        deviceStateFile().replaceWithText(xml->toString());
-    }
-}
-
-void AudioEngine::changeListenerCallback(juce::ChangeBroadcaster*)
-{
-    saveDeviceState();
-    sendChangeMessage();
+    const auto sr = engine.getDeviceManager().getSampleRate();
+    return sr > 0.0 ? sr : 44100.0;
 }
 
 juce::StringArray AudioEngine::getActiveInputNames() const
 {
     juce::StringArray names;
-    if (auto* device = deviceManager.getCurrentAudioDevice())
+    if (auto* device = engine.getDeviceManager().deviceManager.getCurrentAudioDevice())
     {
-        auto all = device->getInputChannelNames();
-        auto active = device->getActiveInputChannels();
-        for (int i = 0; i < all.size(); ++i)
-            if (active[i])
-                names.add(all[i]);
+        const auto all = device->getInputChannelNames();
+        const auto active = device->getActiveInputChannels();
+        for (int ch = 0; ch < all.size(); ++ch)
+            if (active[ch])
+                names.add(all[ch]);
     }
     return names;
 }
 
-juce::int64 AudioEngine::getRoundTripLatency() const
+te::WaveInputDevice* AudioEngine::inputForChannel(int channel) const
 {
-    if (auto* device = deviceManager.getCurrentAudioDevice())
-        return device->getInputLatencyInSamples() + device->getOutputLatencyInSamples();
-    return 0;
+    // Inputs are listed in channel order; the n-th enabled mono input is the n-th active channel.
+    int n = 0;
+    for (auto* device : engine.getDeviceManager().getWaveInputDevices())
+    {
+        if (device->getDeviceType() != te::InputDevice::waveDevice || !device->isEnabled())
+            continue;
+        if (n++ == channel)
+            return device;
+    }
+    return nullptr;
 }
 
-void AudioEngine::audioDeviceAboutToStart(juce::AudioIODevice* device)
+te::AudioTrack* AudioEngine::getAudioTrack(int index) const
 {
-    // The callback isn't running here, so it's safe to (re)allocate.
-    const double sr = device->getCurrentSampleRate();
-    const int block = juce::jmax(kMaxPrepared, device->getCurrentBufferSizeSamples());
-    sampleRate = sr;
-    scratch.setSize(3, block);
-    scratch.clear();
-    scratchSize = block;
-    mixer.prepare(sr, block);
-    clickRemaining = 0;
-
-    if (getState() == State::Recording)
-        triggerAsyncUpdate();   // device restarted mid-take: finish it safely
-}
-
-void AudioEngine::audioDeviceStopped() {}
-
-void AudioEngine::handleAsyncUpdate()
-{
-    if (getState() == State::Recording)
-        stop();
+    if (edit == nullptr)
+        return nullptr;
+    return te::getAudioTracks(*edit)[index];
 }
 
 //==============================================================================
-void AudioEngine::setArrangement(std::shared_ptr<const Arrangement> snapshot)
+void AudioEngine::attachEdit(te::Edit* newEdit, bool freshEdit)
 {
+    detachMeters();
+    edit = newEdit;
+    for (auto& s : strips)
     {
-        const juce::ScopedLock sl(deviceManager.getAudioCallbackLock());
-        std::swap(audioArrangement, snapshot);
+        s.track = nullptr;
+        s.lowCut = s.highCut = nullptr;
+        s.eq = nullptr;
+        s.volume = nullptr;
+        s.send = nullptr;
     }
-    // `snapshot` now holds the previous arrangement and is released here, on the message thread.
+    reverb = nullptr;
+    if (edit == nullptr)
+        return;
+
+    edit->playInStopEnabled = true;   // keeps monitoring and input meters running while stopped
+    edit->getTransport().ensureContextAllocated();
+    buildStrips();
+    attachMeters();
+    pullAll();
+    if (freshEdit)
+    {
+        for (int t = 0; t < kNumTracks; ++t)
+        {
+            tracks[(size_t) t].name = "Track " + juce::String(t + 1);
+            tracks[(size_t) t].colour = kPalette[t];
+            tracks[(size_t) t].monitor = (int) MonitorMode::Off;
+            tracks[(size_t) t].inputType = (int) InputType::Mono;
+            tracks[(size_t) t].inputChannel = 0;
+        }
+        master.volumeDb = 0.0f;
+        master.reverbRoom = 0.5f;
+        master.reverbDamping = 0.5f;
+        master.reverbWet = 0.33f;
+        countInOn = true;
+        punchOn = false;
+        punchIn = 0;
+        punchOut = 0;
+    }
+    inputsDirty = true;
+    sync();
+    edit->getUndoManager().clearUndoHistory();   // building the mixer isn't an undoable edit
+}
+
+void AudioEngine::buildStrips()
+{
+    edit->ensureNumberOfAudioTracks(kNumTracks + 1);
+    auto audioTracks = te::getAudioTracks(*edit);
+
+    for (int t = 0; t < kNumTracks; ++t)
+    {
+        auto& s = strips[(size_t) t];
+        s.track = audioTracks[t];
+        auto& list = s.track->pluginList;
+
+        for (auto* p : list.getPlugins())
+        {
+            if (auto* lp = dynamic_cast<te::LowPassPlugin*>(p))
+                (lp->isLowPass() ? s.highCut : s.lowCut) = lp;
+            else if (auto* eq = dynamic_cast<te::EqualiserPlugin*>(p))
+                s.eq = eq;
+            else if (auto* send = dynamic_cast<te::AuxSendPlugin*>(p))
+                s.send = send;
+        }
+        s.volume = s.track->getVolumePlugin();
+
+        if (s.lowCut == nullptr)
+        {
+            s.lowCut = insertPlugin<te::LowPassPlugin>(*edit, list, list.indexOf(s.volume));
+            s.lowCut->mode = "highpass";
+            s.lowCut->frequency->setParameter(20.0f, juce::sendNotification);
+            s.lowCut->setEnabled(false);
+        }
+        if (s.eq == nullptr)
+        {
+            s.eq = insertPlugin<te::EqualiserPlugin>(*edit, list, list.indexOf(s.volume));
+            s.eq->setLowGain(0.0f);
+            s.eq->setHighGain(0.0f);
+            s.eq->setMidGain2(0.0f);
+            s.eq->setMidGain1(0.0f);
+            s.eq->setMidFreq1(1000.0f);
+        }
+        if (s.highCut == nullptr)
+        {
+            s.highCut = insertPlugin<te::LowPassPlugin>(*edit, list, list.indexOf(s.volume));
+            s.highCut->mode = "lowpass";
+            s.highCut->frequency->setParameter(20000.0f, juce::sendNotification);
+            s.highCut->setEnabled(false);
+        }
+        if (s.send == nullptr)
+        {
+            s.send = insertPlugin<te::AuxSendPlugin>(*edit, list, list.indexOf(s.volume) + 1);
+            s.send->busNumber = 0;
+            s.send->setGainDb(kOffDb);
+        }
+    }
+
+    // The reverb return: a track with no clips that the strips' sends feed.
+    auto* ret = audioTracks[kReverbTrack];
+    ret->setName("Reverb Return");
+    te::AuxReturnPlugin* auxReturn = nullptr;
+    for (auto* p : ret->pluginList.getPlugins())
+    {
+        if (auto* r = dynamic_cast<te::AuxReturnPlugin*>(p)) auxReturn = r;
+        if (auto* r = dynamic_cast<te::ReverbPlugin*>(p))    reverb = r;
+    }
+    auto& retList = ret->pluginList;
+    if (auxReturn == nullptr)
+    {
+        auxReturn = insertPlugin<te::AuxReturnPlugin>(*edit, retList, 0);
+        auxReturn->busNumber = 0;
+    }
+    if (reverb == nullptr)
+    {
+        reverb = insertPlugin<te::ReverbPlugin>(*edit, retList, retList.indexOf(auxReturn) + 1);
+        reverb->setDry(0.0f);
+        reverb->setWet(0.33f);
+    }
+}
+
+void AudioEngine::attachMeters()
+{
+    for (auto& s : strips)
+        if (s.track != nullptr)
+            if (auto* meter = s.track->getLevelMeterPlugin())
+            {
+                s.measurer = &meter->measurer;
+                s.measurer->addClient(s.meter);
+            }
+
+    edit->getTransport().ensureContextAllocated();
+    if (auto* context = edit->getCurrentPlaybackContext())
+    {
+        masterMeasurer = &context->masterLevels;
+        masterMeasurer->addClient(masterMeter);
+    }
+}
+
+void AudioEngine::detachMeters()
+{
+    for (auto& s : strips)
+    {
+        if (s.measurer != nullptr)
+            s.measurer->removeClient(s.meter);
+        s.measurer = nullptr;
+    }
+    if (masterMeasurer != nullptr)
+        masterMeasurer->removeClient(masterMeter);
+    masterMeasurer = nullptr;
+
+    // After a device change some of these inputs may have been deleted, so only detach
+    // from the ones that still exist. Nothing refers to the clients of deleted inputs.
+    const auto current = engine.getDeviceManager().getWaveInputDevices();
+    for (auto& [device, client] : inputMeters)
+        if (std::find(current.begin(), current.end(), device) != current.end())
+            device->levelMeasurer.removeClient(*client);
+    inputMeters.clear();
+}
+
+//==============================================================================
+void AudioEngine::pullAll()
+{
+    for (int t = 0; t < kNumTracks; ++t)
+    {
+        auto& s = strips[(size_t) t];
+        auto& p = tracks[(size_t) t];
+        auto& last = synced[(size_t) t];
+
+        p.name = last.name = s.track->getName().isNotEmpty() ? s.track->getName() : "Track " + juce::String(t + 1);
+        const auto colour = s.track->getColour();
+        p.colour = last.colour = colour.isTransparent() ? kPalette[t] : colour.getARGB();
+        p.volumeDb = last.volumeDb = toUiDb(s.volume->getVolumeDb());
+        p.pan = last.pan = s.volume->getPan();
+        p.mute = last.mute = s.track->isMuted(false);
+        p.solo = last.solo = s.track->isSolo(false);
+        p.lowCut = last.lowCut = s.lowCut->isEnabled() ? s.lowCut->frequency->getCurrentValue() : 20.0f;
+        p.highCut = last.highCut = s.highCut->isEnabled() ? s.highCut->frequency->getCurrentValue() : 20000.0f;
+        p.midFreq = last.midFreq = s.eq->midFreq1->getCurrentValue();
+        p.midGainDb = last.midGainDb = s.eq->midGain1->getCurrentValue();
+        const float sendDb = s.send->getGainDb();
+        p.send = last.send = sendDb <= kMinDb ? 0.0f : juce::Decibels::decibelsToGain(sendDb);
+        p.armed = false;
+
+        // The input this track records from, if the Edit already has one assigned.
+        for (auto* instance : edit->getAllInputDevices())
+            if (instance->getTargets().contains(s.track->itemID))
+                for (int ch = 0; auto* device = inputForChannel(ch); ++ch)
+                    if (&instance->getInputDevice() == device)
+                    {
+                        p.inputType = (int) InputType::Mono;
+                        p.inputChannel = ch;
+                    }
+    }
+
+    master.volumeDb = syncedMaster.volumeDb = toUiDb(edit->getMasterVolumePlugin()->getVolumeDb());
+    master.reverbRoom = syncedMaster.room = reverb->roomSizeValue.get();
+    master.reverbDamping = syncedMaster.damping = reverb->dampValue.get();
+    master.reverbWet = syncedMaster.wet = reverb->wetValue.get();
+
+    bpm = syncedBpm = edit->tempoSequence.getTempo(0)->getBpm();
+    beatsPerBar = syncedBeatsPerBar = edit->tempoSequence.getTimeSig(0)->numerator.get();
+    metronomeOn = syncedClick = edit->clickTrackEnabled.get();
+    countInOn = edit->getCountInMode() != te::Edit::CountIn::none;
+    punchOn = syncedPunchOn = edit->recordingPunchInOut.get();
+    const auto loop = edit->getTransport().getLoopRange();
+    punchIn = syncedPunchIn = toSamples(loop.getStart());
+    punchOut = syncedPunchOut = toSamples(loop.getEnd());
+}
+
+void AudioEngine::sync()
+{
+    if (edit == nullptr)
+        return;
+
+    for (int t = 0; t < kNumTracks; ++t)
+        syncTrack(t);
+    syncMaster();
+    syncTransportSettings();
+
+    for (int t = 0; t < kNumTracks; ++t)
+    {
+        auto& p = tracks[(size_t) t];
+        auto& last = syncedInputs[(size_t) t];
+        const InputState now { p.armed.load(), p.monitor.load(), p.inputType.load(), p.inputChannel.load() };
+        if (now.armed != last.armed || now.monitor != last.monitor || now.type != last.type || now.channel != last.channel)
+        {
+            last = now;
+            inputsDirty = true;
+        }
+    }
+    if (inputsDirty)
+        applyInputs();
+}
+
+void AudioEngine::syncTrack(int t)
+{
+    auto& s = strips[(size_t) t];
+    auto& p = tracks[(size_t) t];
+    auto& last = synced[(size_t) t];
+
+    twoWay(p.volumeDb, last.volumeDb, toUiDb(s.volume->getVolumeDb()), [&](float v) { s.volume->setVolumeDb(toEngineDb(v)); });
+    twoWay(p.pan, last.pan, s.volume->getPan(), [&](float v) { s.volume->setPan(v); });
+    twoWay(p.mute, last.mute, s.track->isMuted(false), [&](bool v) { s.track->setMute(v); });
+    twoWay(p.solo, last.solo, s.track->isSolo(false), [&](bool v) { s.track->setSolo(v); });
+
+    const float lowCut = s.lowCut->isEnabled() ? s.lowCut->frequency->getCurrentValue() : 20.0f;
+    twoWay(p.lowCut, last.lowCut, lowCut, [&](float v)
+    {
+        s.lowCut->setEnabled(v > 20.5f);
+        s.lowCut->frequency->setParameter(v, juce::sendNotification);
+    });
+    const float highCut = s.highCut->isEnabled() ? s.highCut->frequency->getCurrentValue() : 20000.0f;
+    twoWay(p.highCut, last.highCut, highCut, [&](float v)
+    {
+        s.highCut->setEnabled(v < 19999.0f);
+        s.highCut->frequency->setParameter(v, juce::sendNotification);
+    });
+    twoWay(p.midFreq, last.midFreq, s.eq->midFreq1->getCurrentValue(), [&](float v) { s.eq->setMidFreq1(v); });
+    twoWay(p.midGainDb, last.midGainDb, s.eq->midGain1->getCurrentValue(), [&](float v) { s.eq->setMidGain1(v); });
+
+    const float sendDb = s.send->getGainDb();
+    twoWay(p.send, last.send, sendDb <= kMinDb ? 0.0f : juce::Decibels::decibelsToGain(sendDb), [&](float v)
+    {
+        s.send->setGainDb(v <= 0.001f ? kOffDb : juce::Decibels::gainToDecibels(v));
+    });
+
+    // Name and colour are plain members, only ever changed by the UI.
+    if (p.name != last.name)
+    {
+        s.track->setName(p.name);
+        last.name = p.name;
+    }
+    if (p.colour != last.colour)
+    {
+        s.track->setColour(juce::Colour(p.colour));
+        last.colour = p.colour;
+    }
+}
+
+void AudioEngine::syncMaster()
+{
+    auto vol = edit->getMasterVolumePlugin();
+    twoWay(master.volumeDb, syncedMaster.volumeDb, toUiDb(vol->getVolumeDb()), [&](float v) { vol->setVolumeDb(toEngineDb(v)); });
+    twoWay(master.reverbRoom, syncedMaster.room, reverb->roomSizeValue.get(), [&](float v) { reverb->setRoomSize(v); });
+    twoWay(master.reverbDamping, syncedMaster.damping, reverb->dampValue.get(), [&](float v) { reverb->setDamp(v); });
+    twoWay(master.reverbWet, syncedMaster.wet, reverb->wetValue.get(), [&](float v) { reverb->setWet(v); });
+}
+
+void AudioEngine::syncTransportSettings()
+{
+    auto* tempo = edit->tempoSequence.getTempo(0);
+    if (std::abs(bpm.load() - syncedBpm) > 1.0e-6)
+    {
+        syncedBpm = bpm.load();
+        tempo->setBpm(syncedBpm);
+    }
+    else if (std::abs(tempo->getBpm() - syncedBpm) > 1.0e-6)
+    {
+        bpm = syncedBpm = tempo->getBpm();
+    }
+
+    auto* sig = edit->tempoSequence.getTimeSig(0);
+    if (beatsPerBar.load() != syncedBeatsPerBar)
+    {
+        syncedBeatsPerBar = beatsPerBar.load();
+        sig->numerator = syncedBeatsPerBar;
+    }
+    else if (sig->numerator.get() != syncedBeatsPerBar)
+    {
+        beatsPerBar = syncedBeatsPerBar = sig->numerator.get();
+    }
+
+    if (metronomeOn.load() != syncedClick)
+    {
+        syncedClick = metronomeOn.load();
+        edit->clickTrackEnabled = syncedClick;
+        edit->clickTrackEmphasiseBars = true;
+    }
+    if (punchOn.load() != syncedPunchOn)
+    {
+        syncedPunchOn = punchOn.load();
+        edit->recordingPunchInOut = syncedPunchOn;
+    }
+    if (punchIn.load() != syncedPunchIn || punchOut.load() != syncedPunchOut)
+    {
+        syncedPunchIn = punchIn.load();
+        syncedPunchOut = punchOut.load();
+        if (syncedPunchOut > syncedPunchIn)
+            edit->getTransport().setLoopRange({ toTime(syncedPunchIn), toTime(syncedPunchOut) });
+    }
+}
+
+void AudioEngine::applyInputs()
+{
+    inputsDirty = false;
+    edit->getTransport().ensureContextAllocated();
+
+    for (auto* instance : edit->getAllInputDevices())
+    {
+        auto& device = instance->getInputDevice();
+        if (device.getDeviceType() != te::InputDevice::waveDevice)
+            continue;
+
+        int channel = -1;
+        for (int ch = 0; auto* d = inputForChannel(ch); ++ch)
+            if (d == &device)
+                channel = ch;
+
+        juce::Array<int> wanted;
+        bool anyOn = false, anyAuto = false;
+        for (int t = 0; t < kNumTracks; ++t)
+        {
+            auto& p = tracks[(size_t) t];
+            if (channel < 0 || p.inputType.load() == (int) InputType::Mix || p.inputChannel.load() != channel)
+                continue;
+            wanted.add(t);
+            const auto mode = (MonitorMode) p.monitor.load();
+            anyOn = anyOn || mode == MonitorMode::On;
+            anyAuto = anyAuto || mode == MonitorMode::Auto;
+        }
+
+        for (auto id : instance->getTargets())
+        {
+            bool keep = false;
+            for (int t : wanted)
+                keep = keep || strips[(size_t) t].track->itemID == id;
+            if (!keep)
+                [[maybe_unused]] auto r = instance->removeTarget(id, nullptr);
+        }
+
+        for (int t : wanted)
+        {
+            const auto id = strips[(size_t) t].track->itemID;
+            if (!instance->getTargets().contains(id))
+                [[maybe_unused]] auto r = instance->setTarget(id, false, nullptr);
+            instance->setRecordingEnabled(id, tracks[(size_t) t].armed.load());
+        }
+
+        device.setMonitorMode(anyOn ? te::InputDevice::MonitorMode::on
+                              : anyAuto ? te::InputDevice::MonitorMode::automatic
+                                        : te::InputDevice::MonitorMode::off);
+    }
+}
+
+//==============================================================================
+void AudioEngine::drainMeters()
+{
+    for (int t = 0; t < kNumTracks; ++t)
+    {
+        auto& s = strips[(size_t) t];
+        auto& p = tracks[(size_t) t];
+        if (s.measurer == nullptr)
+            continue;
+        atomicMax(p.peakL, levelToGain(s.meter.getAndClearAudioLevel(0)));
+        atomicMax(p.peakR, levelToGain(s.meter.getAndClearAudioLevel(1)));
+
+        // An armed track shows its input level even when it isn't monitored.
+        if (p.armed.load() && p.inputType.load() != (int) InputType::Mix)
+        {
+            if (auto* device = inputForChannel(p.inputChannel.load()))
+            {
+                auto& client = inputMeters[device];
+                if (client == nullptr)
+                {
+                    client = std::make_unique<te::LevelMeasurer::Client>();
+                    device->levelMeasurer.addClient(*client);
+                }
+                const float level = levelToGain(client->getAndClearAudioLevel(0));
+                atomicMax(p.peakL, level);
+                atomicMax(p.peakR, level);
+            }
+        }
+    }
+
+    if (masterMeasurer != nullptr)
+    {
+        atomicMax(master.peakL, levelToGain(masterMeter.getAndClearAudioLevel(0)));
+        atomicMax(master.peakR, levelToGain(masterMeter.getAndClearAudioLevel(1)));
+    }
+}
+
+void AudioEngine::timerCallback()
+{
+    if (edit == nullptr)
+        return;
+    sync();
+    drainMeters();
+}
+
+void AudioEngine::changeListenerCallback(juce::ChangeBroadcaster*)
+{
+    // The audio device changed: its inputs and the playback context may be new objects.
+    if (edit != nullptr)
+    {
+        detachMeters();
+        attachMeters();
+        inputsDirty = true;
+    }
+    lastSampleRate = getSampleRate();
+    sendChangeMessage();
+}
+
+//==============================================================================
+AudioEngine::State AudioEngine::getState() const
+{
+    if (edit == nullptr)
+        return State::Stopped;
+    auto& transport = edit->getTransport();
+    if (transport.isRecording())
+        return State::Recording;
+    return transport.isPlaying() ? State::Playing : State::Stopped;
 }
 
 juce::int64 AudioEngine::getPosition() const
 {
-    const auto pending = pendingLocate.load();
-    return pending != kNoLocate ? pending : position.load();
+    return edit == nullptr ? 0 : toSamples(edit->getTransport().getPosition());
 }
 
 void AudioEngine::setPosition(juce::int64 newPosition)
 {
-    if (getState() == State::Recording)
-        return;
-    pendingLocate = newPosition;
-    returnPosition = newPosition;
+    if (edit != nullptr)
+        edit->getTransport().setPosition(toTime(juce::jmax<juce::int64>(0, newPosition)));
 }
 
 void AudioEngine::play()
 {
-    if (getState() != State::Stopped)
+    if (edit == nullptr || getState() != State::Stopped)
         return;
     returnPosition = getPosition();
-    state = (int) State::Playing;
-}
-
-bool AudioEngine::record(const juce::File& takeFolder, juce::String& error)
-{
-    if (getState() == State::Recording)
-        return false;
-
-    const double sr = getSampleRate();
-    auto newSession = std::make_unique<RecordSession>();
-    newSession->latency = getRoundTripLatency();
-    newSession->maxSamples = (juce::int64) (sr * 60.0 * 60.0);   // one hour per take
-
-    if (!takeFolder.createDirectory())
-    {
-        error = "Couldn't create the folder for recordings:\n" + takeFolder.getFullPathName();
-        return false;
-    }
-
-    juce::WavAudioFormat wav;
-    const auto stamp = juce::Time::getCurrentTime().formatted("%Y%m%d-%H%M%S");
-
-    for (int t = 0; t < kNumTracks; ++t)
-    {
-        auto& p = tracks[(size_t) t];
-        if (!p.armed.load())
-            continue;
-
-        auto take = std::make_unique<LiveTake>();
-        take->track = t;
-        take->inputType = (InputType) p.inputType.load();
-        take->channel = p.inputChannel.load();
-        take->file = takeFolder.getChildFile("T" + juce::String(t + 1) + "_" + stamp + "_" + juce::String(++takeCounter) + ".wav");
-
-        auto fail = [&](const juce::String& message)
-        {
-            error = message;
-            for (auto& made : newSession->takes)
-            {
-                made->writer.reset();
-                made->file.deleteFile();
-            }
-            take->file.deleteFile();
-            return false;
-        };
-
-        std::unique_ptr<juce::OutputStream> stream = take->file.createOutputStream();
-        if (stream == nullptr)
-            return fail("Couldn't create " + take->file.getFullPathName());
-
-        auto writer = wav.createWriterFor(stream, juce::AudioFormatWriterOptions()
-                                                      .withSampleRate(sr)
-                                                      .withNumChannels(2)
-                                                      .withBitsPerSample(24));
-        if (writer == nullptr)
-            return fail("Couldn't create a WAV writer for " + take->file.getFileName());
-
-        take->writer = std::make_unique<juce::AudioFormatWriter::ThreadedWriter>(writer.release(), diskThread,
-                                                                                 (int) (sr * 10.0));
-        const auto peakBlocks = (size_t) (newSession->maxSamples / AudioSourceData::kPeakBlock + 1);
-        take->peakMin.assign(peakBlocks, 0.0f);
-        take->peakMax.assign(peakBlocks, 0.0f);
-        newSession->takes.push_back(std::move(take));
-    }
-
-    if (newSession->takes.empty())
-    {
-        error = "Arm at least one track (the R button) before recording.";
-        return false;
-    }
-
-    // Work out the record window and where the transport starts.
-    const bool alreadyPlaying = getState() == State::Playing;
-    const auto here = getPosition();
-    const auto bar = getSamplesPerBar();
-    juce::int64 startAt = here;
-
-    const bool punch = punchOn.load() && punchOut.load() > punchIn.load();
-    newSession->punch = punch;
-    if (punch)
-    {
-        newSession->windowStart = punchIn.load();
-        newSession->windowEnd = punchOut.load();
-        // Pre-roll: one bar before the punch-in, or from the playhead if it's already earlier.
-        startAt = here < newSession->windowStart ? here : newSession->windowStart - bar;
-    }
-    else
-    {
-        newSession->windowStart = here;
-        newSession->windowEnd = std::numeric_limits<juce::int64>::max() / 2;
-        if (countInOn.load() && !alreadyPlaying)
-            startAt = here - bar;
-    }
-
-    newSession->captureStart = newSession->windowStart + newSession->latency;
-    newSession->captureEnd = newSession->windowEnd + newSession->latency;
-
-    {
-        const juce::ScopedLock sl(deviceManager.getAudioCallbackLock());
-        session = std::move(newSession);
-        audioSession = session.get();
-        if (!alreadyPlaying)
-        {
-            // Pressing record during playback punches in on the fly without moving the playhead.
-            pendingLocate = startAt;
-            returnPosition = here;
-        }
-        state = (int) State::Recording;
-    }
-    return true;
+    edit->getTransport().play(false);
 }
 
 void AudioEngine::stop()
 {
-    std::unique_ptr<RecordSession> finished;
-    {
-        const juce::ScopedLock sl(deviceManager.getAudioCallbackLock());
-        state = (int) State::Stopped;
-        audioSession = nullptr;
-        finished = std::move(session);
-        pendingLocate = returnPosition;
-    }
-
-    if (finished != nullptr)
-    {
-        auto takes = finishSession(std::move(finished));
-        if (onTakesFinished)
-            onTakesFinished(std::move(takes));
-    }
-}
-
-std::vector<AudioEngine::FinishedTake> AudioEngine::finishSession(std::unique_ptr<RecordSession> finished)
-{
-    std::vector<FinishedTake> result;
-    const double sr = getSampleRate();
-
-    // The first captured sample was performed `latency` samples earlier on the timeline.
-    const auto first = finished->firstCapture.load();
-    const auto takeStart = first == std::numeric_limits<juce::int64>::min()
-                               ? finished->windowStart
-                               : first - finished->latency;
-
-    for (auto& take : finished->takes)
-    {
-        take->writer.reset();   // flushes everything still buffered and closes the file
-
-        const auto written = take->written.load();
-        if (written < Arrangement::kMinClipLength)
-        {
-            take->file.deleteFile();
-            continue;
-        }
-
-        juce::String error;
-        auto source = AudioFileIO::loadSource(take->file, sr, error);
-        if (source == nullptr)
-        {
-            DBG("Failed to load take: " << error);
-            continue;
-        }
-
-        FinishedTake ft;
-        ft.track = take->track;
-        ft.start = takeStart;
-        ft.length = juce::jmin(written, source->getLength());
-        ft.source = std::move(source);
-        result.push_back(std::move(ft));
-    }
-    return result;
-}
-
-//==============================================================================
-void AudioEngine::audioDeviceIOCallbackWithContext(const float* const* inputChannelData, int numInputChannels,
-                                                   float* const* outputChannelData, int numOutputChannels,
-                                                   int numSamples, const juce::AudioIODeviceCallbackContext&)
-{
-    juce::ScopedNoDenormals noDenormals;
-
-    // Process in chunks no bigger than the scratch buffers.
-    const float* inputs[64] = {};
-    const int numIn = juce::jmin(numInputChannels, 64);
-
-    for (int offset = 0; offset < numSamples; offset += scratchSize)
-    {
-        const int n = juce::jmin(scratchSize, numSamples - offset);
-        for (int ch = 0; ch < numIn; ++ch)
-            inputs[ch] = inputChannelData[ch] != nullptr ? inputChannelData[ch] + offset : nullptr;
-
-        float* mixL = scratch.getWritePointer(0);
-        float* mixR = scratch.getWritePointer(1);
-        processChunk(inputs, numIn, mixL, mixR, n);
-
-        for (int ch = 0; ch < numOutputChannels; ++ch)
-        {
-            if (outputChannelData[ch] == nullptr)
-                continue;
-            float* out = outputChannelData[ch] + offset;
-            if (ch == 0)
-                juce::FloatVectorOperations::copy(out, mixL, n);
-            else if (ch == 1)
-                juce::FloatVectorOperations::copy(out, mixR, n);
-            else
-                juce::FloatVectorOperations::clear(out, n);
-        }
-        if (numOutputChannels == 1 && outputChannelData[0] != nullptr)
-            juce::FloatVectorOperations::addWithMultiply(outputChannelData[0] + offset, mixR, 1.0f, n);
-    }
-}
-
-void AudioEngine::processChunk(const float* const* inputs, int numInputs, float* outL, float* outR, int n)
-{
-    const auto locate = pendingLocate.exchange(kNoLocate);
-    if (locate != kNoLocate)
-    {
-        position = locate;
-        mixer.reset();   // drop filter/reverb state so a jump doesn't click or smear
-    }
-
-    const auto st = (State) state.load();
-    const bool running = st != State::Stopped;
-    const auto pos = position.load(std::memory_order_relaxed);
-    auto* rec = st == State::Recording ? audioSession : nullptr;
-    const float* silence = scratch.getReadPointer(2);
-
-    auto inputFor = [&](int ch) -> const float*
-    {
-        return (ch >= 0 && ch < numInputs && inputs[ch] != nullptr) ? inputs[ch] : silence;
-    };
-
-    // inWindow: the old audio on a recording track is replaced (silenced).
-    // monitorWindow: Auto monitoring hears the input. For a plain recording that
-    // includes the count-in; for a punch, the pre-roll plays the old take instead.
-    const bool inWindow = rec != nullptr && pos + n > rec->windowStart && pos < rec->windowEnd;
-    const bool monitorWindow = rec != nullptr && (inWindow || !rec->punch);
-
-    // Decide what each track feeds into the mix.
-    for (int t = 0; t < kNumTracks; ++t)
-    {
-        auto& p = tracks[(size_t) t];
-        auto& feed = feeds[(size_t) t];
-        feed = {};
-
-        const bool armed = p.armed.load(std::memory_order_relaxed);
-        const auto type = (InputType) p.inputType.load(std::memory_order_relaxed);
-        const auto mode = (MonitorMode) p.monitor.load(std::memory_order_relaxed);
-
-        bool inSession = false;
-        if (rec != nullptr)
-            for (auto& take : rec->takes)
-                inSession = inSession || take->track == t;
-        const bool recordingHere = inSession && inWindow;
-
-        const bool monitorInput = armed && type != InputType::Mix
-            && (mode == MonitorMode::On
-                || (mode == MonitorMode::Auto && (st == State::Stopped || (inSession && monitorWindow))));
-
-        if (monitorInput)
-        {
-            const int ch = p.inputChannel.load(std::memory_order_relaxed);
-            feed.kind = MixEngine::TrackFeed::Kind::LiveInput;
-            feed.left = inputFor(ch);
-            feed.right = type == InputType::Stereo ? inputFor(ch + 1) : feed.left;
-        }
-        else if (recordingHere)
-        {
-            feed.kind = MixEngine::TrackFeed::Kind::Silence;   // the new take replaces what was there
-        }
-
-        // Armed tracks always show their input level, even when it isn't being monitored,
-        // so you can set levels and see that signal is arriving without risking feedback.
-        if (armed && !monitorInput && type != InputType::Mix)
-        {
-            const int ch = p.inputChannel.load(std::memory_order_relaxed);
-            const float* l = inputFor(ch);
-            const float* r = type == InputType::Stereo ? inputFor(ch + 1) : l;
-            auto peak = [n](const float* d)
-            {
-                auto range = juce::FloatVectorOperations::findMinAndMax(d, n);
-                return juce::jmax(std::abs(range.getStart()), std::abs(range.getEnd()));
-            };
-            atomicMax(p.peakL, peak(l));
-            atomicMax(p.peakR, peak(r));
-        }
-    }
-
-    mixer.process(audioArrangement.get(), paramArray, master, pos, n, running, feeds.data(), outL, outR, true);
-
-    if (rec != nullptr)
-        captureInput(inputs, numInputs, outL, outR, n);
-
-    const bool countIn = rec != nullptr && pos < rec->windowStart && countInOn.load(std::memory_order_relaxed);
-    if (running && (metronomeOn.load(std::memory_order_relaxed) || countIn))
-        addMetronome(outL, outR, n, pos, countIn);
-
-    if (running)
-        position.store(pos + n, std::memory_order_relaxed);
-}
-
-void AudioEngine::captureInput(const float* const* inputs, int numInputs, const float* mixL, const float* mixR, int n)
-{
-    auto* rec = audioSession;
-    const auto pos = position.load(std::memory_order_relaxed);
-
-    // Overlap of this block with the (latency-shifted) capture window.
-    const auto s0 = juce::jmax(pos, rec->captureStart);
-    const auto s1 = juce::jmin(pos + n, rec->captureEnd);
-    if (s1 <= s0)
+    if (edit == nullptr)
         return;
-
-    const int offset = (int) (s0 - pos);
-    const int count = (int) (s1 - s0);
-    if (rec->firstCapture.load(std::memory_order_relaxed) == std::numeric_limits<juce::int64>::min())
-        rec->firstCapture.store(s0, std::memory_order_relaxed);
-    const float* silence = scratch.getReadPointer(2);
-    auto inputFor = [&](int ch) -> const float*
-    {
-        return (ch >= 0 && ch < numInputs && inputs[ch] != nullptr) ? inputs[ch] : silence;
-    };
-
-    for (auto& take : rec->takes)
-    {
-        const auto written = take->written.load(std::memory_order_relaxed);
-        if (take->overflowed.load(std::memory_order_relaxed) || written + count > rec->maxSamples)
-        {
-            take->overflowed = true;
-            continue;
-        }
-
-        const float* l;
-        const float* r;
-        if (take->inputType == InputType::Mix)
-        {
-            l = mixL;
-            r = mixR;
-        }
-        else
-        {
-            l = inputFor(take->channel);
-            r = take->inputType == InputType::Stereo ? inputFor(take->channel + 1) : l;
-        }
-
-        const float* chans[2] = { l + offset, r + offset };
-        if (!take->writer->write(chans, count))
-            take->overflowed = true;   // disk couldn't keep up; keep what we have
-
-        // Live waveform overview for the UI
-        for (int i = 0; i < count; ++i)
-        {
-            const auto block = (size_t) ((written + i) / AudioSourceData::kPeakBlock);
-            const float v = 0.5f * (chans[0][i] + chans[1][i]);
-            take->peakMin[block] = juce::jmin(take->peakMin[block], v);
-            take->peakMax[block] = juce::jmax(take->peakMax[block], v);
-        }
-        take->written.store(written + count, std::memory_order_release);
-    }
+    const bool wasRolling = getState() != State::Stopped;
+    edit->getTransport().stop(false, false);
+    if (wasRolling)
+        setPosition(returnPosition);
 }
 
-void AudioEngine::addMetronome(float* outL, float* outR, int n, juce::int64 pos, bool countInClick)
+bool AudioEngine::record(const juce::File& takeFolder, juce::String& error)
 {
-    const double sr = getSampleRate();
-    const double spb = sr * 60.0 / juce::jmax(20.0, bpm.load(std::memory_order_relaxed));
-    const int bpb = juce::jmax(1, beatsPerBar.load(std::memory_order_relaxed));
-    const float level = dbToGain(clickLevelDb.load(std::memory_order_relaxed)) * (countInClick ? 1.0f : 0.8f);
-
-    // Beat boundaries that fall inside this block.
-    auto beat = (juce::int64) std::ceil((double) pos / spb);
-    int nextTrigger = (int) std::ceil((double) beat * spb - (double) pos);
-
-    for (int i = 0; i < n; ++i)
+    if (edit == nullptr)
     {
-        if (i == nextTrigger && nextTrigger < n)
-        {
-            const bool accent = ((beat % bpb) + bpb) % bpb == 0;
-            clickPhase = 0.0;
-            clickPhaseInc = juce::MathConstants<double>::twoPi * (accent ? 1760.0 : 1320.0) / sr;
-            clickRemaining = (int) (sr * 0.035);
-            clickAmp = level * (accent ? 1.0f : 0.6f);
-            ++beat;
-            nextTrigger = (int) std::ceil((double) beat * spb - (double) pos);
-        }
-
-        if (clickRemaining > 0)
-        {
-            const float env = (float) clickRemaining / (float) (sr * 0.035);
-            const float s = clickAmp * env * env * (float) std::sin(clickPhase);
-            clickPhase += clickPhaseInc;
-            --clickRemaining;
-            outL[i] += s;
-            outR[i] += s;
-        }
+        error = "There's no project open.";
+        return false;
     }
+
+    bool anyArmed = false;
+    for (auto& p : tracks)
+        anyArmed = anyArmed || p.armed.load();
+    if (!anyArmed)
+    {
+        error = "Arm a track (R) before recording.";
+        return false;
+    }
+    if (!takeFolder.createDirectory())
+    {
+        error = "Couldn't create " + takeFolder.getFullPathName();
+        return false;
+    }
+
+    // Takes go in the project's Audio folder, and replace (non-destructively trim) whatever
+    // they're recorded over, like the rest of 8track's editing.
+    const auto replaceMode = te::WaveInputDevice::getMergeModes()[1];
+    for (auto* device : engine.getDeviceManager().getWaveInputDevices())
+    {
+        device->setFilenameMask(takeFolder.getChildFile("%track%_%date%_%time%").getFullPathName());
+        device->setMergeMode(replaceMode);
+    }
+    sync();
+
+    auto& transport = edit->getTransport();
+    if (!transport.isPlaying())
+    {
+        returnPosition = getPosition();
+        const bool punch = punchOn.load() && punchOut.load() > punchIn.load();
+        if (punch)
+            setPosition(punchIn.load() - getSamplesPerBar());   // one bar of pre-roll
+        edit->setCountInMode(countInOn.load() && !punch ? te::Edit::CountIn::oneBar : te::Edit::CountIn::none);
+    }
+    transport.record(false);
+    return true;
+}
+
+std::vector<AudioEngine::LiveTake> AudioEngine::getLiveTakes() const
+{
+    std::vector<LiveTake> takes;
+    if (edit == nullptr || !edit->getTransport().isRecording())
+        return takes;
+
+    for (auto* instance : edit->getAllInputDevices())
+        for (int t = 0; t < kNumTracks; ++t)
+        {
+            const auto id = strips[(size_t) t].track->itemID;
+            if (instance->isRecording(id))
+                takes.push_back({ t, instance->getRecordingFile(id), toSamples(instance->getPunchInTime(id)) });
+        }
+    return takes;
 }

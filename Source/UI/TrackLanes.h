@@ -2,6 +2,7 @@
 
 #include "TimelineView.h"
 #include "../Project/Project.h"
+#include <map>
 #include <optional>
 #include <set>
 
@@ -66,9 +67,7 @@ private:
     void paintGrid(juce::Graphics&, float top, float bottom);
     void paintClip(juce::Graphics&, const Clip&, int track, bool selected, bool hovered);
     void paintLiveTakes(juce::Graphics&);
-    template <typename MinMaxFn>
-    void paintWaveform(juce::Graphics&, juce::Rectangle<float> area, juce::int64 clipStart, MinMaxFn&& minMaxForRange,
-                       juce::Colour colour, const Clip* envelope);
+    te::SmartThumbnail& thumbnailFor(const juce::File&);
 
     AudioEngine& engine;
     Project& project;
@@ -83,4 +82,8 @@ private:
     juce::int64 dragDownSample = 0;
     int dragDownTrack = 0;
     std::optional<Arrangement> preview;
+
+    // Waveforms, built and cached by Tracktion. Keyed by file path.
+    std::map<juce::String, std::unique_ptr<te::SmartThumbnail>> thumbnails;
+    std::map<juce::String, te::RecordingThumbnailManager::Thumbnail::Ptr> recordingThumbs;
 };

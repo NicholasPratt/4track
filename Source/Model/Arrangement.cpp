@@ -101,7 +101,7 @@ void Arrangement::clearRange(int track, juce::int64 a, juce::int64 b)
 
 juce::int64 Arrangement::insertClip(int track, Clip clip)
 {
-    if (track < 0 || track >= kNumTracks || clip.length <= 0 || clip.source == nullptr)
+    if (track < 0 || track >= kNumTracks || clip.length <= 0 || clip.sourceLength <= 0)
         return 0;
 
     if (clip.id == 0)
@@ -180,7 +180,7 @@ bool Arrangement::trimEnd(juce::int64 id, juce::int64 newEnd)
     if (c == nullptr)
         return false;
 
-    juce::int64 highest = c->start + (c->source->getLength() - c->sourceOffset);
+    juce::int64 highest = c->start + (c->sourceLength - c->sourceOffset);
     for (auto& other : tracks[(size_t) t])
         if (other.id != id && other.start >= c->end())
             highest = std::min(highest, other.start);
@@ -259,8 +259,8 @@ void Arrangement::rescalePositions(double ratio)
             c.length = std::max<juce::int64>(1, scale(c.length));
             c.fadeIn = scale(c.fadeIn);
             c.fadeOut = scale(c.fadeOut);
-            if (c.source)
-                c.length = std::min(c.length, c.source->getLength() - c.sourceOffset);
+            c.sourceLength = scale(c.sourceLength);
+            c.length = std::min(c.length, c.sourceLength - c.sourceOffset);
             clampFades(c);
         }
     }

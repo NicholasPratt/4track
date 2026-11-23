@@ -1,50 +1,53 @@
 #include <juce_core/juce_core.h>
 #include "../Source/Model/Arrangement.h"
-#include "../Source/Audio/MixEngine.h"
-#include "../Source/Project/AudioFileIO.h"
 #include "../Source/Audio/AudioEngine.h"
 #include "../Source/Project/Project.h"
 
 namespace
 {
-    AudioSourcePtr makeSource(int length, float value)
+    /** Stand-in for an audio file: the Arrangement only needs its identity and length. */
+    struct Source
     {
-        auto s = std::make_shared<AudioSourceData>();
-        s->audio.setSize(2, length);
-        for (int ch = 0; ch < 2; ++ch)
-            juce::FloatVectorOperations::fill(s->audio.getWritePointer(ch), value, length);
-        s->buildPeaks();
-        return s;
+        juce::File file;
+        juce::int64 length = 0;
+    };
+
+    Source makeSource(int length, float /*value*/ = 0.0f)
+    {
+        static int counter = 0;
+        return { juce::File::getSpecialLocation(juce::File::tempDirectory).getChildFile("src" + juce::String(++counter) + ".wav"), length };
     }
 
-    /** A source whose sample value is its own index, so offsets are easy to check. */
-    AudioSourcePtr makeRamp(int length)
-    {
-        auto s = std::make_shared<AudioSourceData>();
-        s->audio.setSize(2, length);
-        for (int i = 0; i < length; ++i)
-            for (int ch = 0; ch < 2; ++ch)
-                s->audio.setSample(ch, i, (float) i);
-        return s;
-    }
+    Source makeRamp(int length) { return makeSource(length); }
 
-    Clip clip(AudioSourcePtr src, juce::int64 start, juce::int64 length, juce::int64 offset = 0)
+    Clip clip(const Source& src, juce::int64 start, juce::int64 length, juce::int64 offset = 0)
     {
         Clip c;
-        c.source = std::move(src);
+        c.file = src.file;
+        c.sourceLength = src.length;
         c.start = start;
         c.length = length;
         c.sourceOffset = offset;
         return c;
     }
 
-    struct Mixer
+    /** Writes a stereo WAV of a constant value, for tests that need a real file. */
+    juce::File writeWav(const juce::File& file, double sampleRate, int length, float value)
     {
-        std::array<TrackParams, kNumTracks> tracks;
-        MasterParams master;
-        MixEngine::ParamArray params {};
-        Mixer() { for (int i = 0; i < kNumTracks; ++i) params[(size_t) i] = &tracks[(size_t) i]; }
-    };
+        file.deleteFile();
+        juce::AudioBuffer<float> audio(2, length);
+        for (int ch = 0; ch < 2; ++ch)
+            juce::FloatVectorOperations::fill(audio.getWritePointer(ch), value, length);
+
+        std::unique_ptr<juce::OutputStream> stream = file.createOutputStream();
+        juce::WavAudioFormat wav;
+        auto writer = wav.createWriterFor(stream, juce::AudioFormatWriterOptions()
+                                                      .withSampleRate(sampleRate)
+                                                      .withNumChannels(2)
+                                                      .withBitsPerSample(24));
+        writer->writeFromAudioSampleBuffer(audio, 0, length);
+        return file;
+    }
 }
 
 class ArrangementTests : public juce::UnitTest
@@ -160,380 +163,175 @@ public:
     }
 };
 
-class MixEngineTests : public juce::UnitTest
+/**
+    Project and AudioEngine against a real Tracktion Edit: every edit made through the
+    Arrangement must land in the Edit, survive undo/redo and a save/reopen, and old
+    8track projects must import.
+*/
+class TracktionProjectTests : public juce::UnitTest
 {
 public:
-    MixEngineTests() : juce::UnitTest("MixEngine", "8track") {}
+    TracktionProjectTests() : juce::UnitTest("TracktionProject", "8track") {}
 
     void runTest() override
     {
-        beginTest("A clip plays at its timeline position with its fades");
-        {
-            Mixer m;
-            Arrangement a;
-            auto c = clip(makeSource(1000, 0.5f), 1000, 1000);
-            c.fadeIn = 100;
-            a.insertClip(0, c);
-
-            auto out = MixEngine::renderOffline(a, m.params, m.master, 48000.0, 0.0);
-            expectEquals(out.getNumSamples(), 2000);
-            expectWithinAbsoluteError(out.getSample(0, 999), 0.0f, 1e-6f);
-            expectWithinAbsoluteError(out.getSample(0, 1000), 0.0f, 1e-6f);
-            expectWithinAbsoluteError(out.getSample(0, 1050), 0.25f, 0.01f);
-            expectWithinAbsoluteError(out.getSample(0, 1500), 0.5f, 1e-4f);
-            expectWithinAbsoluteError(out.getSample(1, 1500), 0.5f, 1e-4f);
-        }
-
-        beginTest("Mute and solo");
-        {
-            Mixer m;
-            Arrangement a;
-            a.insertClip(0, clip(makeSource(500, 0.25f), 0, 500));
-            a.insertClip(1, clip(makeSource(500, 0.5f), 0, 500));
-
-            m.tracks[1].mute = true;
-            auto out = MixEngine::renderOffline(a, m.params, m.master, 48000.0, 0.0);
-            expectWithinAbsoluteError(out.getSample(0, 300), 0.25f, 1e-4f);
-
-            m.tracks[1].mute = false;
-            m.tracks[1].solo = true;
-            out = MixEngine::renderOffline(a, m.params, m.master, 48000.0, 0.0);
-            expectWithinAbsoluteError(out.getSample(0, 300), 0.5f, 1e-4f);
-        }
-
-        beginTest("Hard pan and volume");
-        {
-            Mixer m;
-            Arrangement a;
-            a.insertClip(0, clip(makeSource(500, 0.5f), 0, 500));
-            m.tracks[0].pan = -1.0f;
-            m.tracks[0].volumeDb = -6.0206f;
-            auto out = MixEngine::renderOffline(a, m.params, m.master, 48000.0, 0.0);
-            expectWithinAbsoluteError(out.getSample(0, 300), 0.25f, 1e-3f);
-            expectWithinAbsoluteError(out.getSample(1, 300), 0.0f, 1e-6f);
-        }
-
-        beginTest("Blocks bigger than the prepared size give identical output");
-        {
-            Mixer m;
-            Arrangement a;
-            a.insertClip(0, clip(makeRamp(3000), 100, 2500));
-
-            MixEngine small, big;
-            small.prepare(48000.0, 64);
-            big.prepare(48000.0, 4096);
-
-            juce::AudioBuffer<float> o1(2, 3000), o2(2, 3000);
-            small.process(&a, m.params, m.master, 0, 3000, true, nullptr, o1.getWritePointer(0), o1.getWritePointer(1), false);
-            big.process(&a, m.params, m.master, 0, 3000, true, nullptr, o2.getWritePointer(0), o2.getWritePointer(1), false);
-
-            float maxDiff = 0.0f;
-            for (int i = 0; i < 3000; ++i)
-                maxDiff = juce::jmax(maxDiff, std::abs(o1.getSample(0, i) - o2.getSample(0, i)));
-            expectWithinAbsoluteError(maxDiff, 0.0f, 1e-4f);
-        }
-
-        beginTest("Reverb send uses the EQ'd signal and its tail is rendered");
-        {
-            Mixer m;
-            Arrangement a;
-            a.insertClip(0, clip(makeSource(4800, 0.5f), 0, 4800));
-            m.tracks[0].send = 1.0f;
-            m.tracks[0].volumeDb = -60.0f;   // direct signal off, so only the reverb remains...
-            auto silentDry = MixEngine::renderOffline(a, m.params, m.master, 48000.0, 1.0);
-            expectEquals(silentDry.getMagnitude(0, 0, silentDry.getNumSamples()), 0.0f,
-                         "sends are post-fader");
-
-            m.tracks[0].volumeDb = 0.0f;
-            auto withTail = MixEngine::renderOffline(a, m.params, m.master, 48000.0, 1.0);
-            expectEquals(withTail.getNumSamples(), 4800 + 48000);
-            expect(withTail.getMagnitude(0, 4800 + 1000, 10000) > 0.001f, "reverb tail rings after the clip ends");
-        }
-
-        beginTest("Live input feeds replace playback");
-        {
-            Mixer m;
-            Arrangement a;
-            a.insertClip(0, clip(makeSource(512, 0.5f), 0, 512));
-
-            MixEngine e;
-            e.prepare(48000.0, 512);
-            std::vector<float> input(512, 0.125f);
-            std::array<MixEngine::TrackFeed, kNumTracks> feeds {};
-            feeds[0].kind = MixEngine::TrackFeed::Kind::LiveInput;
-            feeds[0].left = feeds[0].right = input.data();
-
-            juce::AudioBuffer<float> out(2, 512);
-            e.process(&a, m.params, m.master, 0, 512, true, feeds.data(), out.getWritePointer(0), out.getWritePointer(1), false);
-            expectWithinAbsoluteError(out.getSample(0, 256), 0.125f, 1e-4f);
-
-            feeds[0].kind = MixEngine::TrackFeed::Kind::Silence;
-            e.process(&a, m.params, m.master, 0, 512, true, feeds.data(), out.getWritePointer(0), out.getWritePointer(1), false);
-            expectWithinAbsoluteError(out.getMagnitude(0, 0, 512), 0.0f, 1e-3f);
-        }
-    }
-};
-
-class AudioFileTests : public juce::UnitTest
-{
-public:
-    AudioFileTests() : juce::UnitTest("AudioFileIO", "8track") {}
-
-    void runTest() override
-    {
-        beginTest("WAV round trip with resampling to the engine rate");
-        {
-            auto dir = juce::File::createTempFile("8track-tests");
-            dir.createDirectory();
-            auto file = dir.getChildFile("tone.wav");
-
-            juce::AudioBuffer<float> tone(1, 44100);
-            for (int i = 0; i < 44100; ++i)
-                tone.setSample(0, i, 0.5f * std::sin(juce::MathConstants<float>::twoPi * 440.0f * (float) i / 44100.0f));
-
-            juce::String error;
-            expect(AudioFileIO::writeWav(file, tone, 44100.0, 24, error), error);
-
-            auto same = AudioFileIO::loadSource(file, 44100.0, error);
-            expect(same != nullptr, error);
-            expectEquals(same->getLength(), (juce::int64) 44100);
-            expectWithinAbsoluteError(same->audio.getSample(1, 1000), tone.getSample(0, 1000), 1e-4f,
-                                      "mono files are duplicated to stereo");
-
-            auto converted = AudioFileIO::loadSource(file, 48000.0, error);
-            expect(converted != nullptr, error);
-            expectEquals(converted->getLength(), (juce::int64) 48000);
-            expectWithinAbsoluteError(converted->audio.getMagnitude(0, 1000, 40000), 0.5f, 0.02f);
-
-            dir.deleteRecursively();
-        }
-    }
-};
-
-
-/** Drives AudioEngine's callback directly (no device), 512-sample blocks, one mono input. */
-class RecordingTests : public juce::UnitTest
-{
-public:
-    RecordingTests() : juce::UnitTest("Recording", "8track") {}
-
-    struct Driver
-    {
-        AudioEngine& engine;
-        std::vector<float> input = std::vector<float>(512, 0.0f);
-        juce::AudioBuffer<float> out { 2, 512 };
-
-        float block(float inputValue)
-        {
-            std::fill(input.begin(), input.end(), inputValue);
-            const float* ins[1] = { input.data() };
-            float* outs[2] = { out.getWritePointer(0), out.getWritePointer(1) };
-            juce::AudioIODeviceCallbackContext ctx {};
-            static_cast<juce::AudioIODeviceCallback&>(engine).audioDeviceIOCallbackWithContext(ins, 1, outs, 2, 512, ctx);
-            return out.getMagnitude(0, 0, 512);
-        }
-    };
-
-    juce::File makeFolder()
-    {
-        auto dir = juce::File::createTempFile("8track-rec");
+        auto dir = juce::File::createTempFile("8track-te");
         dir.createDirectory();
-        return dir;
-    }
 
-    void runTest() override
-    {
-        constexpr juce::int64 bar = 88200;   // 44.1 kHz, 120 BPM, 4/4
+        AudioEngine engine;
+        const double sr = engine.getSampleRate();
+        const int len = (int) sr;   // one second
+        auto wav = writeWav(dir.getChildFile("source.wav"), sr, len, 0.5f);
 
-        beginTest("Punch: pre-roll plays the old take, the punch range is replaced exactly");
         {
-            AudioEngine engine(false);
-            Arrangement a;
-            a.insertClip(0, clip(makeSource(400000, 0.25f), 0, 400000));
-            engine.setArrangement(std::make_shared<Arrangement>(a));
-
-            std::vector<AudioEngine::FinishedTake> takes;
-            engine.onTakesFinished = [&](std::vector<AudioEngine::FinishedTake> t) { takes = std::move(t); };
-
-            engine.getTrack(0).armed = true;
-            engine.punchIn = 100000;
-            engine.punchOut = 150000;
-            engine.punchOn = true;
-            engine.setPosition(120000);
-
-            auto folder = makeFolder();
-            juce::String error;
-            expect(engine.record(folder, error), error);
-            expectEquals(engine.getPosition(), (juce::int64) 100000 - bar, "pre-roll starts one bar before punch-in");
-
-            Driver d { engine };
-            float preRollMin = 1.0f, insideMax = 0.0f;
-            while (engine.getPosition() < 170000)
-            {
-                const auto pos = engine.getPosition();
-                const float level = d.block(0.5f);
-                if (pos + 512 <= 100000) preRollMin = juce::jmin(preRollMin, level);
-                if (pos >= 100000 && pos + 512 <= 150000) insideMax = juce::jmax(insideMax, level);
-            }
-            expectWithinAbsoluteError(preRollMin, 0.25f, 0.01f, "old take audible during pre-roll");
-            expectWithinAbsoluteError(insideMax, 0.0f, 0.001f, "old take silenced inside the punch (monitoring off)");
-
-            engine.stop();
-            expectEquals((int) takes.size(), 1);
-            if (takes.size() == 1)
-            {
-                expectEquals(takes[0].track, 0);
-                expectEquals(takes[0].start, (juce::int64) 100000, "take starts exactly at punch-in");
-                expectEquals(takes[0].length, (juce::int64) 50000, "take ends exactly at punch-out");
-                expectWithinAbsoluteError(takes[0].source->audio.getSample(0, 25000), 0.5f, 0.001f, "recorded input is on disk");
-            }
-            expectEquals(engine.getPosition(), (juce::int64) 120000, "stop returns to where you were");
-            folder.deleteRecursively();
-        }
-
-        beginTest("Count-in: one bar of click, then recording starts at the playhead");
-        {
-            AudioEngine engine(false);
-            std::vector<AudioEngine::FinishedTake> takes;
-            engine.onTakesFinished = [&](std::vector<AudioEngine::FinishedTake> t) { takes = std::move(t); };
-            engine.getTrack(2).armed = true;
-            engine.countInOn = true;
-            engine.metronomeOn = false;
-            engine.setPosition(2 * bar);
-
-            auto folder = makeFolder();
-            juce::String error;
-            expect(engine.record(folder, error), error);
-            expectEquals(engine.getPosition(), bar);
-
-            Driver d { engine };
-            float countInPeak = 0.0f, afterPeak = 0.0f;
-            while (engine.getPosition() < 2 * bar + 30000)
-            {
-                const auto pos = engine.getPosition();
-                const float level = d.block(0.3f);
-                if (pos + 512 <= 2 * bar) countInPeak = juce::jmax(countInPeak, level);
-                else if (pos >= 2 * bar) afterPeak = juce::jmax(afterPeak, level);
-            }
-            const auto end = engine.getPosition();
-            expect(countInPeak > 0.05f, "click audible during count-in");
-            expectWithinAbsoluteError(afterPeak, 0.0f, 0.001f, "no click after count-in when the metronome is off");
-
-            engine.stop();
-            expectEquals((int) takes.size(), 1);
-            if (takes.size() == 1)
-            {
-                expectEquals(takes[0].track, 2);
-                expectEquals(takes[0].start, 2 * bar);
-                expectEquals(takes[0].length, end - 2 * bar);
-            }
-            folder.deleteRecursively();
-        }
-
-        beginTest("Pressing record during playback punches in without moving the playhead");
-        {
-            AudioEngine engine(false);
-            std::vector<AudioEngine::FinishedTake> takes;
-            engine.onTakesFinished = [&](std::vector<AudioEngine::FinishedTake> t) { takes = std::move(t); };
-            engine.getTrack(1).armed = true;
-            engine.countInOn = true;   // must not apply mid-playback
-
-            Driver d { engine };
-            engine.play();
-            for (int i = 0; i < 10; ++i) d.block(0.1f);
-
-            auto folder = makeFolder();
-            juce::String error;
-            expect(engine.record(folder, error), error);
-            expectEquals(engine.getPosition(), (juce::int64) 5120);
-            for (int i = 0; i < 10; ++i) d.block(0.1f);
-
-            engine.stop();
-            expectEquals((int) takes.size(), 1);
-            if (takes.size() == 1)
-            {
-                expectEquals(takes[0].start, (juce::int64) 5120);
-                expectEquals(takes[0].length, (juce::int64) 5120);
-            }
-            expectEquals(engine.getPosition(), (juce::int64) 0, "stop returns to where playback started");
-            folder.deleteRecursively();
-        }
-
-        beginTest("Armed tracks meter their input even with monitoring off (and stay silent)");
-        {
-            AudioEngine engine(false);
-            engine.getTrack(0).armed = true;
-            engine.getTrack(0).monitor = (int) MonitorMode::Off;
-            Driver d { engine };
-            const float outLevel = d.block(0.5f);
-            expectWithinAbsoluteError(engine.getTrack(0).peakL.load(), 0.5f, 1e-4f);
-            expectWithinAbsoluteError(outLevel, 0.0f, 1e-6f, "not monitored, so not heard");
-
-            engine.getTrack(0).monitor = (int) MonitorMode::Auto;
-            expectWithinAbsoluteError(d.block(0.5f), 0.5f, 1e-3f, "auto monitoring is heard while stopped");
-        }
-
-        beginTest("Recording with nothing armed is refused with a message");
-        {
-            AudioEngine engine(false);
-            juce::String error;
-            auto folder = makeFolder();
-            expect(!engine.record(folder, error));
-            expect(error.isNotEmpty());
-            expect(engine.getState() == AudioEngine::State::Stopped);
-            folder.deleteRecursively();
-        }
-    }
-};
-
-class ProjectFileTests : public juce::UnitTest
-{
-public:
-    ProjectFileTests() : juce::UnitTest("ProjectFiles", "8track") {}
-
-    void runTest() override
-    {
-        beginTest("Saves as project.8track and still opens projects saved as 4track");
-        {
-            auto dir = juce::File::createTempFile("8track-project");
-            AudioEngine engine(false);
-            engine.bpm = 97.0;
             Project project(engine);
+            const auto untitledFolder = project.getFolder();
             juce::String error;
-            expect(project.saveAs(dir, error), error);
-            auto saved = dir.getChildFile(Project::kProjectFileName);
-            expect(saved.existsAsFile(), "new projects use the new file name");
-            expect(saved.loadFileAsString().contains("<EIGHTTRACK"));
 
-            // Turn it into what the app wrote before the rename.
-            auto legacy = dir.getChildFile(Project::kLegacyProjectFileName);
-            legacy.replaceWithText(saved.loadFileAsString().replace("EIGHTTRACK", "FOURTRACK"));
-            saved.deleteFile();
+            beginTest("Importing audio puts a clip in the Edit, undoably");
+            expect(project.importAudio(wav, 2, (juce::int64) sr, error), error);
+            expectEquals((int) project.getArrangement().tracks[2].size(), 1);
+            auto c = project.getArrangement().tracks[2].front();
+            expectEquals(c.start, (juce::int64) sr);
+            expectEquals(c.length, (juce::int64) len);
+            expectEquals(c.sourceLength, (juce::int64) len);
+            expectEquals(engine.getAudioTrack(2)->getClips().size(), 1, "the clip is in the Tracktion track");
 
-            AudioEngine engine2(false);
-            Project reopened(engine2);
+            expect(project.undo());
+            expectEquals((int) project.getArrangement().tracks[2].size(), 0, "undo removes it");
+            expect(project.redo());
+            expectEquals((int) project.getArrangement().tracks[2].size(), 1, "redo brings it back");
+
+            beginTest("Move, split, fade and gain are written to the Edit");
+            const auto id = project.getArrangement().tracks[2].front().id;
+            expect(project.perform([&](Arrangement& a) { return a.moveClip(id, 5, 0); }));
+            expectEquals((int) project.getArrangement().tracks[5].size(), 1, "moved to track 6");
+            expectEquals(engine.getAudioTrack(5)->getClips().size(), 1);
+            expectEquals(engine.getAudioTrack(2)->getClips().size(), 0);
+
+            const auto movedId = project.getArrangement().tracks[5].front().id;
+            expect(project.perform([&](Arrangement& a) { return a.splitClip(movedId, len / 4); }));
+            const auto lane = project.getArrangement().tracks[5];
+            expectEquals((int) lane.size(), 2, "split in two");
+            expectEquals(engine.getAudioTrack(5)->getClips().size(), 2);
+            expectEquals(lane[0].length + lane[1].length, (juce::int64) len, "nothing lost");
+            expectEquals(lane[1].sourceOffset, (juce::int64) (len / 4), "right half plays from the split point");
+
+            const auto rightId = lane[1].id;
+            expect(project.perform([&](Arrangement& a) { return a.setFades(rightId, 1000, 2000) && a.setGain(rightId, 0.5f); }));
+            auto* right = project.getArrangement().findClip(rightId);
+            expect(right != nullptr);
+            if (right != nullptr)
+            {
+                expect(std::abs(right->fadeIn - 1000) <= 1, "fade-in stored");
+                expect(std::abs(right->fadeOut - 2000) <= 1, "fade-out stored");
+                expectWithinAbsoluteError(right->gain, 0.5f, 0.001f, "gain stored");
+            }
+
+            beginTest("Mixer settings reach Tracktion's plugins and come back after undo");
+            engine.getTrack(5).volumeDb = -6.0f;
+            engine.getTrack(5).lowCut = 120.0f;
+            engine.syncNow();
+            auto* volume = engine.getAudioTrack(5)->getVolumePlugin();
+            expectWithinAbsoluteError(volume->getVolumeDb(), -6.0f, 0.05f);
+            volume->setVolumeDb(-12.0f);   // as undo or an automation change would
+            engine.syncNow();
+            expectWithinAbsoluteError(engine.getTrack(5).volumeDb.load(), -12.0f, 0.05f, "the UI follows the Edit");
+
+            beginTest("Save As, then reopen, gives back the same clips and mixer");
+            auto saved = dir.getChildFile("Song");
+            expect(project.saveAs(saved, error), error);
+            expect(saved.getChildFile(Project::kProjectFileName).existsAsFile());
+            expect(saved.getChildFile("Audio").getChildFile("source.wav").existsAsFile(), "audio copied into the project");
+            expect(!project.isDirty());
+
+            const auto before = project.getArrangement();
+            project.newProject();
+            expect(project.getArrangement().isEmpty(), "new project is empty");
+
             error = {};
-            expect(reopened.load(dir, error), error);
-            expect(!reopened.isUntitled());
-            expectWithinAbsoluteError(engine2.bpm.load(), 97.0, 1e-9, "settings read from the old file");
+            expect(project.load(saved, error), error);
+            expect(error.isEmpty(), error);
+            expectEquals((int) project.getArrangement().tracks[5].size(), 2);
+            for (size_t i = 0; i < before.tracks[5].size() && i < project.getArrangement().tracks[5].size(); ++i)
+            {
+                auto& x = before.tracks[5][i];
+                auto& y = project.getArrangement().tracks[5][i];
+                expect(std::abs(x.start - y.start) <= 1 && std::abs(x.length - y.length) <= 1
+                       && std::abs(x.sourceOffset - y.sourceOffset) <= 1, "clip " + juce::String((int) i) + " unchanged");
+                expect(y.file.isAChildOf(saved), "clip points into the saved project");
+            }
+            expectWithinAbsoluteError(engine.getTrack(5).volumeDb.load(), -12.0f, 0.05f, "volume reopened");
+            expectWithinAbsoluteError(engine.getTrack(5).lowCut.load(), 120.0f, 0.5f, "low cut reopened");
+
+            beginTest("Projects saved before Tracktion import with their clips and mixer");
+            auto legacy = dir.getChildFile("Old");
+            legacy.getChildFile("Audio").createDirectory();
+            wav.copyFileTo(legacy.getChildFile("Audio/take.wav"));
+            juce::XmlElement xml("EIGHTTRACK");
+            xml.setAttribute("sampleRate", sr);
+            xml.setAttribute("bpm", 97.0);
+            auto* tr = xml.createNewChildElement("TRACK");
+            tr->setAttribute("index", 3);
+            tr->setAttribute("name", "Bass");
+            tr->setAttribute("volumeDb", -3.0);
+            auto* cx = tr->createNewChildElement("CLIP");
+            cx->setAttribute("file", "Audio/take.wav");
+            cx->setAttribute("start", juce::String((juce::int64) (2 * sr)));
+            cx->setAttribute("offset", "0");
+            cx->setAttribute("length", juce::String(len / 2));
+            xml.writeTo(legacy.getChildFile(Project::kProjectFileName));
 
             error = {};
-            expect(!reopened.load(juce::File::createTempFile("not-a-project"), error));
-            expect(error.contains("8track"));
-            dir.deleteRecursively();
+            expect(project.load(legacy, error), error);
+            expectEquals((int) project.getArrangement().tracks[3].size(), 1);
+            if (!project.getArrangement().tracks[3].empty())
+            {
+                auto& lc = project.getArrangement().tracks[3].front();
+                expect(std::abs(lc.start - (juce::int64) (2 * sr)) <= 1);
+                expect(std::abs(lc.length - len / 2) <= 1);
+            }
+            expectEquals(engine.getTrack(3).name, juce::String("Bass"));
+            expectWithinAbsoluteError(engine.getAudioTrack(3)->getVolumePlugin()->getVolumeDb(), -3.0f, 0.05f);
+            expectWithinAbsoluteError(engine.bpm.load(), 97.0, 1e-6);
+            expect(project.isDirty(), "imported projects need saving in the new format");
+            expect(!project.canUndo(), "the import isn't an undo step");
+
+            beginTest("Export renders a WAV with the mix and a tail");
+            auto out = dir.getChildFile("mix.wav");
+            error = {};
+            expect(project.exportMix(out, error), error);
+            if (auto reader = std::unique_ptr<juce::AudioFormatReader>(juce::WavAudioFormat().createReaderFor(out.createInputStream().release(), true)))
+            {
+                expect(reader->lengthInSamples >= (juce::int64) (2 * sr + len / 2), "covers the clip");
+                juce::AudioBuffer<float> buf(2, (int) reader->lengthInSamples);
+                reader->read(&buf, 0, buf.getNumSamples(), 0, true, true);
+                expect(buf.getMagnitude(0, (int) (2.2 * sr), (int) (0.1 * sr)) > 0.05f, "the clip is audible");
+                expect(buf.getMagnitude(0, 0, (int) (0.5 * sr)) < 0.001f, "silence before it");
+            }
+            else
+            {
+                expect(false, "export produced a readable WAV");
+            }
+            untitledFolder.deleteRecursively();   // where the import went before Save As
         }
+
+        dir.deleteRecursively();
     }
 };
 
 static ArrangementTests arrangementTests;
-static ProjectFileTests projectFileTests;
-static RecordingTests recordingTests;
-static MixEngineTests mixEngineTests;
-static AudioFileTests audioFileTests;
+static TracktionProjectTests tracktionProjectTests;
 
 int main()
 {
-    juce::MessageManager::getInstance();
+    std::setvbuf(stdout, nullptr, _IONBF, 0);   // keep every line if a test crashes
+    juce::SystemStats::setApplicationCrashHandler([](void*)
+    {
+        std::cerr << "CRASH\n" << juce::SystemStats::getStackBacktrace() << std::endl;
+        std::_Exit(2);
+    });
+    juce::ScopedJuceInitialiser_GUI juceInit;   // Tracktion needs the message manager and GUI basics
     juce::UnitTestRunner runner;
     runner.setAssertOnFailure(false);
     runner.runTestsInCategory("8track");
@@ -543,7 +341,5 @@ int main()
         failures += runner.getResult(i)->failures;
 
     std::cout << (failures == 0 ? "ALL TESTS PASSED" : "TESTS FAILED: " + std::to_string(failures)) << std::endl;
-    juce::DeletedAtShutdown::deleteAll();
-    juce::MessageManager::deleteInstance();
     return failures == 0 ? 0 : 1;
 }

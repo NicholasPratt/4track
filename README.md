@@ -30,20 +30,23 @@ Mouse: drag a clip to move it (to other tracks too), drag its edges to trim, dra
 
 ## Building
 
-Requires CMake 3.22+ and a C++20 compiler (Xcode 14+). Tracktion Engine is a git submodule and
-brings the JUCE version it needs (9.0.5):
+Requires CMake 3.22+ and clang 16 or newer: Tracktion Engine uses C++20 features that Apple clang 15
+(Xcode 15) can't compile. Xcode 16, or Homebrew's LLVM (`brew install llvm`), works. Tracktion Engine
+is a git submodule and brings the JUCE version it needs (9.0.5):
 
 ```bash
 git submodule update --init tracktion_engine
 # Tracktion's JUCE submodule uses an SSH URL; this fetches it over HTTPS instead:
 git -C tracktion_engine config submodule.modules/juce.url https://github.com/juce-framework/JUCE.git
 git -C tracktion_engine submodule update --init modules/juce
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+# With Homebrew LLVM on an Intel Mac (use /opt/homebrew/opt/llvm on Apple silicon):
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug \
+      -DCMAKE_C_COMPILER=/usr/local/opt/llvm/bin/clang -DCMAKE_CXX_COMPILER=/usr/local/opt/llvm/bin/clang++
 cmake --build build
 open build/8Track_artefacts/Debug/8track.app
 ```
 
-Tests (model, mixer, file I/O, and recording driven through the audio callback without a device):
+Tests (the arrangement model, and the project and mixer against a real Tracktion Edit):
 
 ```bash
 cmake --build build --target 8TrackTests && ./build/8TrackTests_artefacts/Debug/8TrackTests
@@ -53,14 +56,15 @@ cmake --build build --target 8TrackTests && ./build/8TrackTests_artefacts/Debug/
 
 ```
 Source/
-├── Model/      Clip, Arrangement (lanes of non-overlapping clips, edit operations), EditHistory
-├── Audio/      MixEngine (shared by playback and export), AudioEngine (device, transport, recording,
-│               monitoring, metronome), Parameters (atomics shared with the audio thread)
-├── Project/    Project (undo, save/load, import/export), AudioFileIO (WAV I/O, resampling)
+├── Model/      Clip, Arrangement: the clip view the UI edits (lanes of non-overlapping clips)
+├── Audio/      AudioEngine: Tracktion Engine, the transport, recording and the mixer plugins,
+│               kept in step with the UI's Parameters
+├── Project/    Project: the Tracktion Edit, undo, save/load, import, export, older-format import
 └── UI/         MainComponent, TransportBar, ArrangeView (Ruler, TrackHeader, TrackLanes), MixerPanel
 Tests/          Unit tests (juce::UnitTest)
 ```
 
-The audio thread never allocates, locks or touches the disk. Recordings stream to disk through
-`AudioFormatWriter::ThreadedWriter`, and the arrangement reaches the audio thread as an immutable
-snapshot that is swapped under the device's callback lock.
+Audio, recording and mixing run in [Tracktion Engine](https://github.com/Tracktion/tracktion_engine)
+(GPLv3). Each track's mixer is a chain of Tracktion plugins (high-pass, EQ, low-pass, volume & pan,
+reverb send); a hidden ninth track returns the reverb. Clip edits are made on an `Arrangement` copy
+and written back to the Edit as one undo step.

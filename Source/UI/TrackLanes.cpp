@@ -117,7 +117,7 @@ void TrackLanes::paint(juce::Graphics& g)
 
     paintLiveTakes(g);
 
-    if (arr.isEmpty() && engine.getRecordSession() == nullptr)
+    if (arr.isEmpty() && engine.getState() != AudioEngine::State::Recording)
     {
         g.setColour(Theme::textDim);
         g.setFont(Theme::font(14.0f));
@@ -151,34 +151,13 @@ void TrackLanes::paintGrid(juce::Graphics& g, float top, float bottom)
     }
 }
 
-template <typename MinMaxFn>
-void TrackLanes::paintWaveform(juce::Graphics& g, juce::Rectangle<float> area, juce::int64 clipStart,
-                               MinMaxFn&& minMaxForRange, juce::Colour colour, const Clip* envelope)
+te::SmartThumbnail& TrackLanes::thumbnailFor(const juce::File& file)
 {
-    const int x0 = juce::jmax(0, (int) std::floor(area.getX()));
-    const int x1 = juce::jmin(getWidth(), (int) std::ceil(area.getRight()));
-    const float mid = area.getCentreY();
-    const float half = area.getHeight() * 0.5f;
-    g.setColour(colour);
-
-    for (int x = x0; x < x1; ++x)
-    {
-        const auto a = view.sampleAt((float) x) - clipStart;
-        const auto b = juce::jmax(a + 1, view.sampleAt((float) x + 1.0f) - clipStart);
-        float lo = 0.0f, hi = 0.0f;
-        minMaxForRange(a, b, lo, hi);
-
-        if (envelope != nullptr)
-        {
-            const float gain = envelope->gain * envelope->fadeGainAt(juce::jlimit<juce::int64>(0, envelope->length - 1, (a + b) / 2));
-            lo *= gain;
-            hi *= gain;
-        }
-
-        const float top = mid - juce::jlimit(0.0f, 1.0f, hi) * half;
-        const float bot = mid - juce::jlimit(-1.0f, 0.0f, lo) * half;
-        g.fillRect((float) x, top, 1.0f, juce::jmax(1.0f, bot - top));
-    }
+    auto& thumb = thumbnails[file.getFullPathName()];
+    if (thumb == nullptr)
+        thumb = std::make_unique<te::SmartThumbnail>(engine.getTracktion(), te::AudioFile(engine.getTracktion(), file),
+                                                     *this, engine.getEdit());
+    return *thumb;
 }
 
 void TrackLanes::paintClip(juce::Graphics& g, const Clip& c, int track, bool selected, bool hovered)
@@ -198,44 +177,29 @@ void TrackLanes::paintClip(juce::Graphics& g, const Clip& c, int track, bool sel
     {
         g.setColour(juce::Colours::black.withAlpha(0.75f));
         g.setFont(Theme::font(10.0f, true));
-        const auto name = c.source->file.getFileNameWithoutExtension();
-        g.drawText(name, header.reduced(5.0f, 0.0f).withX(juce::jmax(header.getX() + 5.0f, 2.0f)),
+        g.drawText(c.file.getFileNameWithoutExtension(),
+                   header.reduced(5.0f, 0.0f).withX(juce::jmax(header.getX() + 5.0f, 2.0f)),
                    juce::Justification::centredLeft, true);
     }
 
-    // Waveform
+    // Waveform: only the visible part of the clip, mapped to the matching part of the file.
     auto waveArea = r.withTrimmedTop(15.0f).reduced(0.0f, 2.0f);
-    const auto* src = c.source.get();
-    paintWaveform(g, waveArea, c.start, [&](juce::int64 a, juce::int64 b, float& lo, float& hi)
+    const auto visible = waveArea.getIntersection(getLocalBounds().toFloat());
+    if (visible.getWidth() >= 1.0f && c.file.existsAsFile())
     {
-        const auto s0 = juce::jlimit<juce::int64>(0, src->getLength(), c.sourceOffset + a);
-        const auto s1 = juce::jlimit<juce::int64>(0, src->getLength(), c.sourceOffset + b);
-        if (s1 <= s0)
-            return;
-
-        if (s1 - s0 >= AudioSourceData::kPeakBlock && !src->peakMin.empty())
+        const double sr = engine.getSampleRate();
+        auto sourceTime = [&](float x)
         {
-            const auto blocks = (juce::int64) src->peakMin.size();
-            const auto b0 = juce::jlimit<juce::int64>(0, blocks - 1, s0 / AudioSourceData::kPeakBlock);
-            const auto b1 = juce::jlimit<juce::int64>(b0 + 1, blocks, s1 / AudioSourceData::kPeakBlock);
-            for (auto i = b0; i < b1; ++i)
-            {
-                lo = juce::jmin(lo, src->peakMin[(size_t) i]);
-                hi = juce::jmax(hi, src->peakMax[(size_t) i]);
-            }
-        }
-        else
-        {
-            const float* l = src->audio.getReadPointer(0);
-            const float* rr = src->audio.getReadPointer(1);
-            for (auto i = s0; i < s1; ++i)
-            {
-                const float v = 0.5f * (l[i] + rr[i]);
-                lo = juce::jmin(lo, v);
-                hi = juce::jmax(hi, v);
-            }
-        }
-    }, base.brighter(0.5f).withAlpha(0.9f), &c);
+            const auto s = juce::jlimit<juce::int64>(c.start, c.end(), view.sampleAt(x));
+            return (double) (c.sourceOffset + (s - c.start)) / sr;
+        };
+        auto& thumb = thumbnailFor(c.file);
+        g.setColour(base.brighter(0.5f).withAlpha(0.9f));
+        thumb.drawChannels(g, visible.withY(waveArea.getY()).withHeight(waveArea.getHeight()).toNearestInt(),
+                           { te::TimePosition::fromSeconds(sourceTime(visible.getX())),
+                             te::TimePosition::fromSeconds(sourceTime(visible.getRight())) },
+                           c.gain);
+    }
 
     // Fades: shade the attenuated area and draw the fade line
     auto drawFade = [&](float xFrom, float xTo, bool fadeIn)
@@ -271,25 +235,23 @@ void TrackLanes::paintClip(juce::Graphics& g, const Clip& c, int track, bool sel
 
 void TrackLanes::paintLiveTakes(juce::Graphics& g)
 {
-    const auto* session = engine.getRecordSession();
-    if (session == nullptr)
-        return;
-
-    const auto first = session->firstCapture.load();
-    if (first == std::numeric_limits<juce::int64>::min())
-        return;
-    const auto start = first - session->latency;
-
-    for (auto& take : session->takes)
+    const auto takes = engine.getLiveTakes();
+    if (takes.empty())
     {
-        const auto written = take->written.load(std::memory_order_acquire);
-        if (written <= 0)
+        recordingThumbs.clear();
+        return;
+    }
+
+    const auto now = engine.getPosition();
+    for (auto& take : takes)
+    {
+        if (now <= take.start)
             continue;
 
         Clip shape;
-        shape.start = start;
-        shape.length = written;
-        auto r = clipRect(shape, take->track);
+        shape.start = take.start;
+        shape.length = now - take.start;
+        auto r = clipRect(shape, take.track);
 
         g.setColour(Theme::record.withAlpha(0.25f));
         g.fillRoundedRectangle(r, 4.0f);
@@ -299,18 +261,15 @@ void TrackLanes::paintLiveTakes(juce::Graphics& g)
         g.setFont(Theme::font(10.0f, true));
         g.drawText("Recording", r.withHeight(14.0f).reduced(5.0f, 0.0f), juce::Justification::centredLeft, true);
 
-        const auto blocks = (juce::int64) (written / AudioSourceData::kPeakBlock);
-        paintWaveform(g, r.withTrimmedTop(15.0f).reduced(0.0f, 2.0f), start,
-                      [&](juce::int64 a, juce::int64 b, float& lo, float& hi)
+        auto& thumb = recordingThumbs[take.file.getFullPathName()];
+        if (thumb == nullptr && take.file != juce::File())
+            thumb = engine.getTracktion().getRecordingThumbnailManager().getThumbnailFor(take.file);
+        if (thumb != nullptr)
         {
-            const auto b0 = juce::jlimit<juce::int64>(0, blocks, a / AudioSourceData::kPeakBlock);
-            const auto b1 = juce::jlimit<juce::int64>(b0, blocks, juce::jmax(b0 + 1, b / AudioSourceData::kPeakBlock));
-            for (auto i = b0; i < b1; ++i)
-            {
-                lo = juce::jmin(lo, take->peakMin[(size_t) i]);
-                hi = juce::jmax(hi, take->peakMax[(size_t) i]);
-            }
-        }, Theme::record.brighter(0.6f), nullptr);
+            g.setColour(Theme::record.brighter(0.6f));
+            const double seconds = (double) shape.length / engine.getSampleRate();
+            thumb->thumb->drawChannels(g, r.withTrimmedTop(15.0f).reduced(0.0f, 2.0f).toNearestInt(), 0.0, seconds, 1.0f);
+        }
 
         g.setColour(Theme::record);
         g.drawRoundedRectangle(r, 4.0f, 1.2f);

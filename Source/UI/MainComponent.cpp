@@ -43,7 +43,6 @@ MainComponent::MainComponent()
     transport->onGridChanged = [this] { arrange->viewChanged(); };
 
     project.onChanged = [this] { projectChanged(); };
-    engine.onTakesFinished = [this](std::vector<AudioEngine::FinishedTake> takes) { project.addTakes(takes); };
     engine.addChangeListener(this);
 
 #if JUCE_MAC
@@ -167,7 +166,7 @@ void MainComponent::toggleRecord()
     }
 
     juce::String error;
-    if (!engine.record(project.getAudioFolder(), error))
+    if (!project.prepareFolder(error) || !engine.record(project.getAudioFolder(), error))
         showError("Can't record", error);
 }
 
