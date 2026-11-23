@@ -6,10 +6,15 @@ class EightTrackApplication : public juce::JUCEApplication
 public:
     const juce::String getApplicationName() override { return JUCE_APPLICATION_NAME_STRING; }
     const juce::String getApplicationVersion() override { return JUCE_APPLICATION_VERSION_STRING; }
-    bool moreThanOneInstanceAllowed() override { return false; }
+    // Plugin scanning runs 8track again as a helper process, which must be allowed to start.
+    bool moreThanOneInstanceAllowed() override { return getCommandLineParameters().contains("PluginScan"); }
 
-    void initialise(const juce::String&) override
+    void initialise(const juce::String& commandLine) override
     {
+        if (te::PluginManager::startChildProcessPluginScan(commandLine))
+            return;   // this is the scan helper: no window
+
+
         juce::LookAndFeel::setDefaultLookAndFeel(&lookAndFeel);
         mainWindow = std::make_unique<MainWindow>(getApplicationName());
 
@@ -54,7 +59,7 @@ public:
             setUsingNativeTitleBar(true);
             setContentOwned(new MainComponent(), true);
             setResizable(true, true);
-            setResizeLimits(1200, 560, 10000, 10000);
+            setResizeLimits(1200, 640, 10000, 10000);
             centreWithSize(getWidth(), getHeight());
             setVisible(true);
         }

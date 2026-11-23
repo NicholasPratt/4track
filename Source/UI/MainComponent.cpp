@@ -248,6 +248,7 @@ void MainComponent::perform(int command)
         case cmdImport:   importAudio(); break;
         case cmdExport:   exportMix(); break;
         case cmdAudioSettings: showAudioSettings(); break;
+        case cmdPlugins: showPluginManager(engine); break;
 
         case cmdUndo:     if (stopped) project.undo(); break;
         case cmdRedo:     if (stopped) project.redo(); break;
@@ -380,6 +381,7 @@ juce::PopupMenu MainComponent::getMenuForIndex(int index, const juce::String&)
             m.addItem(item(cmdExport, "Export Mix...", "Cmd+E", stopped));
             m.addSeparator();
             m.addItem(item(cmdAudioSettings, "Audio Settings...", "Cmd+,"));
+            m.addItem(item(cmdPlugins, "Plugins...", ""));
             break;
         case 1:
             m.addItem(item(cmdUndo, "Undo", "Cmd+Z", stopped && project.canUndo()));
@@ -593,6 +595,17 @@ void MainComponent::runDebugSnapshot(const juce::StringArray& args)
         }
         else if (args[i] == "--mixer" && !mixerVisible)
             toggleMixer();
+        else if (args[i] == "--insert" && i + 2 < args.size())   // --insert <track> <AU id, e.g. aufx,dely,appl>
+        {
+            const int t = args[++i].getIntValue();
+            juce::OwnedArray<juce::PluginDescription> found;
+            for (auto* format : engine.getTracktion().getPluginManager().pluginFormatManager.getFormats())
+                if (format->getName() == "AudioUnit")
+                    format->findAllTypesForFile(found, "AudioUnit:Effects/" + args[++i]);
+            juce::String error;
+            if (found.isEmpty() || engine.addInsert(t, *found[0], error) == nullptr)
+                DBG("insert failed: " + error);
+        }
     }
 
     engine.punchIn = engine.getSamplesPerBar() * 2;

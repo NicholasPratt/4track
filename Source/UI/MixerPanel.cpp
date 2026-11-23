@@ -1,4 +1,5 @@
 #include "MixerPanel.h"
+#include "PluginWindows.h"
 
 namespace
 {
@@ -61,8 +62,157 @@ void Knob::resized()
 }
 
 //==============================================================================
+InsertSlots::InsertSlots(AudioEngine& e, Project& p, int trackIndex) : engine(e), project(p), index(trackIndex)
+{
+    refresh();
+}
+
+void InsertSlots::refresh()
+{
+    std::vector<Slot> now;
+    for (auto* plugin : engine.getInserts(index))
+        now.push_back({ plugin, plugin->getName(), plugin->isEnabled() });
+    if (now != slots)
+    {
+        slots = std::move(now);
+        repaint();
+    }
+}
+
+juce::Rectangle<int> InsertSlots::slotBounds(int i) const
+{
+    return { 0, i * (kSlotHeight + kGap), getWidth(), kSlotHeight };
+}
+
+void InsertSlots::paint(juce::Graphics& g)
+{
+    g.setFont(Theme::font(10.0f));
+    for (int i = 0; i < AudioEngine::kMaxInserts; ++i)
+    {
+        const auto r = slotBounds(i).toFloat();
+        if (i < (int) slots.size())
+        {
+            auto& slot = slots[(size_t) i];
+            g.setColour(slot.enabled ? Theme::panelLight : Theme::bg);
+            g.fillRoundedRectangle(r, 3.0f);
+            g.setColour(slot.enabled ? Theme::accent : Theme::textDim.withAlpha(0.5f));
+            g.fillRoundedRectangle(r.withWidth(3.0f), 1.5f);
+            g.setColour(slot.enabled ? Theme::text : Theme::textDim);
+            g.drawText(slot.name, r.toNearestInt().withTrimmedLeft(7).withTrimmedRight(3), juce::Justification::centredLeft, true);
+        }
+        else
+        {
+            g.setColour(Theme::outline);
+            g.drawRoundedRectangle(r.reduced(0.5f), 3.0f, 1.0f);
+            if (i == (int) slots.size())
+            {
+                g.setColour(Theme::textDim);
+                g.drawText("+", r.toNearestInt(), juce::Justification::centred, false);
+            }
+        }
+    }
+}
+
+void InsertSlots::mouseUp(const juce::MouseEvent& e)
+{
+    if (!getLocalBounds().contains(e.getPosition()))
+        return;
+    const int i = e.y / (kSlotHeight + kGap);
+    if (i < (int) slots.size())
+    {
+        auto* plugin = slots[(size_t) i].plugin;
+        if (e.mods.isPopupMenu())
+            showPluginMenu(*plugin);
+        else
+            plugin->showWindowExplicitly();
+    }
+    else if (i < AudioEngine::kMaxInserts)
+    {
+        showAddMenu();
+    }
+}
+
+void InsertSlots::showAddMenu()
+{
+    juce::Array<juce::PluginDescription> effects;
+    for (auto& type : engine.getKnownPlugins().getTypes())
+        if (!type.isInstrument)
+            effects.add(type);
+
+    juce::PopupMenu menu;
+    if (effects.isEmpty())
+        menu.addItem(-1, "No plugins found yet", false);
+    else
+        juce::KnownPluginList::addToMenu(menu, effects, juce::KnownPluginList::sortByManufacturer);
+    menu.addSeparator();
+    menu.addItem(-2, "Scan for Plugins...");
+
+    menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(this),
+                       [safe = SafePointer<InsertSlots>(this), effects](int result)
+    {
+        if (safe == nullptr || result == 0)
+            return;
+        if (result == -2)
+        {
+            showPluginManager(safe->engine);
+            return;
+        }
+        const int chosen = juce::KnownPluginList::getIndexChosenByMenu(effects, result);
+        if (chosen < 0)
+            return;
+
+        juce::String error;
+        if (auto* plugin = safe->engine.addInsert(safe->index, effects.getReference(chosen), error))
+        {
+            safe->project.markDirty();
+            safe->refresh();
+            plugin->showWindowExplicitly();
+        }
+        else
+        {
+            juce::AlertWindow::showAsync(juce::MessageBoxOptions()
+                                             .withIconType(juce::MessageBoxIconType::WarningIcon)
+                                             .withTitle("Couldn't add plugin")
+                                             .withMessage(error)
+                                             .withButton("OK", 0),
+                                         nullptr);
+        }
+    });
+}
+
+void InsertSlots::showPluginMenu(te::Plugin& plugin)
+{
+    juce::PopupMenu menu;
+    menu.addSectionHeader(plugin.getName());
+    menu.addItem(1, "Open Editor");
+    menu.addItem(2, "Bypass", true, !plugin.isEnabled());
+    menu.addSeparator();
+    menu.addItem(3, "Remove");
+
+    menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(this),
+                       [safe = SafePointer<InsertSlots>(this), ref = te::Plugin::Ptr(&plugin)](int result)
+    {
+        if (safe == nullptr || result == 0)
+            return;
+        // The plugin may have gone (undo) while the menu was open.
+        const auto current = safe->engine.getInserts(safe->index);
+        if (std::find(current.begin(), current.end(), ref.get()) == current.end())
+            return;
+
+        if (result == 1)
+            ref->showWindowExplicitly();
+        else if (result == 2)
+            ref->setEnabled(!ref->isEnabled());
+        else if (result == 3)
+            safe->engine.removeInsert(*ref);
+        safe->project.markDirty();
+        safe->refresh();
+    });
+}
+
+//==============================================================================
 ChannelStrip::ChannelStrip(AudioEngine& e, Project& p, int trackIndex)
-    : engine(e), project(p), params(e.getTrack(trackIndex)), index(trackIndex)
+    : engine(e), project(p), params(e.getTrack(trackIndex)), index(trackIndex), inserts(e, p, trackIndex)
 {
     lowCut.slider.setRange(20.0, 500.0, 1.0);
     lowCut.slider.setSkewFactorFromMidPoint(100.0);
@@ -102,6 +252,7 @@ ChannelStrip::ChannelStrip(AudioEngine& e, Project& p, int trackIndex)
 
     for (auto* k : { &lowCut, &highCut, &midFreq, &midGain, &send, &pan })
         addAndMakeVisible(k);
+    addAndMakeVisible(inserts);
 
     mute.setClickingTogglesState(true);
     mute.setColour(juce::TextButton::buttonOnColourId, Theme::mute);
@@ -132,6 +283,7 @@ void ChannelStrip::refresh()
     sync(send.slider, params.send.load());
     sync(pan.slider, params.pan.load());
     sync(fader, params.volumeDb.load());
+    inserts.refresh();
     mute.setToggleState(params.mute.load(), juce::dontSendNotification);
     solo.setToggleState(params.solo.load(), juce::dontSendNotification);
 
@@ -169,6 +321,10 @@ void ChannelStrip::resized()
     knobRow(lowCut, highCut);
     knobRow(midFreq, midGain);
     knobRow(send, pan);
+
+    r.removeFromTop(4);
+    inserts.setBounds(r.removeFromTop(InsertSlots::preferredHeight()).reduced(2, 0));
+    r.removeFromTop(4);
 
     auto buttons = r.removeFromTop(20);
     mute.setBounds(buttons.removeFromLeft(buttons.getWidth() / 2).reduced(2, 0));

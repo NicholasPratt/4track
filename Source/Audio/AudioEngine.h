@@ -42,7 +42,8 @@ public:
         juce::int64 start = 0;   // timeline position of the first recorded sample
     };
 
-    AudioEngine();
+    /** The UI passes in a UIBehaviour that opens plugin editor windows; tests pass none. */
+    explicit AudioEngine(std::unique_ptr<te::UIBehaviour> ui = {});
     ~AudioEngine() override;
 
     te::Engine& getTracktion() { return engine; }
@@ -63,6 +64,15 @@ public:
     // Mixer
     TrackParams& getTrack(int index) { return tracks[(size_t) index]; }
     MasterParams& getMaster() { return master; }
+
+    // Plugin inserts: VST3/AU effects on a track, after the EQ and before the fader.
+    static constexpr int kMaxInserts = 4;
+    juce::KnownPluginList& getKnownPlugins() { return engine.getPluginManager().knownPluginList; }
+    /** The track's inserts in signal order. */
+    std::vector<te::Plugin*> getInserts(int track) const;
+    /** Loads a plugin and adds it after the track's other inserts, as one undo step. */
+    te::Plugin* addInsert(int track, const juce::PluginDescription&, juce::String& error);
+    void removeInsert(te::Plugin&);
 
     // Tempo, metronome, punch (synced to the Edit by the timer)
     std::atomic<double> bpm { 120.0 };
@@ -133,7 +143,7 @@ private:
     void drainMeters();
     te::WaveInputDevice* inputForChannel(int channel) const;
 
-    te::Engine engine { "8track" };
+    te::Engine engine;
     te::Edit* edit = nullptr;
 
     std::array<TrackParams, kNumTracks> tracks;

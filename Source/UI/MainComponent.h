@@ -2,6 +2,7 @@
 
 #include "ArrangeView.h"
 #include "MixerPanel.h"
+#include "PluginWindows.h"
 #include "TransportBar.h"
 
 class MainComponent : public juce::Component,
@@ -40,7 +41,7 @@ public:
 private:
     enum Command
     {
-        cmdNew = 1, cmdOpen, cmdSave, cmdSaveAs, cmdImport, cmdExport, cmdAudioSettings,
+        cmdNew = 1, cmdOpen, cmdSave, cmdSaveAs, cmdImport, cmdExport, cmdAudioSettings, cmdPlugins,
         cmdUndo, cmdRedo, cmdSplit, cmdDelete, cmdSelectAll,
         cmdPlayStop, cmdRecord, cmdToStart, cmdPunch, cmdPunchIn, cmdPunchOut, cmdClick, cmdCountIn,
         cmdZoomIn, cmdZoomOut, cmdZoomFit, cmdMixer
@@ -66,7 +67,7 @@ private:
     void projectChanged();
     void showError(const juce::String& title, const juce::String& message);
 
-    AudioEngine engine;
+    AudioEngine engine { std::make_unique<PluginWindowBehaviour>() };
     Project project { engine };
 
     std::unique_ptr<ArrangeView> arrange;

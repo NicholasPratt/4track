@@ -4,12 +4,13 @@ An 8-track recorder with clip-based, non-destructive editing, built with C++ and
 
 ## Features
 
-- **8 tracks** with arm, mute, solo, input monitoring (off / auto / on), and a mono, stereo or master-mix (bounce) input
+- **8 tracks** with arm, mute, solo, input monitoring (off / auto / on), and a mono input (stereo and master-mix inputs are coming back after the move to Tracktion)
 - **Clips, non-destructive.** Every recording pass is a clip pointing at its own WAV. Move, trim, split, fade, change gain, delete, with undo/redo. Recording over existing audio trims what's underneath and never touches the file.
 - **Punch in/out.** Drag a range on the lower strip of the ruler, turn Punch on, press Record. You get one bar of pre-roll, and capture starts and stops on the exact sample.
 - **Latency compensation.** Takes are shifted by the device's input + output latency, so overdubs line up with what you heard.
 - **Tempo grid** with bars/beats ruler, snapping, metronome and count-in
 - **Mixer** with low cut, high cut, mid peak EQ, a reverb send, pan, faders and dB-scaled meters; a master strip with reverb controls
+- **Plugins (VST3 and AU).** Up to four effect plugins per track, after the EQ and before the fader. Click **+** in a mixer strip to add one; click a plugin to open its window; right-click it to bypass or remove it. **File > Plugins...** scans for installed plugins (in a separate process, so a plugin that crashes during the scan can't take 8track down).
 - **Projects** are folders (`project.8track` + `Audio/`). Opening one at a different sample rate converts it. Projects saved by 4track (the earlier name) still open.
 - **Export mix** renders offline through the same mixer code as playback, including the reverb tail.
 

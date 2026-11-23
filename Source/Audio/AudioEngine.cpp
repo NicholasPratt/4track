@@ -41,9 +41,17 @@ namespace
         list.insertPlugin(plugin, index, nullptr);
         return dynamic_cast<PluginType*>(plugin.get());
     }
+
+    struct EngineBehaviour : te::EngineBehaviour
+    {
+        // A plugin that crashes while being scanned takes down a helper process, not 8track.
+        bool canScanPluginsOutOfProcess() override { return true; }
+    };
 }
 
-AudioEngine::AudioEngine()
+AudioEngine::AudioEngine(std::unique_ptr<te::UIBehaviour> ui)
+    : engine("8track", ui != nullptr ? std::move(ui) : std::make_unique<te::UIBehaviour>(),
+             std::make_unique<EngineBehaviour>())
 {
     // One input per hardware channel: each track picks the channel it records.
     engine.getDeviceManager().setAllWaveInputsToNumChannels(1);
@@ -491,6 +499,62 @@ void AudioEngine::applyInputs()
                               : anyAuto ? te::InputDevice::MonitorMode::automatic
                                         : te::InputDevice::MonitorMode::off);
     }
+}
+
+//==============================================================================
+std::vector<te::Plugin*> AudioEngine::getInserts(int track) const
+{
+    std::vector<te::Plugin*> inserts;
+    auto& s = strips[(size_t) track];
+    if (s.track == nullptr)
+        return inserts;
+
+    for (auto* p : s.track->pluginList.getPlugins())
+        if (p != s.lowCut && p != s.eq && p != s.highCut && p != s.volume && p != s.send
+            && dynamic_cast<te::LevelMeterPlugin*>(p) == nullptr)
+            inserts.push_back(p);
+    return inserts;
+}
+
+te::Plugin* AudioEngine::addInsert(int track, const juce::PluginDescription& description, juce::String& error)
+{
+    if (edit == nullptr)
+    {
+        error = "There's no project open.";
+        return nullptr;
+    }
+    if ((int) getInserts(track).size() >= kMaxInserts)
+    {
+        error = "A track can have up to " + juce::String(kMaxInserts) + " plugins.";
+        return nullptr;
+    }
+
+    // Tracktion finds a plugin's binary through the scanned list, so make sure it's there.
+    if (getKnownPlugins().getTypeForIdentifierString(description.createIdentifierString()) == nullptr)
+        getKnownPlugins().addType(description);
+
+    auto plugin = edit->getPluginCache().createNewPlugin(te::ExternalPlugin::xmlTypeName, description);
+    auto* external = dynamic_cast<te::ExternalPlugin*>(plugin.get());
+    if (external == nullptr || external->getAudioPluginInstance() == nullptr)
+    {
+        error = description.name + " couldn't be loaded";
+        if (external != nullptr && external->getLoadError().isNotEmpty())
+            error << ": " << external->getLoadError();
+        return nullptr;
+    }
+
+    edit->getUndoManager().beginNewTransaction("Add " + description.name);
+    auto& s = strips[(size_t) track];
+    s.track->pluginList.insertPlugin(plugin, s.track->pluginList.indexOf(s.volume), nullptr);
+    return plugin.get();
+}
+
+void AudioEngine::removeInsert(te::Plugin& plugin)
+{
+    if (edit == nullptr)
+        return;
+    edit->getUndoManager().beginNewTransaction("Remove " + plugin.getName());
+    plugin.deleteFromParent();
 }
 
 //==============================================================================

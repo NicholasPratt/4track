@@ -320,8 +320,101 @@ public:
     }
 };
 
+/** Plugin inserts, using Apple's AUDelay (on every Mac) as the plugin. */
+class PluginInsertTests : public juce::UnitTest
+{
+public:
+    PluginInsertTests() : juce::UnitTest("PluginInserts", "8track") {}
+
+    void runTest() override
+    {
+        AudioEngine engine;
+        auto& formats = engine.getTracktion().getPluginManager().pluginFormatManager;
+
+        juce::OwnedArray<juce::PluginDescription> found;
+        for (auto* format : formats.getFormats())
+            if (format->getName() == "AudioUnit")
+                format->findAllTypesForFile(found, "AudioUnit:Effects/aufx,dely,appl");
+        if (found.isEmpty())
+        {
+            logMessage("AUDelay not available; skipping plugin tests");
+            return;
+        }
+        const auto delay = *found[0];
+        auto& known = engine.getKnownPlugins();
+        const bool wasKnown = known.getTypeForIdentifierString(delay.createIdentifierString()) != nullptr;
+        known.addType(delay);   // projects find their plugins in the scanned list
+
+        auto dir = juce::File::createTempFile("8track-plugins");
+        dir.createDirectory();
+        {
+            Project project(engine);
+            const auto untitledFolder = project.getFolder();
+            juce::String error;
+
+            beginTest("A plugin goes after the EQ and before the fader");
+            auto* plugin = engine.addInsert(1, delay, error);
+            expect(plugin != nullptr, error);
+            expectEquals((int) engine.getInserts(1).size(), 1);
+            auto& list = engine.getAudioTrack(1)->pluginList;
+            if (plugin != nullptr)
+            {
+                expect(list.indexOf(plugin) < list.indexOf(engine.getAudioTrack(1)->getVolumePlugin()), "pre-fader");
+                expect(dynamic_cast<te::EqualiserPlugin*>(list[list.indexOf(plugin) - 2]) != nullptr
+                       || dynamic_cast<te::LowPassPlugin*>(list[list.indexOf(plugin) - 1]) != nullptr, "after the filters");
+            }
+            expectEquals((int) engine.getInserts(0).size(), 0, "other tracks untouched");
+
+            beginTest("Adding a plugin is undoable");
+            expect(project.undo());
+            expectEquals((int) engine.getInserts(1).size(), 0);
+            expect(project.redo());
+            expectEquals((int) engine.getInserts(1).size(), 1);
+
+            beginTest("Tracks are limited to four plugins");
+            for (int i = 1; i < AudioEngine::kMaxInserts; ++i)
+                expect(engine.addInsert(1, delay, error) != nullptr, error);
+            error = {};
+            expect(engine.addInsert(1, delay, error) == nullptr);
+            expect(error.isNotEmpty());
+            while (engine.getInserts(1).size() > 1)
+                engine.removeInsert(*engine.getInserts(1).back());
+            expectEquals((int) engine.getInserts(1).size(), 1);
+
+            beginTest("Plugins and their bypass survive save and reopen, with the mixer intact");
+            engine.getInserts(1).front()->setEnabled(false);
+            engine.getTrack(1).volumeDb = -4.0f;
+            auto saved = dir.getChildFile("WithPlugin");
+            error = {};
+            expect(project.saveAs(saved, error), error);
+            project.newProject();
+            expectEquals((int) engine.getInserts(1).size(), 0, "a new project has no plugins");
+            expect(project.load(saved, error), error);
+            auto reopened = engine.getInserts(1);
+            expectEquals((int) reopened.size(), 1);
+            if (!reopened.empty())
+            {
+                expect(dynamic_cast<te::ExternalPlugin*>(reopened.front()) != nullptr);
+                expect(!reopened.front()->isEnabled(), "still bypassed");
+            }
+            expectWithinAbsoluteError(engine.getTrack(1).volumeDb.load(), -4.0f, 0.05f);
+            expectEquals((int) engine.getInserts(0).size(), 0, "the mixer's own plugins aren't inserts");
+
+            beginTest("Removing a plugin");
+            if (!reopened.empty())
+                engine.removeInsert(*reopened.front());
+            expectEquals((int) engine.getInserts(1).size(), 0);
+            untitledFolder.deleteRecursively();
+        }
+        dir.deleteRecursively();
+        if (!wasKnown)
+            known.removeType(delay);
+    }
+};
+
 static ArrangementTests arrangementTests;
 static TracktionProjectTests tracktionProjectTests;
+static PluginInsertTests pluginInsertTests;
 
 int main()
 {

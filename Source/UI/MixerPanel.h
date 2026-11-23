@@ -14,6 +14,31 @@ private:
     juce::Label caption;
 };
 
+/** A track's plugin inserts: click an empty slot to add a plugin, click a plugin to
+    open its editor, right-click it to bypass or remove it. */
+class InsertSlots : public juce::Component
+{
+public:
+    InsertSlots(AudioEngine&, Project&, int trackIndex);
+    void refresh();
+    void paint(juce::Graphics&) override;
+    void mouseUp(const juce::MouseEvent&) override;
+
+    static constexpr int kSlotHeight = 16, kGap = 2;
+    static int preferredHeight() { return AudioEngine::kMaxInserts * (kSlotHeight + kGap); }
+
+private:
+    struct Slot { te::Plugin* plugin; juce::String name; bool enabled; bool operator==(const Slot&) const = default; };
+    juce::Rectangle<int> slotBounds(int i) const;
+    void showAddMenu();
+    void showPluginMenu(te::Plugin&);
+
+    AudioEngine& engine;
+    Project& project;
+    const int index;
+    std::vector<Slot> slots;
+};
+
 class ChannelStrip : public juce::Component
 {
 public:
@@ -32,6 +57,7 @@ private:
     Knob lowCut { "LO CUT", Theme::mute }, highCut { "HI CUT", Theme::mute },
          midFreq { "FREQ", Theme::mute }, midGain { "GAIN", Theme::mute },
          send { "REVERB", Theme::solo }, pan { "PAN", Theme::accent };
+    InsertSlots inserts;
     juce::TextButton mute { "M" }, solo { "S" };
     juce::Slider fader;
     juce::Label faderValue;
@@ -66,7 +92,7 @@ public:
     void paint(juce::Graphics&) override;
     void resized() override;
 
-    static constexpr int kHeight = 330;
+    static constexpr int kHeight = 330 + 76;   // knobs, inserts, fader
 
 private:
     std::array<std::unique_ptr<ChannelStrip>, kNumTracks> strips;
