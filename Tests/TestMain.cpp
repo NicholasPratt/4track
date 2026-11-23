@@ -459,6 +459,34 @@ public:
             expectWithinAbsoluteError(engine.getTrack(1).volumeDb.load(), -4.0f, 0.05f);
             expectEquals((int) engine.getInserts(0).size(), 0, "the mixer's own plugins aren't inserts");
 
+            beginTest("The master bus takes plugins too, before the master fader");
+            {
+                expectEquals((int) engine.getInserts(AudioEngine::kMasterBus).size(), 0, "none to start with");
+                auto* onMaster = engine.addInsert(AudioEngine::kMasterBus, delay, error);
+                expect(onMaster != nullptr, error);
+                expectEquals((int) engine.getInserts(AudioEngine::kMasterBus).size(), 1);
+                expect(project.getEdit().getMasterPluginList().indexOf(onMaster) >= 0, "in Tracktion's master list");
+                expectEquals((int) engine.getInserts(1).size(), 1, "track plugins untouched");
+
+                expect(project.undo());
+                expectEquals((int) engine.getInserts(AudioEngine::kMasterBus).size(), 0, "undoable");
+                expect(project.redo());
+
+                for (int i = 1; i < AudioEngine::kMaxInserts; ++i)
+                    engine.addInsert(AudioEngine::kMasterBus, delay, error);
+                error = {};
+                expect(engine.addInsert(AudioEngine::kMasterBus, delay, error) == nullptr && error.startsWith("The master"),
+                       "limited to four");
+                while (engine.getInserts(AudioEngine::kMasterBus).size() > 1)
+                    engine.removeInsert(*engine.getInserts(AudioEngine::kMasterBus).back());
+
+                expect(project.save(error), error);
+                expect(project.load(saved, error), error);
+                expectEquals((int) engine.getInserts(AudioEngine::kMasterBus).size(), 1, "kept when saved");
+                expectWithinAbsoluteError(engine.getMaster().volumeDb.load(), 0.0f, 0.05f, "master fader intact");
+                reopened = engine.getInserts(1);
+            }
+
             beginTest("Removing a plugin");
             if (!reopened.empty())
                 engine.removeInsert(*reopened.front());

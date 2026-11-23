@@ -338,8 +338,9 @@ void ChannelStrip::resized()
 }
 
 //==============================================================================
-MasterStrip::MasterStrip(AudioEngine& e, Project& p) : engine(e), project(p)
+MasterStrip::MasterStrip(AudioEngine& e, Project& p) : engine(e), project(p), inserts(e, p, AudioEngine::kMasterBus)
 {
+    addAndMakeVisible(inserts);
     auto& m = engine.getMaster();
     juce::ignoreUnused(m);
 
@@ -370,6 +371,7 @@ void MasterStrip::refresh()
     sync(room.slider, m.reverbRoom.load());
     sync(damping.slider, m.reverbDamping.load());
     sync(wet.slider, m.reverbWet.load());
+    inserts.refresh();
     sync(fader, m.volumeDb.load());
     const auto text = dbText(fader.getValue());
     if (faderValue.getText() != text)
@@ -393,7 +395,9 @@ void MasterStrip::resized()
     room.setBounds(row.removeFromLeft(w));
     damping.setBounds(row.removeFromLeft(w));
     wet.setBounds(row);
-    r.removeFromTop(10);
+    r.removeFromTop(8);
+    inserts.setBounds(r.removeFromTop(InsertSlots::preferredHeight()).reduced(2, 0));
+    r.removeFromTop(8);
 
     faderValue.setBounds(r.removeFromBottom(14));
     meter.setBounds(r.removeFromRight(36));

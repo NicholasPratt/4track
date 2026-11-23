@@ -767,9 +767,10 @@ void MainComponent::runDebugSnapshot(const juce::StringArray& args)
                     engine.getTrack(t).automationShown = target.key;
                 }
         }
-        else if (args[i] == "--insert" && i + 2 < args.size())   // --insert <track> <AU id, e.g. aufx,dely,appl>
+        else if (args[i] == "--insert" && i + 2 < args.size())   // --insert <track | master> <AU id, e.g. aufx,dely,appl>
         {
-            const int t = args[++i].getIntValue();
+            const int t = args[i + 1] == "master" ? AudioEngine::kMasterBus : args[i + 1].getIntValue();
+            ++i;
             juce::OwnedArray<juce::PluginDescription> found;
             for (auto* format : engine.getTracktion().getPluginManager().pluginFormatManager.getFormats())
                 if (format->getName() == "AudioUnit")

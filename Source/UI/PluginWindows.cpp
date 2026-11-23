@@ -103,7 +103,7 @@ namespace
         {
             if (auto* track = p.getOwnerTrack())
                 return p.getName() + " - " + track->getName();
-            return p.getName();
+            return p.getName() + " - Master";
         }
 
         void setEditor(std::unique_ptr<te::Plugin::EditorComponent> newEditor)

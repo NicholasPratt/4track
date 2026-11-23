@@ -595,6 +595,14 @@ void AudioEngine::applyInputs()
 std::vector<te::Plugin*> AudioEngine::getInserts(int track) const
 {
     std::vector<te::Plugin*> inserts;
+    if (track == kMasterBus)
+    {
+        if (edit != nullptr)
+            for (auto* p : edit->getMasterPluginList().getPlugins())
+                if (p != edit->getMasterVolumePlugin().get() && dynamic_cast<te::LevelMeterPlugin*>(p) == nullptr)
+                    inserts.push_back(p);
+        return inserts;
+    }
     auto& s = strips[(size_t) track];
     if (s.track == nullptr)
         return inserts;
@@ -722,7 +730,8 @@ te::Plugin* AudioEngine::addInsert(int track, const juce::PluginDescription& des
     }
     if ((int) getInserts(track).size() >= kMaxInserts)
     {
-        error = "A track can have up to " + juce::String(kMaxInserts) + " plugins.";
+        error = (track == kMasterBus ? "The master" : "A track") + juce::String(" can have up to ")
+                + juce::String(kMaxInserts) + " plugins.";
         return nullptr;
     }
 
@@ -731,6 +740,12 @@ te::Plugin* AudioEngine::addInsert(int track, const juce::PluginDescription& des
         return nullptr;
 
     edit->getUndoManager().beginNewTransaction("Add " + description.name);
+    if (track == kMasterBus)
+    {
+        auto& list = edit->getMasterPluginList();
+        list.insertPlugin(plugin, list.size(), nullptr);   // the master fader isn't in this list: it comes after
+        return plugin.get();
+    }
     auto& s = strips[(size_t) track];
     s.track->pluginList.insertPlugin(plugin, s.track->pluginList.indexOf(s.volume), nullptr);
     return plugin.get();

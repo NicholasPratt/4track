@@ -77,6 +77,7 @@ private:
     AudioEngine& engine;
     Project& project;
     Knob room { "ROOM", Theme::solo }, damping { "DAMP", Theme::solo }, wet { "REVERB", Theme::solo };
+    InsertSlots inserts;
     juce::Slider fader;
     juce::Label faderValue;
     LevelMeter meter { true, true };

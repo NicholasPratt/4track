@@ -80,7 +80,10 @@ public:
     MasterParams& getMaster() { return master; }
 
     // Plugin inserts: VST3/AU effects on a track, after the EQ and before the fader.
+    // kMasterBus in place of a track means the master's inserts: on the whole mix
+    // (reverb included), before the master fader.
     static constexpr int kMaxInserts = 4;
+    static constexpr int kMasterBus = -1;
     juce::KnownPluginList& getKnownPlugins() { return engine.getPluginManager().knownPluginList; }
     /** The track's inserts in signal order. */
     std::vector<te::Plugin*> getInserts(int track) const;
