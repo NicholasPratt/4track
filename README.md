@@ -4,7 +4,7 @@ An 8-track recorder with clip-based, non-destructive editing, built with C++ and
 
 ## Features
 
-- **8 tracks** with arm, mute, solo, input monitoring (off / auto / on), and a mono input (stereo and master-mix inputs are coming back after the move to Tracktion)
+- **8 tracks** with arm, mute, solo, input monitoring (off / auto / on), and an input: a mono channel, or a stereo pair set up under **Audio Settings > Stereo input pairs** (recording the master mix isn't back yet since the move to Tracktion)
 - **Clips, non-destructive.** Every recording pass is a clip pointing at its own WAV. Move, trim, split, fade, change gain, delete, with undo/redo. Recording over existing audio trims what's underneath and never touches the file.
 - **Punch in/out.** Drag a range on the lower strip of the ruler, turn Punch on, press Record. You get one bar of pre-roll, and capture starts and stops on the exact sample.
 - **Latency compensation.** Takes are shifted by the device's input + output latency, so overdubs line up with what you heard.

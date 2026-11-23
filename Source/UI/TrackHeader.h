@@ -3,8 +3,8 @@
 #include "Widgets.h"
 #include "../Project/Project.h"
 
-/** Fills an input selector: mono channels, stereo pairs, and the master mix (for bouncing). */
-void fillInputSelector(juce::ComboBox& box, const juce::StringArray& inputNames);
+/** Fills an input selector with the device's inputs: mono channels and the stereo pairs set up in Audio Settings. */
+void fillInputSelector(juce::ComboBox& box, const std::vector<AudioEngine::Input>& inputs);
 /** Selects the item that matches the track's current input setting. */
 void showTrackInput(juce::ComboBox& box, const TrackParams& p);
 /** Writes the selected item back to the track. */
@@ -16,7 +16,7 @@ class TrackHeader : public juce::Component
 public:
     TrackHeader(AudioEngine&, Project&, int trackIndex);
 
-    void setInputNames(const juce::StringArray& names);
+    void setInputs(const std::vector<AudioEngine::Input>& inputs);
     void refresh();                      // pull values from the track (they may change elsewhere)
     void setMeter(float left, float right) { meter.setPeaks(left, right); }
     void setSelected(bool shouldBeSelected) { if (selected != shouldBeSelected) { selected = shouldBeSelected; repaint(); } }

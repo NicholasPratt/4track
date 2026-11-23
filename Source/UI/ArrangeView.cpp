@@ -137,10 +137,10 @@ void ArrangeView::zoomToFit()
     viewChanged();
 }
 
-void ArrangeView::setInputNames(const juce::StringArray& names)
+void ArrangeView::setInputs(const std::vector<AudioEngine::Input>& inputs)
 {
     for (auto& h : headers)
-        h->setInputNames(names);
+        h->setInputs(inputs);
 }
 
 void ArrangeView::tick()

@@ -55,7 +55,7 @@ MainComponent::MainComponent()
     disableFocus(*this);
     setWantsKeyboardFocus(true);
 
-    arrange->setInputNames(engine.getActiveInputNames());
+    arrange->setInputs(engine.getInputs());
     setSize(1320, 820);
     startTimerHz(30);
 }
@@ -130,7 +130,7 @@ void MainComponent::timerCallback()
 void MainComponent::changeListenerCallback(juce::ChangeBroadcaster*)
 {
     // Audio device changed (or started)
-    arrange->setInputNames(engine.getActiveInputNames());
+    arrange->setInputs(engine.getInputs());
     project.handleSampleRateChange();
     arrange->viewChanged();
 }
@@ -567,7 +567,7 @@ void MainComponent::exportMix()
 void MainComponent::showAudioSettings()
 {
     juce::DialogWindow::LaunchOptions options;
-    options.content.setOwned(new AudioSettingsDialog(engine.getDeviceManager()));
+    options.content.setOwned(new AudioSettingsDialog(engine));
     options.dialogTitle = "Audio Settings";
     options.dialogBackgroundColour = Theme::panel;
     options.escapeKeyTriggersCloseButton = true;
@@ -619,9 +619,17 @@ void MainComponent::runDebugSnapshot(const juce::StringArray& args)
         arrange->getLanes().clearSelection();
     }
 
-    juce::Timer::callAfterDelay(1200, [this, output]
+    const bool settings = args.contains("--settings");
+    juce::Timer::callAfterDelay(1200, [this, output, settings]
     {
-        auto image = createComponentSnapshot(getLocalBounds(), true, 2.0f);
+        std::unique_ptr<AudioSettingsDialog> dialog;
+        if (settings)
+        {
+            dialog = std::make_unique<AudioSettingsDialog>(engine);
+            dialog->setVisible(true);
+        }
+        auto image = dialog != nullptr ? dialog->createComponentSnapshot(dialog->getLocalBounds(), true, 2.0f)
+                                       : createComponentSnapshot(getLocalBounds(), true, 2.0f);
         output.deleteFile();
         juce::FileOutputStream stream(output);
         juce::PNGImageFormat().writeImageToStream(image, stream);
@@ -651,15 +659,16 @@ void MainComponent::runDiagnostics()
                   << " sr=" << device->getCurrentSampleRate() << " block=" << device->getCurrentBufferSizeSamples() << "\n"
                   << "input chans available: " << device->getInputChannelNames().joinIntoString(", ") << "\n"
                   << "active input bits: " << device->getActiveInputChannels().toString(2) << "\n"
-                  << "active names: " << engine.getActiveInputNames().joinIntoString(", ") << "\n"
+                  << "inputs: " << engine.getInputs().size() << "\n"
                   << "latency in/out: " << device->getInputLatencyInSamples() << "/" << device->getOutputLatencyInSamples() << std::endl;
 
         // Arm one track per active input (monitoring off) and watch the meters.
-        const int numIns = juce::jmin(kNumTracks, engine.getActiveInputNames().size());
+        const auto inputs = engine.getInputs();
+        const int numIns = juce::jmin(kNumTracks, (int) inputs.size());
         for (int t = 0; t < numIns; ++t)
         {
-            engine.getTrack(t).inputType = (int) InputType::Mono;
-            engine.getTrack(t).inputChannel = t;
+            engine.getTrack(t).inputType = (int) (inputs[(size_t) t].numChannels > 1 ? InputType::Stereo : InputType::Mono);
+            engine.getTrack(t).inputChannel = inputs[(size_t) t].channel;
             engine.getTrack(t).monitor = (int) MonitorMode::Off;
             engine.getTrack(t).armed = true;
         }

@@ -53,9 +53,9 @@ AudioEngine::AudioEngine(std::unique_ptr<te::UIBehaviour> ui)
     : engine("8track", ui != nullptr ? std::move(ui) : std::make_unique<te::UIBehaviour>(),
              std::make_unique<EngineBehaviour>())
 {
-    // One input per hardware channel: each track picks the channel it records.
-    engine.getDeviceManager().setAllWaveInputsToNumChannels(1);
+    setUpInputLayout();
     getDeviceManager().addChangeListener(this);
+    engine.getDeviceManager().addChangeListener(this);   // the input layout (stereo pairs) changed
     lastSampleRate = getSampleRate();
 
     for (int t = 0; t < kNumTracks; ++t)
@@ -71,6 +71,7 @@ AudioEngine::~AudioEngine()
 {
     stopTimer();
     getDeviceManager().removeChangeListener(this);
+    engine.getDeviceManager().removeChangeListener(this);
     jassert(edit == nullptr);   // Project detaches its Edit before it is destroyed
 }
 
@@ -80,32 +81,101 @@ double AudioEngine::getSampleRate() const
     return sr > 0.0 ? sr : 44100.0;
 }
 
-juce::StringArray AudioEngine::getActiveInputNames() const
+int AudioEngine::firstChannelOf(const te::WaveInputDevice& device)
 {
-    juce::StringArray names;
-    if (auto* device = engine.getDeviceManager().deviceManager.getCurrentAudioDevice())
-    {
-        const auto all = device->getInputChannelNames();
-        const auto active = device->getActiveInputChannels();
-        for (int ch = 0; ch < all.size(); ++ch)
-            if (active[ch])
-                names.add(all[ch]);
-    }
-    return names;
+    return (int) device.deviceDescription.getDeviceChannelRange().first;
 }
 
 te::WaveInputDevice* AudioEngine::inputForChannel(int channel) const
 {
-    // Inputs are listed in channel order; the n-th enabled mono input is the n-th active channel.
-    int n = 0;
+    // The enabled input that carries this channel: a mono input, or a pair containing it.
     for (auto* device : engine.getDeviceManager().getWaveInputDevices())
     {
         if (device->getDeviceType() != te::InputDevice::waveDevice || !device->isEnabled())
             continue;
-        if (n++ == channel)
+        const auto range = device->deviceDescription.getDeviceChannelRange();
+        if ((juce::uint32) channel >= range.first && (juce::uint32) channel < range.second)
             return device;
     }
     return nullptr;
+}
+
+std::vector<AudioEngine::Input> AudioEngine::getInputs() const
+{
+    std::vector<Input> inputs;
+    for (auto* device : engine.getDeviceManager().getWaveInputDevices())
+    {
+        if (device->getDeviceType() != te::InputDevice::waveDevice || !device->isEnabled())
+            continue;
+        Input in;
+        in.channel = firstChannelOf(*device);
+        in.numChannels = (int) device->deviceDescription.getNumChannels();
+        in.name = "In " + juce::String(in.channel + 1);
+        for (int c = 1; c < in.numChannels; ++c)
+            in.name << "/" << (in.channel + c + 1);
+        in.label = device->getName();
+        inputs.push_back(in);
+    }
+    std::sort(inputs.begin(), inputs.end(), [](auto& a, auto& b) { return a.channel < b.channel; });
+    return inputs;
+}
+
+bool AudioEngine::isInputPaired(int firstChannel) const
+{
+    auto* device = inputForChannel(firstChannel);
+    return device != nullptr && firstChannelOf(*device) == firstChannel && device->deviceDescription.getNumChannels() == 2;
+}
+
+bool AudioEngine::canPairInputs(int firstChannel) const
+{
+    if (firstChannel % 2 != 0)
+        return false;
+    if (isInputPaired(firstChannel))
+        return true;
+    auto* left = inputForChannel(firstChannel);
+    auto* right = inputForChannel(firstChannel + 1);
+    return left != nullptr && right != nullptr && left != right
+        && left->deviceDescription.getNumChannels() == 1 && right->deviceDescription.getNumChannels() == 1;
+}
+
+void AudioEngine::setInputPaired(int firstChannel, bool stereo)
+{
+    if (!canPairInputs(firstChannel) || isInputPaired(firstChannel) == stereo)
+        return;
+    if (auto* device = inputForChannel(firstChannel))
+        engine.getDeviceManager().setDeviceNumChannels(*device, stereo ? 2u : 1u);
+    // Tracktion rebuilds its inputs and tells us through changeListenerCallback.
+}
+
+void AudioEngine::setUpInputLayout()
+{
+    // Tracktion's default groups inputs into stereo pairs. 8track starts each audio
+    // interface as mono channels the first time it's used; after that, whatever pairs
+    // the user sets up in Audio Settings are kept (Tracktion saves them per device).
+    auto* device = getDeviceManager().getCurrentAudioDevice();
+    if (device == nullptr)
+        return;
+    auto& props = engine.getPropertyStorage().getPropertiesFile();
+    auto seen = juce::StringArray::fromLines(props.getValue("8trackInputLayoutDevices"));
+    seen.removeEmptyStrings();
+    const auto key = device->getTypeName() + ":" + device->getName();
+    if (seen.contains(key))
+        return;
+    seen.add(key);
+    props.setValue("8trackInputLayoutDevices", seen.joinIntoString("\n"));
+    engine.getDeviceManager().setAllWaveInputsToNumChannels(1);
+}
+
+void AudioEngine::normaliseInputChoices()
+{
+    // After pairing or unpairing, point each track at the first channel of the input that
+    // now carries its old channel (a track on In 2 moves to In 1/2, and back to In 1).
+    for (auto& p : tracks)
+        if (auto* device = inputForChannel(p.inputChannel.load()))
+        {
+            p.inputChannel = firstChannelOf(*device);
+            p.inputType = (int) (device->deviceDescription.getNumChannels() > 1 ? InputType::Stereo : InputType::Mono);
+        }
 }
 
 te::AudioTrack* AudioEngine::getAudioTrack(int index) const
@@ -303,12 +373,11 @@ void AudioEngine::pullAll()
         // The input this track records from, if the Edit already has one assigned.
         for (auto* instance : edit->getAllInputDevices())
             if (instance->getTargets().contains(s.track->itemID))
-                for (int ch = 0; auto* device = inputForChannel(ch); ++ch)
-                    if (&instance->getInputDevice() == device)
-                    {
-                        p.inputType = (int) InputType::Mono;
-                        p.inputChannel = ch;
-                    }
+                if (auto* device = dynamic_cast<te::WaveInputDevice*>(&instance->getInputDevice()))
+                {
+                    p.inputType = (int) (device->deviceDescription.getNumChannels() > 1 ? InputType::Stereo : InputType::Mono);
+                    p.inputChannel = firstChannelOf(*device);
+                }
     }
 
     master.volumeDb = syncedMaster.volumeDb = toUiDb(edit->getMasterVolumePlugin()->getVolumeDb());
@@ -460,17 +529,12 @@ void AudioEngine::applyInputs()
         if (device.getDeviceType() != te::InputDevice::waveDevice)
             continue;
 
-        int channel = -1;
-        for (int ch = 0; auto* d = inputForChannel(ch); ++ch)
-            if (d == &device)
-                channel = ch;
-
         juce::Array<int> wanted;
         bool anyOn = false, anyAuto = false;
         for (int t = 0; t < kNumTracks; ++t)
         {
             auto& p = tracks[(size_t) t];
-            if (channel < 0 || p.inputType.load() == (int) InputType::Mix || p.inputChannel.load() != channel)
+            if (p.inputType.load() == (int) InputType::Mix || inputForChannel(p.inputChannel.load()) != &device)
                 continue;
             wanted.add(t);
             const auto mode = (MonitorMode) p.monitor.load();
@@ -580,9 +644,11 @@ void AudioEngine::drainMeters()
                     client = std::make_unique<te::LevelMeasurer::Client>();
                     device->levelMeasurer.addClient(*client);
                 }
-                const float level = levelToGain(client->getAndClearAudioLevel(0));
-                atomicMax(p.peakL, level);
-                atomicMax(p.peakR, level);
+                const float left = levelToGain(client->getAndClearAudioLevel(0));
+                const float right = device->deviceDescription.getNumChannels() > 1
+                                        ? levelToGain(client->getAndClearAudioLevel(1)) : left;
+                atomicMax(p.peakL, left);
+                atomicMax(p.peakR, right);
             }
         }
     }
@@ -604,7 +670,10 @@ void AudioEngine::timerCallback()
 
 void AudioEngine::changeListenerCallback(juce::ChangeBroadcaster*)
 {
-    // The audio device changed: its inputs and the playback context may be new objects.
+    // The audio device or the input layout changed: inputs and the playback context may
+    // be new objects.
+    setUpInputLayout();
+    normaliseInputChoices();
     if (edit != nullptr)
     {
         detachMeters();

@@ -24,7 +24,7 @@ public:
 
     void zoom(double factor);
     void zoomToFit();
-    void setInputNames(const juce::StringArray& names);
+    void setInputs(const std::vector<AudioEngine::Input>& inputs);
     void setMeter(int track, float l, float r) { headers[(size_t) track]->setMeter(l, r); }
 
     int getSelectedTrack() const { return selectedTrack; }

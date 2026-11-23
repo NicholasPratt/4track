@@ -412,9 +412,70 @@ public:
     }
 };
 
+/** Stereo input pairs, on whatever audio interface is connected (needs two input channels). */
+class StereoInputTests : public juce::UnitTest
+{
+public:
+    StereoInputTests() : juce::UnitTest("StereoInputs", "8track") {}
+
+    static void pump() { juce::MessageManager::getInstance()->runDispatchLoopUntil(300); }
+
+    void runTest() override
+    {
+        bool wasPaired = false;
+        {
+            AudioEngine engine;
+            const auto inputs = engine.getInputs();
+            logMessage("inputs: " + juce::String((int) inputs.size()));
+            if (!engine.canPairInputs(0))
+            {
+                logMessage("Fewer than two input channels active; skipping stereo tests");
+                return;
+            }
+            wasPaired = engine.isInputPaired(0);
+            if (wasPaired)
+            {
+                engine.setInputPaired(0, false);
+                pump();
+            }
+
+            beginTest("Pairing In 1 and In 2 makes one stereo input");
+            engine.getTrack(3).inputChannel = 1;   // a track on In 2
+            engine.setInputPaired(0, true);
+            pump();
+            expect(engine.isInputPaired(0));
+            auto now = engine.getInputs();
+            expect(!now.empty() && now.front().channel == 0 && now.front().numChannels == 2 && now.front().name == "In 1/2",
+                   now.empty() ? "none" : now.front().name);
+            expectEquals(engine.getTrack(3).inputChannel.load(), 0, "the track on In 2 now records In 1/2");
+            expectEquals(engine.getTrack(3).inputType.load(), (int) InputType::Stereo);
+        }
+
+        beginTest("Pairs are kept when 8track starts again");
+        {
+            AudioEngine engine;
+            expect(engine.isInputPaired(0), "still paired");
+
+            beginTest("Unpairing gives two mono inputs again");
+            engine.setInputPaired(0, false);
+            pump();
+            expect(!engine.isInputPaired(0));
+            auto now = engine.getInputs();
+            expect(now.size() >= 2 && now[0].name == "In 1" && now[1].name == "In 2");
+
+            if (wasPaired)
+            {
+                engine.setInputPaired(0, true);
+                pump();
+            }
+        }
+    }
+};
+
 static ArrangementTests arrangementTests;
 static TracktionProjectTests tracktionProjectTests;
 static PluginInsertTests pluginInsertTests;
+static StereoInputTests stereoInputTests;
 
 int main()
 {

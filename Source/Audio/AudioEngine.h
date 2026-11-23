@@ -51,8 +51,22 @@ public:
     // Device
     juce::AudioDeviceManager& getDeviceManager() { return engine.getDeviceManager().deviceManager; }
     double getSampleRate() const;
-    /** One name per input channel, in channel order. Tracks pick an input by index. */
-    juce::StringArray getActiveInputNames() const;
+    /** An input a track can record from: one hardware channel, or a stereo pair. Tracks
+        store the input's first channel (TrackParams::inputChannel). */
+    struct Input
+    {
+        int channel = 0;        // first hardware channel, 0-based
+        int numChannels = 1;
+        juce::String name;      // e.g. "In 3" or "In 1/2"
+        juce::String label;     // the interface's name for it, e.g. "Loop 1" or "Input 1 + 2"
+    };
+    std::vector<Input> getInputs() const;
+
+    /** Stereo pairs (1/2, 3/4, ...) are a device setting shared by all tracks, made in Audio
+        Settings. firstChannel is the left channel (0, 2, 4, ...). */
+    bool canPairInputs(int firstChannel) const;
+    bool isInputPaired(int firstChannel) const;
+    void setInputPaired(int firstChannel, bool stereo);
 
     /** The Edit being played. Set by Project whenever it creates or loads one (nullptr
         before that Edit is deleted). A fresh Edit gets 8track's default track names,
@@ -142,6 +156,9 @@ private:
     void applyInputs();
     void drainMeters();
     te::WaveInputDevice* inputForChannel(int channel) const;
+    static int firstChannelOf(const te::WaveInputDevice&);
+    void setUpInputLayout();
+    void normaliseInputChoices();
 
     te::Engine engine;
     te::Edit* edit = nullptr;

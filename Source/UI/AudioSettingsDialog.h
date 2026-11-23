@@ -1,25 +1,30 @@
 #pragma once
 
-#include <juce_gui_basics/juce_gui_basics.h>
-#include <juce_audio_devices/juce_audio_devices.h>
+#include "../Audio/AudioEngine.h"
 #include <juce_audio_utils/juce_audio_utils.h>
 
+/** The audio device chooser, plus which input channels are recorded as stereo pairs. */
 class AudioSettingsDialog : public juce::Component,
-                            private juce::Button::Listener
+                            private juce::ChangeListener
 {
 public:
-    AudioSettingsDialog(juce::AudioDeviceManager& deviceManager);
+    explicit AudioSettingsDialog(AudioEngine&);
     ~AudioSettingsDialog() override;
 
-    void paint(juce::Graphics& g) override;
+    void paint(juce::Graphics&) override;
     void resized() override;
 
 private:
-    void buttonClicked(juce::Button* button) override;
+    void changeListenerCallback(juce::ChangeBroadcaster*) override;
+    void rebuildPairs();
 
-    juce::AudioDeviceManager& audioDeviceManager;
-    std::unique_ptr<juce::AudioDeviceSelectorComponent> audioSetupComp;
-    juce::TextButton closeButton;
+    AudioEngine& engine;
+    std::unique_ptr<juce::AudioDeviceSelectorComponent> selector;
+    juce::Label pairsTitle;
+    juce::OwnedArray<juce::ToggleButton> pairs;
+    juce::TextButton closeButton { "Close" };
+
+    static constexpr int kSelectorHeight = 360, kPairColumns = 4, kPairRowHeight = 24;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(AudioSettingsDialog)
 };

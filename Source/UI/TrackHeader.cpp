@@ -14,13 +14,13 @@ namespace
     }
 }
 
-// Each track records one input channel. (Stereo pairs and recording the master mix
-// aren't wired to the Tracktion engine yet.)
-void fillInputSelector(juce::ComboBox& box, const juce::StringArray& names)
+// Items are identified by the input's first channel + 1. (Recording the master mix
+// isn't wired to the Tracktion engine yet.)
+void fillInputSelector(juce::ComboBox& box, const std::vector<AudioEngine::Input>& inputs)
 {
     box.clear(juce::dontSendNotification);
-    for (int ch = 0; ch < names.size(); ++ch)
-        box.addItem("In " + juce::String(ch + 1) + (names[ch].isNotEmpty() ? "  " + names[ch] : juce::String()), ch + 1);
+    for (auto& in : inputs)
+        box.addItem(in.name + "  " + in.label, in.channel + 1);
 }
 
 void showTrackInput(juce::ComboBox& box, const TrackParams& p)
@@ -36,8 +36,9 @@ void applyInputSelection(const juce::ComboBox& box, TrackParams& p)
 {
     if (const int id = box.getSelectedId(); id > 0)
     {
-        p.inputType = (int) InputType::Mono;
-        p.inputChannel = id - 1;
+        p.inputChannel = id - 1;   // the engine works out whether it's a pair
+        if (p.inputType.load() == (int) InputType::Mix)
+            p.inputType = (int) InputType::Mono;
     }
 }
 
@@ -134,9 +135,9 @@ void TrackHeader::styleMonitorButton()
     monitor.setColour(juce::TextButton::textColourOffId, mode == MonitorMode::On ? juce::Colours::black : Theme::text);
 }
 
-void TrackHeader::setInputNames(const juce::StringArray& names)
+void TrackHeader::setInputs(const std::vector<AudioEngine::Input>& inputs)
 {
-    fillInputSelector(input, names);
+    fillInputSelector(input, inputs);
     showTrackInput(input, params);
     applyInputSelection(input, params);   // in case the old channel no longer exists
 }
