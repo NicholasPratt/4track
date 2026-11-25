@@ -10,7 +10,8 @@ class MainComponent : public juce::Component,
                       public juce::MenuBarModel,
                       public juce::KeyListener,
                       private juce::Timer,
-                      private juce::ChangeListener
+                      private juce::ChangeListener,
+                      private juce::FocusChangeListener
 {
 public:
     MainComponent();
@@ -18,6 +19,7 @@ public:
 
     void paint(juce::Graphics&) override;
     void resized() override;
+    void mouseDown(const juce::MouseEvent&) override;
     void parentHierarchyChanged() override;
 
     /** Asks to save unsaved changes, then calls `quit` unless the user cancels. */
@@ -35,20 +37,17 @@ public:
     juce::PopupMenu getMenuForIndex(int index, const juce::String& name) override;
     void menuItemSelected(int itemId, int topLevelMenuIndex) override;
 
-    // KeyListener (on the top-level window, so shortcuts work wherever focus is)
+    // KeyListener for keys that reach the main editor.
     bool keyPressed(const juce::KeyPress&, juce::Component*) override;
     using juce::Component::keyPressed;
 
 private:
-    enum Command
-    {
-        cmdNew = 1, cmdOpen, cmdSave, cmdSaveAs, cmdImport, cmdExport, cmdAudioSettings, cmdPlugins,
-        cmdUndo, cmdRedo, cmdCut, cmdCopy, cmdPaste, cmdDuplicate, cmdSplit, cmdDelete, cmdSelectAll,
-        cmdPlayStop, cmdRecord, cmdToStart, cmdPunch, cmdPunchMode, cmdLoop, cmdPunchIn, cmdPunchOut, cmdClick, cmdCountIn,
-        cmdZoomIn, cmdZoomOut, cmdZoomFit, cmdMixer
-    };
-
     void perform(int command);
+    void perform(int command, Shortcuts::Context);
+    Shortcuts::Context shortcutContext() const;
+    void globalFocusChanged(juce::Component*) override { menuItemsChanged(); }
+    void movePlayhead(int direction, bool byBar);
+    void showShortcutHelp();
     void timerCallback() override;
     void changeListenerCallback(juce::ChangeBroadcaster*) override;
 
@@ -58,8 +57,13 @@ private:
     void deleteSelection();
     void copySelection();
     void paste();
-    void duplicateSelection();
-    void pasteClips(const std::vector<ClipboardClip>&, int track, juce::int64 position, bool movePlayhead);
+    /** Copies the selection straight after itself, `times` times in a row, as one undo step. */
+    void duplicateSelection(int times = 1);
+    /** Asks how many copies to make, then duplicates. */
+    void askToDuplicate();
+    int lastDuplicateCount = 2;
+    /** Pastes the clips at position; times > 1 pastes them that many times end to end. */
+    void pasteClips(const std::vector<ClipboardClip>&, int track, juce::int64 position, bool movePlayhead, int times = 1);
     void setPunchPoint(bool in);
     void setRangeMode(AudioEngine::RangeMode);
     void toggleMixer();
@@ -71,7 +75,9 @@ private:
     void openProject();
     void importAudio();
     void exportMix();
+    void chooseExportFile(Project::ExportSettings);
     void showAudioSettings();
+    void showMidiSettings();
     void projectChanged();
     void showError(const juce::String& title, const juce::String& message);
 
@@ -90,6 +96,7 @@ private:
 
     bool mixerVisible = false;
     bool pianoRollVisible = false;
+    juce::Component::SafePointer<juce::Component> shortcutHost;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(MainComponent)
 };

@@ -1,5 +1,7 @@
 #include "MixerPanel.h"
+#include "Busy.h"
 #include "PluginWindows.h"
+#include "../Audio/Effects.h"
 
 namespace
 {
@@ -34,6 +36,22 @@ namespace
     {
         if (!s.isMouseButtonDown())
             s.setValue(value, juce::dontSendNotification);
+    }
+
+    void styleRoute(juce::TextButton& button, juce::Colour colour)
+    {
+        button.setColour(juce::TextButton::buttonOnColourId, colour);
+        button.setColour(juce::TextButton::textColourOnId, Theme::bg);
+    }
+
+    constexpr int knobRowHeight = 48;
+    void layoutRouteButtons(juce::Rectangle<int> bank, std::initializer_list<juce::TextButton*> buttons)
+    {
+        for (auto* button : buttons)
+        {
+            button->setBounds(bank.removeFromTop(20));
+            bank.removeFromTop(4);
+        }
     }
 }
 
@@ -139,16 +157,57 @@ void InsertSlots::showAddMenu()
         if (!type.isInstrument)
             effects.add(type);
 
+    constexpr int kFirstEffect = 1000;   // 8track's own effects; KnownPluginList's ids are far above
+    // 8track's own: effects everywhere; on the 8 tracks, its instruments and MIDI effects too.
+    // Those need a MIDI track, so on an empty audio track picking one makes it one.
+    const bool isTrack = juce::isPositiveAndBelow(index, kNumTracks);
+    const bool midiTrack = engine.isTrackMidi(index);
+    const bool canBecomeMidi = isTrack && !midiTrack && project.getArrangement().tracks[(size_t) index].empty();
+    const auto builtIn = EffectPlugin::getTypes();
     juce::PopupMenu menu;
-    if (effects.isEmpty())
-        menu.addItem(-1, "No plugins found yet", false);
+    menu.addSectionHeader("8track");
+    for (size_t i = 0; i < builtIn.size(); ++i)
+        if (builtIn[i].kind == EffectPlugin::Kind::Effect)
+            menu.addItem(juce::PopupMenu::Item(builtIn[i].name).setID(kFirstEffect + (int) i));
+    if (isTrack)
+    {
+        const bool usable = midiTrack || canBecomeMidi;
+        const juce::String why = midiTrack ? juce::String() : canBecomeMidi ? " (makes this a MIDI track)" : " (MIDI tracks only)";
+        menu.addSectionHeader("8track Instruments" + why);
+        auto* current = engine.getInstrument(index);
+        for (size_t i = 0; i < builtIn.size(); ++i)
+            if (builtIn[i].kind == EffectPlugin::Kind::Instrument)
+                menu.addItem(juce::PopupMenu::Item(builtIn[i].name)
+                                 .setID(kFirstEffect + (int) i)
+                                 .setEnabled(usable)
+                                 .setTicked(current != nullptr && current->getPluginType() == builtIn[i].xmlType));
+        menu.addSectionHeader("8track MIDI Effects" + why);
+        for (size_t i = 0; i < builtIn.size(); ++i)
+            if (builtIn[i].kind == EffectPlugin::Kind::MidiEffect)
+                menu.addItem(juce::PopupMenu::Item(builtIn[i].name).setID(kFirstEffect + (int) i).setEnabled(usable));
+        if (!usable)
+            menu.addItem(-4, "(A track with clips on it can't change to MIDI)", false);
+    }
+    const bool thirdParty = showsThirdPartyPlugins(engine);
+    if (thirdParty)
+    {
+        menu.addSectionHeader("Plugins");
+        if (effects.isEmpty())
+            menu.addItem(-1, "No plugins found yet", false);
+        else
+            juce::KnownPluginList::addToMenu(menu, effects, juce::KnownPluginList::sortByManufacturer);
+    }
     else
-        juce::KnownPluginList::addToMenu(menu, effects, juce::KnownPluginList::sortByManufacturer);
+    {
+        effects.clear();   // so no menu id can pick one
+    }
     menu.addSeparator();
-    menu.addItem(-2, "Scan for Plugins...");
+    menu.addItem(-3, "Show Third-Party Plugins", true, thirdParty);
+    if (thirdParty)
+        menu.addItem(-2, "Scan for Plugins...");
 
     menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(this),
-                       [safe = SafePointer<InsertSlots>(this), effects](int result)
+                       [safe = SafePointer<InsertSlots>(this), effects, builtIn](int result)
     {
         if (safe == nullptr || result == 0)
             return;
@@ -157,12 +216,38 @@ void InsertSlots::showAddMenu()
             showPluginManager(safe->engine);
             return;
         }
-        const int chosen = juce::KnownPluginList::getIndexChosenByMenu(effects, result);
-        if (chosen < 0)
+        if (result == -3)
+        {
+            setShowsThirdPartyPlugins(safe->engine, !showsThirdPartyPlugins(safe->engine));
+            safe->showAddMenu();   // open it again, so the change shows straight away
             return;
-
+        }
         juce::String error;
-        if (auto* plugin = safe->engine.addInsert(safe->index, effects.getReference(chosen), error))
+        te::Plugin* plugin = nullptr;
+        if (juce::isPositiveAndBelow(result - kFirstEffect, (int) builtIn.size()))
+        {
+            const auto& type = builtIn[(size_t) (result - kFirstEffect)];
+            if (type.kind != EffectPlugin::Kind::Effect && !safe->engine.isTrackMidi(safe->index))
+            {
+                if (!safe->project.getArrangement().tracks[(size_t) safe->index].empty())
+                    return;
+                safe->engine.setTrackMidi(safe->index, true);   // the header follows on its next refresh
+            }
+            if (type.kind == EffectPlugin::Kind::Instrument)
+                plugin = safe->engine.setInstrument(safe->index, type.xmlType, error);
+            else
+                plugin = safe->engine.addEffect(safe->index, type.xmlType, error);
+        }
+        else
+        {
+            const int chosen = juce::KnownPluginList::getIndexChosenByMenu(effects, result);
+            if (chosen < 0)
+                return;
+            const auto& description = effects.getReference(chosen);
+            Busy::runHere("Loading " + description.name + "...",
+                          [&] { plugin = safe->engine.addInsert(safe->index, description, error); });
+        }
+        if (plugin != nullptr)
         {
             safe->project.markDirty();
             safe->refresh();
@@ -237,10 +322,16 @@ ChannelStrip::ChannelStrip(AudioEngine& e, Project& p, int trackIndex)
     midGain.slider.textFromValueFunction = [](double v) { return juce::String(v, 1) + " dB"; };
     bind(midGain.slider, project, [this](float v) { params.midGainDb = v; });
 
-    send.slider.setRange(0.0, 1.0, 0.01);
-    send.slider.setDoubleClickReturnValue(true, 0.0);
-    send.slider.textFromValueFunction = [](double v) { return juce::String(juce::roundToInt(v * 100.0)) + "%"; };
-    bind(send.slider, project, [this](float v) { params.send = v; });
+    const std::array sends { &send1, &send2 };
+    for (size_t bus = 0; bus < sends.size(); ++bus)
+    {
+        auto& slider = sends[bus]->slider;
+        slider.setRange(0.0, 1.0, 0.01);
+        slider.setDoubleClickReturnValue(true, 1.0);
+        slider.setTooltip("Post-fader send level to Bus " + juce::String(static_cast<int>(bus) + 1));
+        slider.textFromValueFunction = [](double v) { return juce::String(juce::roundToInt(v * 100.0)) + "%"; };
+        bind(slider, project, [this, bus](float v) { params.sendLevels[bus] = v; });
+    }
 
     pan.slider.setRange(-1.0, 1.0, 0.01);
     pan.slider.setDoubleClickReturnValue(true, 0.0);
@@ -250,9 +341,24 @@ ChannelStrip::ChannelStrip(AudioEngine& e, Project& p, int trackIndex)
     };
     bind(pan.slider, project, [this](float v) { params.pan = v; });
 
-    for (auto* k : { &lowCut, &highCut, &midFreq, &midGain, &send, &pan })
+    for (auto* k : { &lowCut, &highCut, &midFreq, &midGain, &send1, &send2, &pan })
         addAndMakeVisible(k);
     addAndMakeVisible(inserts);
+
+    const auto addRoute = [this](juce::TextButton& button, AudioEngine::Route route, juce::Colour colour, const char* tooltip)
+    {
+        styleRoute(button, colour);
+        button.setTooltip(tooltip);
+        button.onClick = [this, route]
+        {
+            engine.setTrackRoute(index, route, !engine.hasTrackRoute(index, route));
+            refresh();
+        };
+        addAndMakeVisible(button);
+    };
+    addRoute(mainRoute, AudioEngine::Route::Main, Theme::accent, "Send directly to Main");
+    addRoute(bus1Route, AudioEngine::Route::Bus1, Theme::monitor, "Send to Bus 1");
+    addRoute(bus2Route, AudioEngine::Route::Bus2, Theme::solo, "Send to Bus 2");
 
     mute.setClickingTogglesState(true);
     mute.setColour(juce::TextButton::buttonOnColourId, Theme::mute);
@@ -280,12 +386,19 @@ void ChannelStrip::refresh()
     sync(highCut.slider, params.highCut.load());
     sync(midFreq.slider, params.midFreq.load());
     sync(midGain.slider, params.midGainDb.load());
-    sync(send.slider, params.send.load());
+    sync(send1.slider, params.sendLevels[0].load());
+    sync(send2.slider, params.sendLevels[1].load());
     sync(pan.slider, params.pan.load());
     sync(fader, params.volumeDb.load());
     inserts.refresh();
     mute.setToggleState(params.mute.load(), juce::dontSendNotification);
     solo.setToggleState(params.solo.load(), juce::dontSendNotification);
+    mainRoute.setToggleState(engine.hasTrackRoute(index, AudioEngine::Route::Main), juce::dontSendNotification);
+    bus1Route.setToggleState(engine.hasTrackRoute(index, AudioEngine::Route::Bus1), juce::dontSendNotification);
+    bus2Route.setToggleState(engine.hasTrackRoute(index, AudioEngine::Route::Bus2), juce::dontSendNotification);
+    const bool routingAvailable = engine.getState() != AudioEngine::State::Recording;
+    for (auto* button : { &mainRoute, &bus1Route, &bus2Route })
+        button->setEnabled(routingAvailable);
 
     const auto text = dbText(fader.getValue());
     if (faderValue.getText() != text)
@@ -304,7 +417,6 @@ void ChannelStrip::paint(juce::Graphics& g)
     g.setFont(Theme::font(11.0f, true));
     g.drawText(params.name, getLocalBounds().withHeight(22).withTrimmedTop(4).reduced(4, 0),
                juce::Justification::centred, true);
-    juce::ignoreUnused(engine, index);
 }
 
 void ChannelStrip::resized()
@@ -313,15 +425,17 @@ void ChannelStrip::resized()
 
     auto knobRow = [&r](Knob& a, Knob& b)
     {
-        auto row = r.removeFromTop(46);
+        auto row = r.removeFromTop(knobRowHeight).withTrimmedBottom(2);
         a.setBounds(row.removeFromLeft(row.getWidth() / 2));
         b.setBounds(row);
-        r.removeFromTop(2);
     };
     knobRow(lowCut, highCut);
     knobRow(midFreq, midGain);
-    knobRow(send, pan);
-
+    auto sends = r.removeFromTop(knobRowHeight).withTrimmedBottom(2);
+    const int columnWidth = sends.getWidth() / 3;
+    pan.setBounds(sends.removeFromLeft(columnWidth));
+    send1.setBounds(sends.removeFromLeft(columnWidth));
+    send2.setBounds(sends);
     r.removeFromTop(4);
     inserts.setBounds(r.removeFromTop(InsertSlots::preferredHeight()).reduced(2, 0));
     r.removeFromTop(4);
@@ -331,95 +445,149 @@ void ChannelStrip::resized()
     solo.setBounds(buttons.reduced(2, 0));
     r.removeFromTop(6);
 
-    faderValue.setBounds(r.removeFromBottom(14));
+    const auto valueRow = r.removeFromBottom(14);
+    layoutRouteButtons(r.removeFromLeft(32).withTrimmedTop(2), { &mainRoute, &bus1Route, &bus2Route });
+    r.removeFromLeft(4);
     meter.setBounds(r.removeFromRight(10));
     r.removeFromRight(4);
+    faderValue.setBounds(valueRow.withWidth(40).withCentre({ r.getCentreX(), valueRow.getCentreY() }));
     fader.setBounds(r);
 }
 
 //==============================================================================
-MasterStrip::MasterStrip(AudioEngine& e, Project& p) : engine(e), project(p), inserts(e, p, AudioEngine::kMasterBus)
+OutputStrip::OutputStrip(AudioEngine& e, Project& p, int mixerIndex)
+    : engine(e),
+      params(mixerIndex == AudioEngine::kMasterBus ? e.getMaster() : e.getBus(mixerIndex - AudioEngine::kFirstStereoBus)),
+      bus1(mixerIndex == AudioEngine::kFirstStereoBus),
+      name(mixerIndex == AudioEngine::kMasterBus ? "MAIN" : bus1 ? "BUS 1" : "BUS 2"),
+      colour(mixerIndex == AudioEngine::kMasterBus ? Theme::accent : bus1 ? Theme::monitor : Theme::solo),
+      inserts(e, p, mixerIndex)
 {
     addAndMakeVisible(inserts);
-    auto& m = engine.getMaster();
-    juce::ignoreUnused(m);
-
-    for (auto* k : { &room, &damping, &wet })
+    if (bus1)
     {
-        k->slider.setRange(0.0, 1.0, 0.01);
-        k->slider.textFromValueFunction = [](double v) { return juce::String(juce::roundToInt(v * 100.0)) + "%"; };
-        addAndMakeVisible(k);
+        for (auto* knob : { &room, &damping, &wet })
+        {
+            knob->slider.setRange(0.0, 1.0, 0.01);
+            knob->slider.textFromValueFunction = [](double v) { return juce::String(juce::roundToInt(v * 100.0)) + "%"; };
+            addAndMakeVisible(knob);
+        }
+        room.slider.setDoubleClickReturnValue(true, 0.5);
+        damping.slider.setDoubleClickReturnValue(true, 0.5);
+        wet.slider.setDoubleClickReturnValue(true, 0.33);
+        bind(room.slider, p, [this](float v) { engine.getBusReverb().room = v; });
+        bind(damping.slider, p, [this](float v) { engine.getBusReverb().damping = v; });
+        bind(wet.slider, p, [this](float v) { engine.getBusReverb().wet = v; });
+
+        styleRoute(reverb, Theme::monitor);
+        styleRoute(toMain, Theme::accent);
+        styleRoute(toBus2, Theme::solo);
+        reverb.setTooltip("Enable or bypass the Bus 1 reverb");
+        toMain.setTooltip("Send Bus 1 directly to Main");
+        toBus2.setTooltip("Send Bus 1 through Bus 2");
+        reverb.onClick = [this] { engine.setBusReverbEnabled(!engine.isBusReverbEnabled()); refresh(); };
+        toMain.onClick = [this] { engine.setBus1FeedsBus2(false); refresh(); };
+        toBus2.onClick = [this] { engine.setBus1FeedsBus2(true); refresh(); };
+        for (auto* button : { &reverb, &toMain, &toBus2 })
+            addAndMakeVisible(button);
     }
-    room.slider.setDoubleClickReturnValue(true, 0.5);
-    damping.slider.setDoubleClickReturnValue(true, 0.5);
-    wet.slider.setDoubleClickReturnValue(true, 0.33);
-    bind(room.slider, project, [this](float v) { engine.getMaster().reverbRoom = v; });
-    bind(damping.slider, project, [this](float v) { engine.getMaster().reverbDamping = v; });
-    bind(wet.slider, project, [this](float v) { engine.getMaster().reverbWet = v; });
 
     setupFader(fader, faderValue);
-    bind(fader, project, [this](float v) { engine.getMaster().volumeDb = v; });
+    fader.setColour(juce::Slider::trackColourId, colour);
+    bind(fader, p, [this](float v) { params.volumeDb = v; });
     addAndMakeVisible(fader);
     addAndMakeVisible(faderValue);
     addAndMakeVisible(meter);
     refresh();
 }
 
-void MasterStrip::refresh()
+void OutputStrip::refresh()
 {
-    auto& m = engine.getMaster();
-    sync(room.slider, m.reverbRoom.load());
-    sync(damping.slider, m.reverbDamping.load());
-    sync(wet.slider, m.reverbWet.load());
+    if (bus1)
+    {
+        auto& effect = engine.getBusReverb();
+        sync(room.slider, effect.room.load());
+        sync(damping.slider, effect.damping.load());
+        sync(wet.slider, effect.wet.load());
+        const bool active = engine.isBusReverbEnabled();
+        reverb.setToggleState(active, juce::dontSendNotification);
+        for (auto* knob : { &room, &damping, &wet })
+            knob->setEnabled(active);
+        const bool cascaded = engine.bus1FeedsBus2();
+        toMain.setToggleState(!cascaded, juce::dontSendNotification);
+        toBus2.setToggleState(cascaded, juce::dontSendNotification);
+        const bool routingAvailable = engine.getState() != AudioEngine::State::Recording;
+        toMain.setEnabled(routingAvailable);
+        toBus2.setEnabled(routingAvailable);
+    }
     inserts.refresh();
-    sync(fader, m.volumeDb.load());
+    sync(fader, params.volumeDb.load());
     const auto text = dbText(fader.getValue());
     if (faderValue.getText() != text)
         faderValue.setText(text, juce::dontSendNotification);
 }
 
-void MasterStrip::paint(juce::Graphics& g)
+void OutputStrip::paint(juce::Graphics& g)
 {
     g.setColour(Theme::panelLight);
     g.fillRect(getLocalBounds().reduced(1, 0));
+    g.setColour(colour);
+    g.fillRect(2, 0, getWidth() - 4, 3);
     g.setColour(Theme::text);
     g.setFont(Theme::font(11.0f, true));
-    g.drawText("MASTER", getLocalBounds().withHeight(22).withTrimmedTop(4), juce::Justification::centred, false);
+    g.drawText(name, getLocalBounds().withHeight(22).withTrimmedTop(4),
+               juce::Justification::centred, false);
 }
 
-void MasterStrip::resized()
+void OutputStrip::resized()
 {
     auto r = getLocalBounds().reduced(6, 0).withTrimmedTop(24).withTrimmedBottom(6);
-    auto row = r.removeFromTop(46);
-    const int w = row.getWidth() / 3;
-    room.setBounds(row.removeFromLeft(w));
-    damping.setBounds(row.removeFromLeft(w));
-    wet.setBounds(row);
-    r.removeFromTop(8);
+    if (bus1)
+    {
+        reverb.setBounds(r.removeFromTop(24).reduced(0, 2));
+        auto row = r.removeFromTop(knobRowHeight);
+        const int width = row.getWidth() / 3;
+        room.setBounds(row.removeFromLeft(width));
+        damping.setBounds(row.removeFromLeft(width));
+        wet.setBounds(row);
+    }
+    r.removeFromTop(4);
     inserts.setBounds(r.removeFromTop(InsertSlots::preferredHeight()).reduced(2, 0));
     r.removeFromTop(8);
 
-    faderValue.setBounds(r.removeFromBottom(14));
-    meter.setBounds(r.removeFromRight(36));
+    const auto valueRow = r.removeFromBottom(14);
+    if (bus1)
+    {
+        layoutRouteButtons(r.removeFromLeft(36).withTrimmedTop(2), { &toMain, &toBus2 });
+        r.removeFromLeft(4);
+    }
+    meter.setBounds(r.removeFromRight(34));
     r.removeFromRight(4);
+    faderValue.setBounds(valueRow.withWidth(40).withCentre({ r.getCentreX(), valueRow.getCentreY() }));
     fader.setBounds(r);
 }
 
 //==============================================================================
-MixerPanel::MixerPanel(AudioEngine& e, Project& p) : master(e, p)
+MixerPanel::MixerPanel(AudioEngine& e, Project& p)
+    : bus1(e, p, AudioEngine::kFirstStereoBus),
+      bus2(e, p, AudioEngine::kFirstStereoBus + 1),
+      master(e, p, AudioEngine::kMasterBus)
 {
     for (int t = 0; t < kNumTracks; ++t)
     {
         strips[(size_t) t] = std::make_unique<ChannelStrip>(e, p, t);
         addAndMakeVisible(*strips[(size_t) t]);
     }
-    addAndMakeVisible(master);
+    for (auto* output : { &bus1, &bus2, &master })
+        addAndMakeVisible(output);
 }
 
 void MixerPanel::refresh()
 {
     for (auto& s : strips)
         s->refresh();
+    bus1.refresh();
+    bus2.refresh();
     master.refresh();
 }
 
@@ -433,8 +601,11 @@ void MixerPanel::paint(juce::Graphics& g)
 void MixerPanel::resized()
 {
     auto r = getLocalBounds().withTrimmedTop(2);
-    master.setBounds(r.removeFromRight(150));
-    const int w = juce::jmin(110, r.getWidth() / kNumTracks);
+    const int outputWidth = juce::jmin(124, r.getWidth() / (kNumTracks + AudioEngine::kStereoBusCount + 1));
+    master.setBounds(r.removeFromRight(outputWidth));
+    bus2.setBounds(r.removeFromRight(outputWidth));
+    bus1.setBounds(r.removeFromRight(outputWidth));
+    const int w = r.getWidth() / kNumTracks;
     for (auto& s : strips)
         s->setBounds(r.removeFromLeft(w));
 }

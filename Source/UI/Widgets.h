@@ -111,7 +111,7 @@ private:
 class IconButton : public juce::Button
 {
 public:
-    enum class Icon { ToStart, Play, Stop, Record };
+    enum class Icon { ToStart, Play, Stop, Record, Metronome, CountIn, Tuner };
 
     IconButton(const juce::String& name, Icon i, juce::Colour onColour = Theme::accent)
         : juce::Button(name), icon(i), activeColour(onColour) {}
@@ -142,6 +142,38 @@ public:
             case Icon::Record:
                 p.addEllipse(r.reduced(1.0f));
                 break;
+            case Icon::Metronome:
+            {
+                const float x = r.getCentreX(), y = r.getY();
+                p.startNewSubPath(x - 2, y + 1);
+                p.lineTo(x + 2, y + 1);
+                p.lineTo(x + 6, y + 13);
+                p.lineTo(x - 6, y + 13);
+                p.closeSubPath();
+                g.strokePath(p, juce::PathStrokeType(1.25f));
+                g.drawLine(x, y + 10, x + 6, y + 2, 1.4f);
+                g.fillEllipse(x + 5, y + 1, 2.5f, 2.5f);
+                return;
+            }
+            case Icon::CountIn:
+                for (int i = 0; i < 4; ++i)
+                    p.addEllipse(r.getX() + (float) i * 3.5f, r.getCentreY() - 1.5f, 2.5f, 2.5f);
+                p.addRectangle(r.getX(), r.getY() + 2, r.getWidth(), 1.2f);
+                p.addRectangle(r.getX(), r.getBottom() - 3, r.getWidth(), 1.2f);
+                break;
+            case Icon::Tuner:
+            {
+                const auto x = r.getCentreX(), y = r.getY();
+                p.startNewSubPath(x - 4, y);
+                p.lineTo(x - 4, y + 5);
+                p.quadraticTo(x - 4, y + 9, x, y + 9);
+                p.quadraticTo(x + 4, y + 9, x + 4, y + 5);
+                p.lineTo(x + 4, y);
+                g.strokePath(p, juce::PathStrokeType(1.6f, juce::PathStrokeType::curved,
+                                                     juce::PathStrokeType::rounded));
+                g.drawLine(x, y + 9, x, y + 14, 1.6f);
+                return;
+            }
             case Icon::ToStart:
                 p.addRectangle(r.getX(), r.getY(), 2.5f, r.getHeight());
                 p.addTriangle(r.getRight(), r.getY(), r.getRight(), r.getBottom(), r.getX() + 2.5f, r.getCentreY());

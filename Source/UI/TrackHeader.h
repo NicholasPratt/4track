@@ -27,6 +27,7 @@ public:
     void resized() override;
     void mouseDown(const juce::MouseEvent&) override;
     std::function<void()> onClicked;
+    std::function<void()> onShowMidiSettings;
 
 private:
     void edited();
@@ -49,7 +50,10 @@ private:
     juce::ComboBox input;
     juce::TextButton instrument;   // MIDI tracks show this instead of the input
     bool shownAsMidi = false;
-    juce::String shownInstrument;
+    juce::String shownInstrument, shownRouting;
+    // Instrument menu items for the MIDI routing (the plugin list uses ids far above these).
+    enum { kAllInputs = 1000, kFirstInput, kMissingInput = 1999, kAnyChannel = 2000, kNoOutput = 3000, kFirstOutput,
+           kMissingOutput = 3998, kBothPlay = 3999, kMidiSettings = 4000, kFirstBuiltIn = 5000 };
     juce::Slider volume, pan;
     LevelMeter meter { false };
 };

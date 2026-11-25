@@ -1,10 +1,15 @@
 #include "TransportBar.h"
+#include "Shortcuts.h"
+#include "TempoPopup.h"
+#include "TunerWindow.h"
 
 TransportBar::TransportBar(AudioEngine& e, Project& p, TimelineView& v) : engine(e), project(p), view(v)
 {
     projectName.setFont(Theme::font(14.0f, true));
     projectName.setColour(juce::Label::textColourId, Theme::text);
     addAndMakeVisible(projectName);
+    addChildComponent(recall);
+    recall.onClick = [this] { if (onRecall) onRecall(); };
 
     toStart.setTooltip("Go to start (Return)");
     play.setTooltip("Play (Space)");
@@ -17,34 +22,22 @@ TransportBar::TransportBar(AudioEngine& e, Project& p, TimelineView& v) : engine
     for (auto* b : { &toStart, &play, &stop, &record })
         addAndMakeVisible(b);
 
-    bpm.setSliderStyle(juce::Slider::LinearBarVertical);
-    bpm.setRange(30.0, 300.0, 0.5);
-    bpm.setTextBoxIsEditable(true);
-    bpm.textFromValueFunction = [](double value) { return juce::String(value, value == std::floor(value) ? 0 : 1) + " BPM"; };
-    bpm.valueFromTextFunction = [](const juce::String& text) { return text.retainCharacters("0123456789.").getDoubleValue(); };
-    bpm.setColour(juce::Slider::trackColourId, Theme::control);
-    bpm.setColour(juce::Slider::textBoxTextColourId, Theme::text);
-    bpm.setTooltip("Tempo: drag up/down or double-click to type");
-    bpm.setScrollWheelEnabled(false);
-    bpm.onValueChange = [this]
-    {
-        engine.bpm = bpm.getValue();
-        project.markDirty();
-        if (onGridChanged) onGridChanged();
-    };
-    addAndMakeVisible(bpm);
+    tempo.setTooltip("Tempo, tap tempo, time signature and MIDI clock");
+    tempo.setColour(juce::TextButton::buttonOnColourId, Theme::panelLight.brighter(0.2f));
+    tempo.onClick = [this] { showTempoPopup(); };
+    addAndMakeVisible(tempo);
 
-    for (int n = 2; n <= 7; ++n)
-        timeSig.addItem(juce::String(n) + "/4", n);
-    timeSig.setTooltip("Beats per bar");
-    timeSig.onChange = [this]
+    click.setClickingTogglesState(true);
+    countIn.setClickingTogglesState(true);
+    countIn.setTooltip("Recording count-in. Open Tempo for playback count-in.");
+    tuner.setTooltip("Tune using armed audio inputs (" + Shortcuts::keysFor(Shortcuts::Context::Global, Shortcuts::cmdShowTuner) + ")");
+    tuner.onClick = [this]
     {
-        engine.beatsPerBar = timeSig.getSelectedId();
-        project.markDirty();
-        if (onGridChanged) onGridChanged();
+        if (tunerWindow != nullptr && tunerWindow->isVisible())
+            tunerWindow.reset();
+        else
+            showTuner();
     };
-    addAndMakeVisible(timeSig);
-
     click.onClick   = [this] { engine.metronomeOn = click.getToggleState(); project.markDirty(); };
     countIn.onClick = [this] { engine.countInOn = countIn.getToggleState(); project.markDirty(); };
     punch.setClickingTogglesState(false);   // it steps through off, punch and loop
@@ -56,7 +49,7 @@ TransportBar::TransportBar(AudioEngine& e, Project& p, TimelineView& v) : engine
     zoomIn.setTooltip("Zoom in (=)");
     zoomOut.setTooltip("Zoom out (-)");
 
-    for (auto* b : { (juce::Component*) &click, (juce::Component*) &countIn, (juce::Component*) &punch,
+    for (auto* b : { (juce::Component*) &click, (juce::Component*) &countIn, (juce::Component*) &tuner, (juce::Component*) &punch,
                      (juce::Component*) &snap, (juce::Component*) &mixer, (juce::Component*) &zoomIn,
                      (juce::Component*) &zoomOut })
         addAndMakeVisible(b);
@@ -67,12 +60,42 @@ TransportBar::TransportBar(AudioEngine& e, Project& p, TimelineView& v) : engine
 
 void TransportBar::refresh()
 {
-    bpm.setValue(engine.bpm.load(), juce::dontSendNotification);
-    timeSig.setSelectedId(engine.beatsPerBar.load(), juce::dontSendNotification);
+    showTempo();
     click.setToggleState(engine.metronomeOn.load(), juce::dontSendNotification);
     countIn.setToggleState(engine.countInOn.load(), juce::dontSendNotification);
+    click.setTooltip(engine.metronomeRecordOnly.load() ? "Metronome, record only (C)" : "Metronome (C)");
     showRangeMode();
     snap.setToggleState(view.snapOn, juce::dontSendNotification);
+}
+
+void TransportBar::showTempo()
+{
+    const double value = engine.bpm.load();
+    const auto text = juce::String(value, value == std::floor(value) ? 0 : 1) + " BPM   "
+                    + juce::String(engine.beatsPerBar.load()) + "/4";
+    if (tempo.getButtonText() != text)
+        tempo.setButtonText(text);
+    tempo.setToggleState(tempoPopup != nullptr, juce::dontSendNotification);
+}
+
+void TransportBar::showTempoPopup()
+{
+    if (tempoPopup != nullptr)
+    {
+        tempoPopup->dismiss();
+        return;
+    }
+    auto content = std::make_unique<TempoPopup>(engine);
+    content->onChanged = [this]
+    {
+        project.markDirty();
+        showTempo();
+        if (onGridChanged) onGridChanged();
+    };
+    auto& box = juce::CallOutBox::launchAsynchronously(std::move(content), tempo.getScreenBounds(), nullptr);
+    box.setDismissalMouseClicksAreAlwaysConsumed(true);   // a click on the tempo button just closes it
+    tempoPopup = &box;
+    showTempo();
 }
 
 void TransportBar::showRangeMode()
@@ -85,8 +108,14 @@ void TransportBar::showRangeMode()
     punch.setToggleState(mode != AudioEngine::RangeMode::Off, juce::dontSendNotification);
 }
 
-void TransportBar::tick()
+void TransportBar::tick(bool canRecall)
 {
+    if (recall.isVisible() != canRecall)
+    {
+        recall.setVisible(canRecall);
+        resized();
+    }
+    tuner.setToggleState(tunerWindow != nullptr && tunerWindow->isVisible(), juce::dontSendNotification);
     const auto state = engine.getState();
     play.setToggleState(state != AudioEngine::State::Stopped, juce::dontSendNotification);
     // The looper waiting to start or finish blinks the record button.
@@ -98,13 +127,17 @@ void TransportBar::tick()
         record.setToggleState(state == AudioEngine::State::Recording, juce::dontSendNotification);
     showRangeMode();
     click.setToggleState(engine.metronomeOn.load(), juce::dontSendNotification);
-    bpm.setEnabled(state == AudioEngine::State::Stopped);
-    timeSig.setEnabled(state == AudioEngine::State::Stopped);
+    showTempo();
 
     const auto pos = engine.getPosition();
     const auto grid = Grid::make(engine, view);
     auto newBars = grid.barsBeats(pos);
     auto newTime = formatTime(pos, engine.getSampleRate());
+    if (looper == AudioEngine::LoopRecord::Waiting || looper == AudioEngine::LoopRecord::Finishing)
+    {
+        const auto boundary = grid.barsBeats(engine.punchOut.load());
+        newTime = (looper == AudioEngine::LoopRecord::Waiting ? "Rec starts at " : "Rec ends at ") + boundary;
+    }
     if (newBars != barsText || newTime != timeText)
     {
         barsText = newBars;
@@ -115,6 +148,14 @@ void TransportBar::tick()
     const auto name = project.getName() + (project.isDirty() ? "  \xe2\x80\xa2" : "");
     if (projectName.getText() != name)
         projectName.setText(name, juce::dontSendNotification);
+}
+
+void TransportBar::showTuner()
+{
+    if (tunerWindow != nullptr && tunerWindow->isVisible())
+        tunerWindow->toFront(true);
+    else
+        tunerWindow = openTunerWindow(engine, tuner.getScreenBounds());
 }
 
 void TransportBar::paint(juce::Graphics& g)
@@ -146,7 +187,10 @@ void TransportBar::resized()
 {
     auto r = getLocalBounds().reduced(10, 9);
 
-    projectName.setBounds(r.removeFromLeft(170));
+    auto title = r.removeFromLeft(170);
+    if (recall.isVisible())
+        recall.setBounds(title.removeFromBottom(19));
+    projectName.setBounds(title);
     r.removeFromLeft(6);
 
     for (auto* b : { &toStart, &play, &stop, &record })
@@ -159,14 +203,12 @@ void TransportBar::resized()
     displayArea = r.removeFromLeft(150);
     r.removeFromLeft(10);
 
-    bpm.setBounds(r.removeFromLeft(84).reduced(0, 3));
-    r.removeFromLeft(4);
-    timeSig.setBounds(r.removeFromLeft(60).reduced(0, 3));
+    tempo.setBounds(r.removeFromLeft(110).reduced(0, 3));
     r.removeFromLeft(12);
 
-    for (auto* b : { (juce::Button*) &click, (juce::Button*) &countIn, (juce::Button*) &punch, (juce::Button*) &snap })
+    for (auto* b : { (juce::Button*) &click, (juce::Button*) &countIn, (juce::Button*) &tuner, (juce::Button*) &punch, (juce::Button*) &snap })
     {
-        b->setBounds(r.removeFromLeft(b == &countIn ? 72 : 56).reduced(0, 3));
+        b->setBounds(r.removeFromLeft(b == &punch || b == &snap ? 56 : 38).reduced(0, 3));
         r.removeFromLeft(4);
     }
 

@@ -1,6 +1,23 @@
+#include "../Source/UI/PianoRoll.h"
+#include "../Source/Audio/TunerCapture.h"
+#include "../Source/Audio/Mp3Encoder.h"
+#include "../Source/UI/LyricRows.h"
+#include "../Source/UI/LyricEditorWindow.h"
+#include "../Source/UI/Ruler.h"
+#include "../Source/UI/ShortcutHelp.h"
 #include <juce_core/juce_core.h>
+#include "../Source/Audio/RecordingThumbnail.h"
 #include "../Source/Model/Arrangement.h"
 #include "../Source/Audio/AudioEngine.h"
+#include "../Source/Audio/Effects.h"
+#include "../Source/Audio/Dynamics.h"
+#include "../Source/Audio/Drive.h"
+#include "../Source/Audio/ChorusEffect.h"
+#include "../Source/Audio/ReverbEffect.h"
+#include "../Source/Audio/Arpeggiator.h"
+#include "../Source/Audio/AnalogSynth.h"
+#include "../Source/Audio/DrumSampler.h"
+#include "../Source/Audio/KeySampler.h"
 #include "../Source/Project/Project.h"
 
 namespace
@@ -362,7 +379,9 @@ public:
             expect(project.exportMix(out, error), error);
             if (auto reader = std::unique_ptr<juce::AudioFormatReader>(juce::WavAudioFormat().createReaderFor(out.createInputStream().release(), true)))
             {
-                expect(reader->lengthInSamples >= (juce::int64) (2 * sr + len / 2), "covers the clip");
+                expectEquals((int) reader->bitsPerSample, 24);
+                expectWithinAbsoluteError((double) reader->lengthInSamples / reader->sampleRate,
+                                          2.0 + len / (2.0 * sr) + 3.0, 0.03);
                 juce::AudioBuffer<float> buf(2, (int) reader->lengthInSamples);
                 reader->read(&buf, 0, buf.getNumSamples(), 0, true, true);
                 expect(buf.getMagnitude(0, (int) (2.2 * sr), (int) (0.1 * sr)) > 0.05f, "the clip is audible");
@@ -371,6 +390,55 @@ public:
             else
             {
                 expect(false, "export produced a readable WAV");
+            }
+
+            beginTest("WAV export applies the selected bit depth");
+            Project::ExportSettings settings;
+            for (int depth : { 16, 32 })
+            {
+                settings.wavBitDepth = depth;
+                expect(project.exportMix(out, settings, error), error);
+                auto reader = std::unique_ptr<juce::AudioFormatReader>(
+                    juce::WavAudioFormat().createReaderFor(out.createInputStream().release(), true));
+                expect(reader != nullptr, "export produced a readable WAV");
+                if (reader != nullptr)
+                {
+                    expectEquals((int) reader->bitsPerSample, depth);
+                    expectEquals((int) reader->usesFloatingPointData, depth == 32 ? 1 : 0);
+                }
+            }
+
+            beginTest("An invalid export leaves the existing destination intact");
+            const auto savedSize = out.getSize();
+            settings.wavBitDepth = 12;
+            expect(!project.exportMix(out, settings, error));
+            expectEquals(out.getSize(), savedSize);
+
+            if (Mp3Encoder::isAvailable())
+            {
+                beginTest("MP3 exports are audible and use the selected constant bitrate");
+                settings.format = Project::ExportSettings::Format::mp3;
+                auto mp3 = dir.getChildFile("mix.mp3");
+                for (int bitrate : { 64, 192, 320 })
+                {
+                    settings.mp3BitrateKbps = bitrate;
+                    expect(project.exportMix(mp3, settings, error), error);
+                    const auto seconds = 2.0 + len / (2.0 * sr) + 3.0;
+                    const auto actualKbps = (double) mp3.getSize() * 8.0 / seconds / 1000.0;
+                    expectWithinAbsoluteError(actualKbps, (double) bitrate, bitrate * 0.03);
+                   #if JUCE_USE_MP3AUDIOFORMAT
+                    auto reader = std::unique_ptr<juce::AudioFormatReader>(
+                        juce::MP3AudioFormat().createReaderFor(mp3.createInputStream().release(), true));
+                    expect(reader != nullptr, "export produced a readable MP3");
+                    if (reader != nullptr)
+                    {
+                        const auto count = (int) (0.1 * reader->sampleRate);
+                        juce::AudioBuffer<float> buffer(2, count);
+                        expect(reader->read(&buffer, 0, count, (juce::int64) (2.2 * reader->sampleRate), true, true));
+                        expect(buffer.getMagnitude(0, count) > 0.05f, "the clip is audible");
+                    }
+                   #endif
+                }
             }
             untitledFolder.deleteRecursively();   // where the import went before Save As
         }
@@ -487,6 +555,31 @@ public:
                 reopened = engine.getInserts(1);
             }
 
+            beginTest("Both stereo buses have independent pre-fader inserts");
+            for (int index = AudioEngine::kFirstStereoBus; index < AudioEngine::kFirstStereoBus + AudioEngine::kStereoBusCount; ++index)
+            {
+                expectEquals(static_cast<int>(engine.getInserts(index).size()), 0);
+                auto* insert = engine.addInsert(index, delay, error);
+                expect(insert != nullptr, error);
+                if (insert != nullptr)
+                {
+                    auto* bus = engine.getAudioTrack(index);
+                    expect(bus->pluginList.indexOf(insert) >= 0);
+                    expect(bus->pluginList.indexOf(insert) < bus->pluginList.indexOf(bus->getVolumePlugin()));
+                    insert->setEnabled(false);
+                }
+            }
+            expect(project.save(error), error);
+            expect(project.load(saved, error), error);
+            for (int index = AudioEngine::kFirstStereoBus; index < AudioEngine::kFirstStereoBus + AudioEngine::kStereoBusCount; ++index)
+            {
+                const auto effects = engine.getInserts(index);
+                expectEquals(static_cast<int>(effects.size()), 1);
+                if (!effects.empty())
+                    expect(!effects.front()->isEnabled());
+            }
+            reopened = engine.getInserts(1);
+
             beginTest("Removing a plugin");
             if (!reopened.empty())
                 engine.removeInsert(*reopened.front());
@@ -496,6 +589,144 @@ public:
         dir.deleteRecursively();
         if (!wasKnown)
             known.removeType(delay);
+    }
+};
+
+class StereoBusTests : public juce::UnitTest
+{
+public:
+    StereoBusTests() : juce::UnitTest("Stereo buses", "8track") {}
+
+    void runTest() override
+    {
+        beginTest("Main is the default path and Bus 1 owns the reverb");
+        AudioEngine engine;
+        Project project(engine);
+        const auto untitledFolder = project.getFolder();
+        using Route = AudioEngine::Route;
+        expect(engine.hasTrackRoute(0, Route::Main));
+        expect(!engine.hasTrackRoute(0, Route::Bus1));
+        expect(!engine.hasTrackRoute(0, Route::Bus2));
+        expect(engine.isBusReverbEnabled());
+        expect(!engine.bus1FeedsBus2());
+        auto* firstBus = engine.getAudioTrack(AudioEngine::kFirstStereoBus);
+        auto* secondBus = engine.getAudioTrack(AudioEngine::kFirstStereoBus + 1);
+        expectEquals(firstBus->pluginList.getPluginsOfType<te::ReverbPlugin>().size(), 1);
+        expect(secondBus->pluginList.getPluginsOfType<te::ReverbPlugin>().isEmpty());
+        expect(project.getEdit().getMasterPluginList().getPluginsOfType<te::ReverbPlugin>().isEmpty());
+
+        auto directory = juce::File::createTempFile("8track-buses");
+        expect(directory.createDirectory().wasOk());
+        const auto sampleRate = engine.getSampleRate();
+        const auto samples = juce::roundToInt(sampleRate * 0.5);
+        const auto source = directory.getChildFile("stereo.wav");
+        {
+            juce::AudioBuffer<float> signal(2, samples);
+            for (int i = 0; i < samples; ++i)
+            {
+                const auto time = i / sampleRate;
+                signal.setSample(0, i, 0.2f * static_cast<float>(std::sin(juce::MathConstants<double>::twoPi * 200 * time)));
+                signal.setSample(1, i, 0.1f * static_cast<float>(std::sin(juce::MathConstants<double>::twoPi * 300 * time)));
+            }
+            std::unique_ptr<juce::OutputStream> stream = source.createOutputStream();
+            auto writer = juce::WavAudioFormat().createWriterFor(stream, juce::AudioFormatWriterOptions()
+                .withSampleRate(sampleRate).withNumChannels(2).withBitsPerSample(24));
+            expect(writer != nullptr && writer->writeFromAudioSampleBuffer(signal, 0, samples));
+        }
+
+        juce::String error;
+        expect(project.importAudio(source, 0, 0, error), error);
+        const auto render = [&](double start = 0.2)
+        {
+            const auto output = directory.getChildFile("mix.wav");
+            expect(project.exportMix(output, error), error);
+            auto reader = std::unique_ptr<juce::AudioFormatReader>(
+                juce::WavAudioFormat().createReaderFor(output.createInputStream().release(), true));
+            if (reader == nullptr)
+            {
+                expect(false, "The mix should be readable");
+                return std::array<float, 2> {};
+            }
+            const int length = juce::roundToInt(reader->sampleRate * 0.08);
+            juce::AudioBuffer<float> audio(2, length);
+            expect(reader->read(&audio, 0, length, juce::roundToInt(reader->sampleRate * start), true, true));
+            return std::array { audio.getRMSLevel(0, 0, length), audio.getRMSLevel(1, 0, length) };
+        };
+        const auto direct = render();
+        expect(direct[0] > 0.07f && direct[1] > 0.035f);
+        expectWithinAbsoluteError(direct[0] / juce::jmax(0.001f, direct[1]), 2.0f, 0.02f);
+
+        beginTest("Each send works independently in stereo and parallel sends sum");
+        engine.setBusReverbEnabled(false);
+        engine.setTrackRoute(0, Route::Main, false);
+        const auto silent = render();
+        expect(silent[0] < 0.0001f && silent[1] < 0.0001f);
+        engine.setTrackRoute(0, Route::Bus1, true);
+        const auto bus1 = render();
+        engine.setTrackRoute(0, Route::Bus1, false);
+        engine.setTrackRoute(0, Route::Bus2, true);
+        const auto bus2 = render();
+        engine.setTrackRoute(0, Route::Main, true);
+        const auto parallel = render();
+        for (size_t channel = 0; channel < 2; ++channel)
+        {
+            expectWithinAbsoluteError(bus1[channel], direct[channel], 0.005f);
+            expectWithinAbsoluteError(bus2[channel], direct[channel], 0.005f);
+            expectWithinAbsoluteError(parallel[channel], direct[channel] * 2.0f, 0.005f);
+        }
+
+        beginTest("Routing Bus 1 to Bus 2 applies both stereo bus faders and no direct copy");
+        engine.setTrackRoute(0, Route::Main, false);
+        engine.setTrackRoute(0, Route::Bus2, false);
+        engine.setTrackRoute(0, Route::Bus1, true);
+        engine.getBus(0).volumeDb = -6.0f;
+        engine.getBus(1).volumeDb = -12.0f;
+        engine.setBus1FeedsBus2(true);
+        const auto chained = render();
+        for (size_t channel = 0; channel < 2; ++channel)
+            expectWithinAbsoluteError(chained[channel], direct[channel] * juce::Decibels::decibelsToGain(-18.0f), 0.003f);
+
+        beginTest("An insert on Bus 2 processes the output of Bus 1");
+        auto filter = project.getEdit().getPluginCache().createNewPlugin(te::LowPassPlugin::xmlTypeName, {});
+        auto* lowPass = dynamic_cast<te::LowPassPlugin*>(filter.get());
+        expect(lowPass != nullptr);
+        if (lowPass != nullptr)
+        {
+            lowPass->frequency->setParameter(40.0f, juce::sendNotification);
+            auto& list = secondBus->pluginList;
+            list.insertPlugin(filter, list.indexOf(secondBus->getVolumePlugin()), nullptr);
+            expectEquals(static_cast<int>(engine.getInserts(AudioEngine::kFirstStereoBus + 1).size()), 1);
+            expect(engine.getInserts(AudioEngine::kFirstStereoBus).empty());
+            const auto filtered = render();
+            expect(filtered[0] < chained[0] * 0.3f && filtered[1] < chained[1] * 0.3f);
+            engine.removeInsert(*filter);
+        }
+        filter = nullptr;
+
+        beginTest("The routed reverb is audible in the export tail");
+        engine.setBusReverbEnabled(true);
+        engine.getBus(0).volumeDb = 0.0f;
+        engine.getBus(1).volumeDb = 0.0f;
+        const auto tail = render(0.53);
+        expect(tail[0] > 0.0001f || tail[1] > 0.0001f);
+
+        beginTest("Routing is undoable and survives saving and reopening");
+        engine.setTrackRoute(0, Route::Main, true);
+        expect(project.undo());
+        expect(!engine.hasTrackRoute(0, Route::Main));
+        engine.setBus1FeedsBus2(false);
+        expect(project.undo());
+        expect(engine.bus1FeedsBus2());
+        const auto saved = directory.getChildFile("Session");
+        expect(project.saveAs(saved, error), error);
+        expect(project.load(saved, error), error);
+        expect(!engine.hasTrackRoute(0, Route::Main));
+        expect(engine.hasTrackRoute(0, Route::Bus1));
+        expect(!engine.hasTrackRoute(0, Route::Bus2));
+        expect(engine.bus1FeedsBus2());
+        expect(engine.isBusReverbEnabled());
+        untitledFolder.deleteRecursively();
+        directory.deleteRecursively();
     }
 };
 
@@ -690,6 +921,32 @@ public:
                     notes += mc->getSequence().getNumNotes();
             expectEquals(notes, 4, "both halves keep their copy of the two notes");
 
+            beginTest("A MIDI track's input, channel and output are saved with the project");
+            expect(engine.getMidiRouting(t) == AudioEngine::MidiRouting {}, "every input, any channel, no output to start with");
+            AudioEngine::MidiRouting routing;
+            routing.input = "Some Keyboard";
+            routing.channel = 3;
+            routing.output = "Some Synth";
+            routing.replaceInstrument = false;
+            engine.setMidiRouting(t, routing);
+            expect(engine.getMidiRouting(t) == routing);
+            auto& chain = engine.getAudioTrack(t)->pluginList;
+            expect(dynamic_cast<MidiOutPlugin*>(chain.getPlugins()[0].get()) != nullptr, "MIDI Out is first, so it sees the notes");
+            expectEquals(chain.indexOf(engine.getInstrument(t)), 1, "the instrument comes after it");
+            expect(engine.getInserts(t).empty(), "it isn't one of the track's inserts");
+
+            auto routed = dir.getChildFile("Routed");
+            expect(project.saveAs(routed, error), error);
+            project.newProject();
+            expect(engine.getMidiRouting(t) == AudioEngine::MidiRouting {}, "a new project has no routing");
+            expect(project.load(routed, error), error);
+            expect(engine.getMidiRouting(t) == routing, "the routing comes back");
+            expect(engine.getInstrument(t) != nullptr && dynamic_cast<MidiOutPlugin*>(engine.getAudioTrack(t)->pluginList.getPlugins()[0].get()) != nullptr);
+
+            engine.setMidiRouting(t, {});
+            expect(engine.getMidiRouting(t) == AudioEngine::MidiRouting {}, "back to every input, no output");
+            expectEquals(engine.getAudioTrack(t)->pluginList.indexOf(engine.getInstrument(t)), 0, "MIDI Out is gone");
+
             beginTest("Export plays the instrument");
             auto out = dir.getChildFile("midi.wav");
             expect(project.exportMix(out, error), error);
@@ -864,7 +1121,7 @@ public:
                 audio.createDirectory();
                 auto pass1 = writeWav(audio.getChildFile("take.wav"), sr, loopLen, 0.1f);
                 auto pass2 = writeWav(audio.getChildFile("take_take_2.wav"), sr, loopLen, 0.2f);
-                auto pass3 = writeWav(audio.getChildFile("take_take_3.wav"), sr, loopLen / 3, 0.3f);   // stopped part way
+                auto pass3 = writeWav(audio.getChildFile("take_take_3.wav"), sr, loopLen - (int) (sr * 0.010), 0.3f);   // stopped 10 ms early
 
                 auto clip = engine.getAudioTrack(0)->insertWaveClip("take", pass1, { { te::TimePosition(), te::TimePosition::fromSeconds(3.0) }, {} }, false);
                 expect(clip != nullptr);
@@ -883,13 +1140,2441 @@ public:
     }
 };
 
+class ClipOperationTests : public juce::UnitTest
+{
+public:
+    ClipOperationTests() : juce::UnitTest("ClipOperations", "8track") {}
+
+    /** One sample of a file, at a time in seconds. */
+    static float sampleAt(const juce::File& file, double seconds)
+    {
+        juce::WavAudioFormat wav;
+        std::unique_ptr<juce::AudioFormatReader> reader(wav.createReaderFor(file.createInputStream().release(), true));
+        if (reader == nullptr)
+            return -100.0f;
+        juce::AudioBuffer<float> buffer((int) reader->numChannels, 1);
+        reader->read(&buffer, 0, 1, (juce::int64) (seconds * reader->sampleRate), true, true);
+        return buffer.getSample(0, 0);
+    }
+
+    void runTest() override
+    {
+        auto dir = juce::File::createTempFile("8track-ops");
+        dir.createDirectory();
+
+        AudioEngine engine;
+        const double sr = engine.getSampleRate();
+        const auto second = (juce::int64) sr;
+        auto wav = writeWav(dir.getChildFile("half.wav"), sr, (int) second, 0.5f);
+        {
+            Project project(engine);
+            juce::String error;
+            const int t = 1;
+
+            beginTest("Normalise sets the clip's gain so it peaks at 0 dB");
+            expect(project.importAudio(wav, t, 0, error), error);
+            const auto first = project.getArrangement().tracks[t].front().id;
+            expect(project.normaliseClips({ first }));
+            expectWithinAbsoluteError(project.getArrangement().tracks[t].front().gain, 2.0f, 0.01f);
+            expect(project.undo());
+            expectWithinAbsoluteError(project.getArrangement().tracks[t].front().gain, 1.0f, 0.001f, "undo puts the gain back");
+
+            beginTest("Joining audio clips renders them, gaps and gain included, into one clip");
+            expect(project.importAudio(wav, t, second * 3 / 2, error), error);   // half a second after the first ends
+            const auto second2 = project.getArrangement().tracks[t].back().id;
+            project.perform([second2](Arrangement& a) { return a.setGain(second2, 2.0f); });
+            expect(!project.canJoin({ first }), "one clip can't be joined");
+            expect(project.canJoin({ first, second2 }));
+
+            auto joined = project.joinClips({ first, second2 }, error);
+            expectEquals((int) joined.size(), 1, error);
+            expectEquals((int) project.getArrangement().tracks[t].size(), 1);
+            const auto c = project.getArrangement().tracks[t].front();
+            expectEquals(c.start, (juce::int64) 0);
+            expectEquals(c.length, second * 5 / 2);
+            expectEquals(c.sourceLength, second * 5 / 2);
+            expect(c.file.existsAsFile() && c.file.isAChildOf(project.getAudioFolder()), "a new file in the project");
+            expectWithinAbsoluteError(sampleAt(c.file, 0.5), 0.5f, 0.001f, "the first clip");
+            expectWithinAbsoluteError(sampleAt(c.file, 1.25), 0.0f, 0.0001f, "silence in the gap");
+            expectWithinAbsoluteError(sampleAt(c.file, 2.0), 1.0f, 0.001f, "the second clip, with its gain");
+            expectEquals(engine.getAudioTrack(t)->getClips().size(), 1, "one clip in the Edit");
+
+            expect(project.undo());
+            expectEquals((int) project.getArrangement().tracks[t].size(), 2, "undo gives back both clips");
+
+            beginTest("Transposing moves every note, undoably");
+            const int m = 4;
+            engine.getTrack(m).midi = true;
+            engine.syncNow();
+            const auto bar = engine.getSamplesPerBar();
+            auto* a = project.createMidiClip(m, 0, bar);
+            auto* b = project.createMidiClip(m, 2 * bar, bar);
+            expect(a != nullptr && b != nullptr);
+            if (a == nullptr || b == nullptr)
+                return;
+            auto* um = &project.getEdit().getUndoManager();
+            a->getSequence().addNote(60, te::BeatPosition::fromBeats(0.0), te::BeatDuration::fromBeats(1.0), 100, 0, um);
+            a->getSequence().addNote(64, te::BeatPosition::fromBeats(1.0), te::BeatDuration::fromBeats(1.0), 100, 0, um);
+            b->getSequence().addNote(67, te::BeatPosition::fromBeats(0.0), te::BeatDuration::fromBeats(1.0), 100, 0, um);
+            um->beginNewTransaction();
+            const auto aId = (juce::int64) a->itemID.getRawID(), bId = (juce::int64) b->itemID.getRawID();
+
+            expect(project.transposeClips({ aId }, 12));
+            expectEquals(a->getSequence().getNotes()[0]->getNoteNumber(), 72);
+            expectEquals(a->getSequence().getNotes()[1]->getNoteNumber(), 76);
+            expectEquals(b->getSequence().getNotes()[0]->getNoteNumber(), 67, "other clips are left alone");
+            expect(project.undo());
+            expectEquals(a->getSequence().getNotes()[0]->getNoteNumber(), 60, "undo");
+            expect(project.transposeClips({ aId }, -1));
+            expectEquals(a->getSequence().getNotes()[0]->getNoteNumber(), 59);
+
+            beginTest("Joining MIDI clips merges their notes into one clip");
+            joined = project.joinClips({ aId, bId }, error);
+            expectEquals((int) joined.size(), 1, error);
+            expectEquals((int) project.getArrangement().tracks[m].size(), 1);
+            const auto mc = project.getArrangement().tracks[m].front();
+            expectEquals(mc.start, (juce::int64) 0);
+            expectEquals(mc.length, 3 * bar);
+            if (auto* merged = project.getMidiClip(mc.id))
+            {
+                const auto& notes = merged->getSequence().getNotes();
+                expectEquals(notes.size(), 3);
+                if (notes.size() == 3)
+                {
+                    expectEquals(notes[2]->getNoteNumber(), 67);
+                    expectWithinAbsoluteError(notes[2]->getStartBeat().inBeats(), 2.0 * engine.beatsPerBar.load(), 0.001,
+                                              "the second clip's note keeps its place");
+                }
+            }
+            else
+                expect(false, "no merged clip");
+        }
+        dir.deleteRecursively();
+    }
+};
+
+class MidiInputRoutingTests : public juce::UnitTest
+{
+public:
+    MidiInputRoutingTests() : juce::UnitTest("MidiInputRouting", "8track") {}
+
+    static te::VirtualMidiInputDevice* trackInput(AudioEngine& engine, int track)
+    {
+        for (auto& d : engine.getTracktion().getDeviceManager().getMidiInDevices())
+            if (d->getName() == "8track Track " + juce::String(track + 1))
+                return dynamic_cast<te::VirtualMidiInputDevice*>(d.get());
+        return nullptr;
+    }
+
+    void runTest() override
+    {
+        AudioEngine engine;
+        juce::MessageManager::getInstance()->runDispatchLoopUntil(300);   // Tracktion's device scan makes the inputs
+        Project project(engine);
+        const int t = 2;
+
+        beginTest("Each MIDI track records from its own input, filtered to its channel");
+        auto* input = trackInput(engine, t);
+        expect(input != nullptr, "a virtual input for the track");
+        if (input == nullptr)
+            return;
+
+        engine.getTrack(t).midi = true;
+        engine.syncNow();
+        AudioEngine::MidiRouting routing;
+        routing.channel = 3;
+        engine.setMidiRouting(t, routing);
+        expect(input->isChannelAllowed(3) && !input->isChannelAllowed(4), "only channel 3 gets through");
+
+        bool targeted = false, physicalTargeted = false;
+        for (auto* instance : project.getEdit().getAllInputDevices())
+        {
+            const bool toTrack = instance->getTargets().contains(engine.getAudioTrack(t)->itemID);
+            if (&instance->getInputDevice() == input)
+                targeted = toTrack;
+            else if (instance->getInputDevice().getDeviceType() == te::InputDevice::physicalMidiDevice && toTrack)
+                physicalTargeted = true;
+        }
+        expect(targeted, "the track's input feeds it");
+        expect(!physicalTargeted, "hardware inputs reach it only through that input");
+
+        engine.setMidiRouting(t, {});
+        expect(input->isChannelAllowed(4), "any channel again");
+    }
+};
+
+class MidiAssignTests : public juce::UnitTest
+{
+public:
+    MidiAssignTests() : juce::UnitTest("MidiAssign", "8track") {}
+
+    void runTest() override
+    {
+        auto dir = juce::File::createTempFile("8track-assign");
+        dir.createDirectory();
+        AudioEngine engine;
+        {
+            Project project(engine);
+            juce::String error;
+
+            auto targets = engine.getAutomationTargets(3);
+            te::AutomatableParameter* lowCut = nullptr;
+            te::AutomatableParameter* pan = nullptr;
+            for (auto& target : targets)
+            {
+                if (target.name == "Low Cut") lowCut = target.param;
+                if (target.name == "Pan") pan = target.param;
+            }
+            expect(lowCut != nullptr && pan != nullptr);
+            if (lowCut == nullptr || pan == nullptr)
+                return;
+            const auto lowCutKey = AudioEngine::parameterKey(*lowCut), panKey = AudioEngine::parameterKey(*pan);
+
+            beginTest("An assigned controller moves its parameter");
+            expect(engine.findParameter(lowCutKey) == lowCut, "found by key on any track");
+            engine.assignMidi(lowCutKey, 1, 74);
+            engine.handleController(1, 74, 127);
+            expectWithinAbsoluteError(lowCut->getCurrentNormalisedValue(), 1.0f, 0.001f);
+            engine.handleController(1, 74, 0);
+            expectWithinAbsoluteError(lowCut->getCurrentNormalisedValue(), 0.0f, 0.001f);
+            engine.handleController(2, 74, 127);
+            expectWithinAbsoluteError(lowCut->getCurrentNormalisedValue(), 0.0f, 0.001f, "another channel does nothing");
+
+            beginTest("A controller moves one parameter, and a parameter follows one controller");
+            engine.assignMidi(panKey, 1, 74);   // takes CC 74 from the low cut
+            expect(!engine.getMidiAssignment(lowCutKey).has_value());
+            expectEquals(engine.getMidiAssignment(panKey)->controller, 74);
+            engine.assignMidi(panKey, 1, 10);   // moves pan to CC 10
+            expectEquals((int) engine.getMidiAssignments().size(), 1);
+            expectEquals(engine.getMidiAssignment(panKey)->controller, 10);
+
+            beginTest("Assigning is undoable");
+            expect(project.undo());
+            expectEquals(engine.getMidiAssignment(panKey)->controller, 74, "back on CC 74");
+
+            beginTest("Assignments are saved with the project");
+            engine.assignMidi(lowCutKey, 5, 20);
+            auto folder = dir.getChildFile("Assigned");
+            expect(project.saveAs(folder, error), error);
+            project.newProject();
+            expect(engine.getMidiAssignments().empty(), "a new project has none");
+            expect(project.load(folder, error), error);
+            expectEquals((int) engine.getMidiAssignments().size(), 2);
+            auto* reloaded = engine.findParameter(lowCutKey);
+            expect(reloaded != nullptr, "the key still finds the parameter");
+            engine.handleController(5, 20, 127);
+            if (reloaded != nullptr)
+                expectWithinAbsoluteError(reloaded->getCurrentNormalisedValue(), 1.0f, 0.001f);
+
+            beginTest("Removing an assignment");
+            engine.removeMidiAssignment(lowCutKey);
+            expect(!engine.getMidiAssignment(lowCutKey).has_value());
+            expectEquals((int) engine.getMidiAssignments().size(), 1);
+        }
+        dir.deleteRecursively();
+    }
+};
+
+class RecordingPreviewTests : public juce::UnitTest
+{
+public:
+    RecordingPreviewTests() : UnitTest("Recording waveform", "8track") {}
+
+    void runTest() override
+    {
+        beginTest("A metronome transient stays at its beat as later blocks arrive");
+        constexpr int beat = 24000, length = 49152, samplesPerPixel = 64;
+        juce::AudioBuffer<float> audio(1, length);
+        audio.clear();
+        for (int i = 0; i < 96; ++i)
+            audio.setSample(0, beat + i, i % 2 ? 1.0f : -1.0f);
+
+        juce::AudioFormatManager formats;
+        juce::AudioThumbnailCache cache(4);
+        AudioUIBehaviour behaviour;
+        for (int block : { 64, 127, 128, 512 })
+        {
+            auto thumb = behaviour.createAudioThumbnail(1024, formats, cache);
+            thumb->reset(1, 48000, 0);
+            for (int p = 0; p < length; p += block)
+            {
+                const int count = juce::jmin(block, length - p);
+                thumb->addBlock(p, audio, p, count);
+                expect(thumb->getNumSamplesFinished() <= p + count);
+            }
+            expectEquals(thumb->getNumSamplesFinished(), (juce::int64) length);
+            juce::Image image(juce::Image::ARGB, length / samplesPerPixel, 100, true);
+            juce::Graphics graphics(image);
+            graphics.setColour(juce::Colours::white);
+            thumb->drawChannels(graphics, image.getBounds(), 0, length / 48000.0, 1.0f);
+            int first = -1, last = -1;
+            for (int x = 0; x < image.getWidth(); ++x)
+                if (image.getPixelAt(x, 10).getAlpha() > 32)
+                {
+                    if (first < 0)
+                        first = x;
+                    last = x;
+                }
+            expectEquals(first, beat / samplesPerPixel);
+            expectEquals(last, (beat + 95) / samplesPerPixel);
+        }
+    }
+};
+
+class RecordingWriterTests : public juce::UnitTest
+{
+public:
+    RecordingWriterTests() : UnitTest("Recording writer", "8track") {}
+
+    void runTest() override
+    {
+        beginTest("Eight interleaved stereo takes preserve every sample and their live peaks");
+        AudioEngine engine;
+        auto& teEngine = engine.getTracktion();
+        auto& thread = teEngine.getWaveInputRecordingThread();
+        te::WaveInputRecordingThread::ScopedInitialiser recording(thread);
+        juce::WavAudioFormat wav;
+        std::array<std::unique_ptr<te::AudioFileWriter>, 8> writers;
+        std::array<te::RecordingThumbnailManager::Thumbnail::Ptr, 8> thumbs;
+        const int frames = 32768;
+        juce::AudioBuffer<float> audio(2, frames);
+        for (int sample = 0; sample < frames; ++sample)
+        {
+            const float value = (float) ((sample % 251) - 125) / 256.0f;
+            audio.setSample(0, sample, value);
+            audio.setSample(1, sample, -value);
+        }
+
+        for (size_t t = 0; t < writers.size(); ++t)
+        {
+            auto file = juce::File::createTempFile("take.wav");
+            writers[t] = std::make_unique<te::AudioFileWriter>(te::AudioFile(teEngine, file),
+                                                               &wav, 2, 48000, 24, juce::StringPairArray(), 0);
+            expect(writers[t]->isOpen());
+            thumbs[t] = teEngine.getRecordingThumbnailManager().getThumbnailFor(file);
+            thumbs[t]->reset(2, 48000);
+        }
+
+        for (int pos = 0; pos < frames; pos += 127)
+            for (size_t t = 0; t < writers.size(); ++t)
+                thread.addBlockToRecord(*writers[t], audio, pos, juce::jmin(127, frames - pos), thumbs[t]);
+
+        for (size_t t = 0; t < writers.size(); ++t)
+        {
+            thread.waitForWriterToFinish(*writers[t]);
+            writers[t]->closeForWriting();
+            expectEquals(thumbs[t]->thumb->getNumSamplesFinished(), (juce::int64) frames);
+            auto file = thumbs[t]->file;
+            std::unique_ptr<juce::AudioFormatReader> reader(wav.createReaderFor(file.createInputStream().release(), true));
+            expect(reader != nullptr);
+            if (reader != nullptr)
+            {
+                expectEquals(reader->lengthInSamples, (juce::int64) frames);
+                juce::AudioBuffer<float> result(2, frames);
+                expect(reader->read(&result, 0, frames, 0, true, true));
+                for (int ch = 0; ch < 2; ++ch)
+                    expect(std::equal(audio.getReadPointer(ch), audio.getReadPointer(ch) + frames,
+                                      result.getReadPointer(ch)), "WAV samples differ from input");
+            }
+            reader.reset();
+            file.deleteFile();
+        }
+    }
+};
+
+static RecordingWriterTests recordingWriterTests;
+static RecordingPreviewTests recordingPreviewTests;
+class SongwritingTests : public juce::UnitTest
+{
+public:
+    SongwritingTests() : UnitTest("Songwriting", "8track") {}
+
+    void runTest() override
+    {
+        auto dir = juce::File::createTempFile("songwriting");
+        dir.createDirectory();
+        {
+            AudioEngine engine;
+            Project project(engine);
+            const auto sr = (int) engine.getSampleRate();
+            juce::String error;
+            auto song = dir.getChildFile("Song");
+            beginTest("A fresh session is clean and tempo edits count before recording any clips");
+            juce::MessageManager::getInstance()->runDispatchLoopUntil(120);
+            expect(!project.isDirty());
+            engine.bpm = 96;
+            engine.syncNow();
+            expect(project.isDirty() && project.getArrangement().isEmpty());
+            beginTest("Save As preserves different recordings with the same name, including alternate takes");
+            expect(project.prepareFolder(error), error);
+            auto source = dir.getChildFile("sources");
+            source.createDirectory();
+            auto file1 = writeWav(source.getChildFile("vocal.wav"), sr, sr * 5, 0.25f);
+            auto file2 = writeWav(dir.getChildFile("vocal.wav"), sr, sr * 5, 0.75f);
+            song.getChildFile("Audio").createDirectory();
+            auto existing = writeWav(song.getChildFile("Audio/vocal.wav"), sr, sr, 0.5f);
+            auto time = [](double s) { return te::TimePosition::fromSeconds(s); };
+            auto* track = engine.getAudioTrack(0);
+            auto wave = track->insertWaveClip("vocal", file1, { { time(0), time(5) }, {} }, false);
+            wave->addTake(file1);
+            wave->addTake(file2);
+            engine.keepLastFullPass(*wave);
+            auto id = (juce::int64) wave->itemID.getRawID();
+            project.chooseTake(id, 0);
+            expect(project.saveAs(song, error), error);
+            wave = nullptr;
+            source.deleteRecursively();
+            file2.deleteFile();
+            expect(project.load(song, error), error);
+            auto find = [&]() { return project.getArrangement().findClip(id); };
+            expect(find() != nullptr);
+            if (!find()) return;
+            expectEquals(find()->takes.size(), 2);
+            expectWithinAbsoluteError(ClipOperationTests::sampleAt(existing, 0), 0.5f, 0.001f);
+            expectWithinAbsoluteError(ClipOperationTests::sampleAt(find()->file, 0), 0.25f, 0.001f);
+            project.chooseTake(id, 1);
+            expectWithinAbsoluteError(ClipOperationTests::sampleAt(find()->file, 0), 0.75f, 0.001f);
+            expect(project.undo());
+            expectWithinAbsoluteError(ClipOperationTests::sampleAt(find()->file, 0), 0.25f, 0.001f);
+
+            beginTest("Duplicate a named range with crossing clips, a rest, and track automation in one undo step");
+            project.addSection("Verse", {time(1), time(3)});
+            project.addSection("Chorus", {time(3), time(5)});
+            project.createMidiClip(1, sr, sr);
+            auto* param = engine.getAudioTrack(0)->getVolumePlugin()->volParam.get();
+            auto& curve = param->getCurve();
+            auto* um = &project.getEdit().getUndoManager();
+            curve.addPoint(time(1.5), 0.25f, 0, um);
+            curve.addPoint(time(2.5), 0.75f, 0, um);
+            auto& masterCurve = project.getEdit().getMasterVolumePlugin()->volParam->getCurve();
+            masterCurve.addPoint(time(1.5), 0.5f, 0, um);
+            masterCurve.addPoint(time(2.5), 0.125f, 0, um);
+            auto* sections = project.getEdit().getArrangerTrack();
+            project.duplicateSection(*dynamic_cast<te::ArrangerClip*>(sections->getClips().getFirst()));
+            expectEquals(sections->getClips().size(), 3);
+            int labelsAtExpectedPosition = 0;
+            for (auto* label : sections->getClips())
+            {
+                const auto start = engine.toSamples(label->getPosition().getStart());
+                if ((label->getName() == "Chorus" && start == sr * 5)
+                     || (label->getName() == "Verse" && (start == sr || start == sr * 3)))
+                    ++labelsAtExpectedPosition;
+            }
+            expectEquals(labelsAtExpectedPosition, 3);
+            const auto& lane = project.getArrangement().tracks[0];
+            expectEquals((int) lane.size(), 4);
+            if (lane.size() == 4)
+            {
+                expectEquals(lane[2].start, (juce::int64) sr * 3);
+                expectEquals(lane[2].sourceOffset, (juce::int64) sr);
+                expectEquals(lane[3].start, (juce::int64) sr * 5);
+            }
+            const auto& midi = project.getArrangement().tracks[1];
+            expectEquals((int) midi.size(), 2);
+            if (midi.size() == 2)
+                expectEquals(midi[1].end(), (juce::int64) sr * 4);
+            expectWithinAbsoluteError(masterCurve.getValueAt(time(4.5), 0), 0.125f, 0.001f);
+            expectWithinAbsoluteError(curve.getValueAt(time(3.5), 0), 0.25f, 0.001f);
+            expectWithinAbsoluteError(curve.getValueAt(time(4.5), 0), 0.75f, 0.001f);
+            expect(project.undo());
+            expectEquals(sections->getClips().size(), 2);
+            expectEquals((int) project.getArrangement().tracks[0].size(), 1);
+            expectEquals(curve.getNumPoints(), 2);
+            expect(project.save(error), error);
+            expect(project.load(song, error), error);
+            expectEquals(project.getEdit().getArrangerTrack()->getClips().getFirst()->getName(), juce::String("Verse"));
+        }
+        dir.deleteRecursively();
+        beginTest("Chord and lyric entries follow beats, copy with sections, and survive reopening");
+        {
+            AudioEngine engine;
+            Project project(engine);
+            using Entry = Project::SongEntry;
+            const auto beat = [](double value) { return te::BeatPosition::fromBeats(value); };
+            auto& tempo = project.getEdit().tempoSequence;
+            project.setSongNote(Entry::Chord, beat(0), "Am7");
+            project.setSongNote(Entry::Lyric, beat(1), "First line\nSecond line");
+            project.setSongNote(Entry::Chord, beat(4), "G/B");
+            expect(project.addSection("Verse", { tempo.toTime(beat(0)), tempo.toTime(beat(4)) }).wasOk());
+            auto* section = dynamic_cast<te::ArrangerClip*>(project.getEdit().getArrangerTrack()->getClips().getFirst());
+            expect(section != nullptr);
+            if (section != nullptr)
+                project.duplicateSection(*section);
+            auto chords = project.songNotes(Entry::Chord);
+            expectEquals((int) chords.size(), 3);
+            if (chords.size() == 3)
+            {
+                expectEquals(chords[1].text, juce::String("Am7"));
+                expectWithinAbsoluteError(chords[1].beat.inBeats(), 4.0, 1e-9);
+                expectWithinAbsoluteError(chords[2].beat.inBeats(), 8.0, 1e-9);
+            }
+            auto lyrics = project.songNotes(Entry::Lyric);
+            expectEquals((int) lyrics.size(), 2);
+            if (lyrics.size() == 2)
+                expectWithinAbsoluteError(lyrics[1].beat.inBeats(), 5.0, 1e-9);
+            expect(project.undo());
+            expectEquals((int) project.songNotes(Entry::Lyric).size(), 1);
+            expect(project.redo());
+            engine.bpm = 60;
+            engine.syncNow();
+            expectWithinAbsoluteError(tempo.toTime(project.songNotes(Entry::Lyric).front().beat).inSeconds(), 1.0, 1e-9);
+
+            auto destination = juce::File::createTempFile("8track-writing");
+            juce::String error;
+            expect(project.saveAs(destination, error), error);
+            expect(project.load(destination, error), error);
+            lyrics = project.songNotes(Entry::Lyric);
+            expectEquals((int) lyrics.size(), 2);
+            if (!lyrics.empty())
+                expectEquals(lyrics.front().text, juce::String("First line\nSecond line"));
+            project.setSongNote(Entry::Lyric, beat(1), {}, lyrics.front().entry);
+            expectEquals((int) project.songNotes(Entry::Lyric).size(), 1);
+            expect(project.undo());
+            expectEquals((int) project.songNotes(Entry::Lyric).size(), 2);
+            destination.deleteRecursively();
+        }
+
+        beginTest("A draft line drops at the lyric beat and stays in the draft");
+        {
+            AudioEngine engine;
+            Project project(engine);
+            using Entry = Project::SongEntry;
+            const auto beat = [](double value) { return te::BeatPosition::fromBeats(value); };
+            project.setLyricDraft(juce::String::fromUTF8("A draft line\r\n\r\nUnplaced déjà vu\rLast line\r\n"));
+            const auto draft = juce::String::fromUTF8("A draft line\n\nUnplaced déjà vu\nLast line\n");
+            expectEquals(project.getLyricDraft(), draft);
+            expect(project.isDirty());
+            expect(project.songNotes(Entry::Lyric).empty());
+
+            TimelineView view;
+            Ruler ruler(engine, project, view);
+            ruler.setSize(800, 160);
+            ruler.setSongwritingExpanded(true);
+            ruler.layoutLyrics(800, 2);
+            const auto& tempo = project.getEdit().tempoSequence;
+            const int x = juce::roundToInt(view.xFor(engine.toSamples(tempo.toTime(beat(4.18)))));
+            const int lyricY = Ruler::baseHeight + Ruler::chordHeight + 5;
+            const int chordY = Ruler::baseHeight + 5;
+            const juce::var line(new LyricLineDrag(project.getEdit().state, "A draft line"));
+            const juce::var stale(new LyricLineDrag(juce::ValueTree("EDIT"), "Wrong project"));
+            ruler.itemDropped({ line, nullptr, { x, chordY } });
+            ruler.itemDropped({ stale, nullptr, { x, lyricY } });
+            expect(project.songNotes(Entry::Lyric).empty());
+            ruler.itemDropped({ line, nullptr, { x, lyricY } });
+            const auto lyrics = project.songNotes(Entry::Lyric);
+            expectEquals(static_cast<int>(lyrics.size()), 1);
+            if (!lyrics.empty())
+            {
+                expect(lyrics.front().beat == beat(4));
+                expectEquals(lyrics.front().text, juce::String("A draft line"));
+            }
+            expectEquals(project.getLyricDraft(), draft);
+            expect(project.undo());
+            expect(project.songNotes(Entry::Lyric).empty());
+            expectEquals(project.getLyricDraft(), draft);
+            expect(project.redo());
+
+            beginTest("Timeline import follows beat and row order, and the draft exports and reopens");
+            project.setSongNote(Entry::Lyric, beat(1), "First on the timeline");
+            project.setSongNote(Entry::Chord, beat(2), "Am");
+            project.setSongNote(Entry::Lyric, beat(4), "Second at four");
+            expectEquals(project.timelineLyricText(), juce::String("First on the timeline\nA draft line\nSecond at four"));
+            const auto parent = juce::File::createTempFile("8track-lyric-draft");
+            const auto folder = parent.getChildFile("Song title");
+            juce::String error;
+            expect(project.saveAs(folder, error), error);
+            const auto sheet = parent.getChildFile("Lyrics.txt");
+            expect(sheet.replaceWithText(project.lyricSheetText(), false, false, "\n"));
+            expectEquals(sheet.loadFileAsString(), juce::String("Song title\n==========\n\n") + draft);
+            project.newProject();
+            expect(project.getLyricDraft().isEmpty());
+            expect(project.load(folder, error), error);
+            expectEquals(project.getLyricDraft(), draft);
+            expectEquals(project.timelineLyricText(), juce::String("First on the timeline\nA draft line\nSecond at four"));
+            parent.deleteRecursively();
+        }
+
+        beginTest("Lyrics keep beat precedence and preserve the order of lines sharing a beat");
+        {
+            AudioEngine engine;
+            Project project(engine);
+            using Entry = Project::SongEntry;
+            const auto beat = [](double value) { return te::BeatPosition::fromBeats(value); };
+            project.setSongNote(Entry::Lyric, beat(4), "Oldest at four");
+            project.setSongNote(Entry::Chord, beat(4), "G");
+            project.setSongNote(Entry::Lyric, beat(1), "Earlier");
+            project.setSongNote(Entry::Lyric, beat(4), "Second at four");
+            project.setSongNote(Entry::Lyric, beat(7), "Moved");
+            auto notes = [&] { return project.songNotes(Entry::Lyric); };
+            auto texts = [&]
+            {
+                juce::StringArray lines;
+                for (const auto& note : notes())
+                    lines.add(note.text);
+                return lines;
+            };
+            auto initial = notes();
+            expectEquals(static_cast<int>(initial.size()), 4);
+            if (initial.size() == 4)
+            {
+                const auto oldest = initial[1].entry, moved = initial[3].entry;
+                expect(!project.adjacentLyric(initial[0].entry, 1).isValid());
+                project.moveLyric(moved, beat(4));
+                expect(notes().back().beat == beat(4));
+                expect(texts() == juce::StringArray({ "Earlier", "Oldest at four", "Second at four", "Moved" }));
+                expect(project.undo());
+                expect(notes().back().beat == beat(7));
+                expect(project.redo());
+
+                project.reorderLyric(moved, -1);
+                project.reorderLyric(oldest, 1);
+                expect(texts() == juce::StringArray({ "Earlier", "Moved", "Oldest at four", "Second at four" }));
+                project.mergeLyric(oldest, -1);
+                expect(texts() == juce::StringArray({ "Earlier", "Moved Oldest at four", "Second at four" }));
+                expect(project.undo());
+                expect(texts() == juce::StringArray({ "Earlier", "Moved", "Oldest at four", "Second at four" }));
+                project.mergeLyric(moved, 1);
+                expect(texts() == juce::StringArray({ "Earlier", "Moved Oldest at four", "Second at four" }));
+
+                auto destination = juce::File::createTempFile("8track-lyric-order");
+                juce::String error;
+                expect(project.saveAs(destination, error), error);
+                expect(project.load(destination, error), error);
+                expect(texts() == juce::StringArray({ "Earlier", "Moved Oldest at four", "Second at four" }));
+                auto restored = notes();
+                if (restored.size() == 3)
+                {
+                    project.setSongNote(Entry::Lyric, restored[2].beat, "Updated", restored[2].entry);
+                    expect(texts() == juce::StringArray({ "Earlier", "Moved Oldest at four", "Updated" }));
+                }
+                destination.deleteRecursively();
+            }
+        }
+
+        beginTest("Place chord notes into MIDI clips and undo an approved audio-track conversion");
+        {
+            AudioEngine engine;
+            Project project(engine);
+            auto& tempo = project.getEdit().tempoSequence;
+            const auto beat = [](double value) { return te::BeatPosition::fromBeats(value); };
+            using Entry = Project::SongEntry;
+            project.setSongNote(Entry::Chord, beat(0), "G/B");
+            project.setSongNote(Entry::Chord, beat(2), "Fmaj7");
+            expectWithinAbsoluteError(project.chordDuration(beat(0)).inBeats(), 2.0, 0.00001);
+            expectWithinAbsoluteError(project.chordDuration(beat(2)).inBeats(), 4.0, 0.00001);
+
+            const te::TimeRange range(tempo.toTime(beat(4)), tempo.toTime(beat(6)));
+            expect(project.placeChord(0, range, "G/B", false) == nullptr);
+            expect(!engine.getTrack(0).midi.load());
+            expect(project.getArrangement().tracks[0].empty());
+
+            auto* chord = project.placeChord(0, range, "G/B", true);
+            expect(chord != nullptr);
+            expect(engine.getTrack(0).midi.load());
+            if (chord != nullptr)
+            {
+                expectEquals(chord->getName(), juce::String("G/B"));
+                expect(chord->getPosition().time == range);
+                expectEquals(chord->getSequence().getNumNotes(), 4);
+                juce::Array<int> pitches;
+                for (auto* note : chord->getSequence().getNotes())
+                {
+                    pitches.add(note->getNoteNumber());
+                    expectWithinAbsoluteError(note->getStartBeat().inBeats(), 0.0, 0.00001);
+                    expectWithinAbsoluteError(note->getLengthBeats().inBeats(), 2.0, 0.00001);
+                }
+                expect(pitches == juce::Array<int>({ 59, 67, 71, 74 }));
+            }
+            expect(!project.canPlaceChord(0, range));
+            expect(project.placeChord(0, range, "Fmaj7", false) == nullptr);
+            expect(project.undo());
+            expect(!engine.getTrack(0).midi.load());
+            expect(project.getArrangement().tracks[0].empty());
+            expect(project.redo());
+            expect(engine.getTrack(0).midi.load());
+            expectEquals((int) project.getArrangement().tracks[0].size(), 1);
+            const te::TimeRange following(tempo.toTime(beat(6)), tempo.toTime(beat(10)));
+            expect(project.placeChord(0, following, "Fmaj7", false) != nullptr);
+            expectEquals((int) project.getArrangement().tracks[0].size(), 2);
+            expect(project.placeChord(1, following, "unsupported", true) == nullptr);
+            expect(!engine.getTrack(1).midi.load());
+        }
+
+        beginTest("Recover a played impulse on the selected armed track during playback");
+        AudioEngine engine;
+        auto& dm = engine.getTracktion().getDeviceManager();
+        auto& io = dm.getHostedAudioDeviceInterface();
+        te::HostedAudioDeviceInterface::Parameters params;
+        params.sampleRate = 48000;
+        params.blockSize = 128;
+        io.initialise(params);
+        io.prepareToPlay(params.sampleRate, params.blockSize);
+        dm.dispatchPendingUpdates();
+        for (auto* input : dm.getWaveInputDevices())
+            input->setEnabled(true);
+        dm.dispatchPendingUpdates();
+        Project project(engine);
+        engine.getTrack(0).armed = true;
+        engine.getTrack(1).armed = true;
+        engine.syncNow();
+        engine.setPosition(48000 * 4);
+        engine.play();
+        juce::AudioBuffer<float> block(2, params.blockSize);
+        juce::MidiBuffer notes;
+        juce::int64 impulsePosition = 0;
+        for (int i = 0; i < 240; ++i)
+        {
+            block.clear();
+            if (i == 120)
+            {
+                auto* ctx = project.getEdit().getCurrentPlaybackContext();
+                impulsePosition = engine.toSamples(ctx->globalStreamTimeToEditTime(dm.getCurrentStreamTime()));
+                block.setSample(0, 0, 0.75f);
+            }
+            io.processBlock(block, notes);
+        }
+        expect(project.canRecall(0));
+        expect(!project.canRecall(2));
+        juce::String error;
+        expect(project.recall(0, error), error);
+        expect(project.getArrangement().tracks[1].empty());
+        const auto& clips = project.getArrangement().tracks[0];
+        expectEquals((int) clips.size(), 1);
+        if (clips.size() == 1)
+        {
+            auto clip = clips.front();
+            juce::WavAudioFormat wav;
+            std::unique_ptr<juce::AudioFormatReader> reader(wav.createReaderFor(clip.file.createInputStream().release(), true));
+            expect(reader != nullptr);
+            if (reader)
+            {
+                juce::AudioBuffer<float> data(1, (int) reader->lengthInSamples);
+                reader->read(&data, 0, data.getNumSamples(), 0, true, false);
+                const float* samples = data.getReadPointer(0);
+                auto peak = std::max_element(samples, samples + data.getNumSamples());
+                expectWithinAbsoluteError(*peak, 0.75f, 0.001f);
+                expectWithinAbsoluteError(clip.start - clip.sourceOffset + (peak - samples), impulsePosition, (juce::int64) 1);
+            }
+            expect(project.undo());
+            expect(project.getArrangement().tracks[0].empty());
+        }
+        engine.stop();
+
+        beginTest("Recover buffered MIDI notes into the armed MIDI track and undo");
+        engine.getTrack(2).midi = true;
+        engine.getTrack(2).armed = true;
+        engine.syncNow();
+        auto id = engine.getAudioTrack(2)->itemID;
+        te::MidiInputDevice* midiInput = nullptr;
+        for (auto* instance : project.getEdit().getAllInputDevices())
+            if (instance->isRecordingActive(id))
+                midiInput = dynamic_cast<te::MidiInputDevice*>(&instance->getInputDevice());
+        expect(midiInput != nullptr);
+        if (midiInput)
+        {
+            auto on = juce::MidiMessage::noteOn(1, 64, (juce::uint8) 100);
+            auto off = juce::MidiMessage::noteOff(1, 64);
+            midiInput->handleIncomingMessage(on);
+            juce::Thread::sleep(5);
+            midiInput->handleIncomingMessage(off);
+            expect(project.canRecall(2));
+            error.clear();
+            expect(project.recall(2, error), error);
+            auto& midiLane = project.getArrangement().tracks[2];
+            expectEquals((int) midiLane.size(), 1);
+            if (!midiLane.empty())
+            {
+                auto* recovered = project.getMidiClip(midiLane.front().id);
+                expect(recovered != nullptr && recovered->getSequence().getNumNotes() == 1);
+                expect(project.undo());
+                expect(project.getArrangement().tracks[2].empty());
+            }
+        }
+        beginTest("Chord preview plays on the device only when switched on");
+        expect(ChordPreview::notesFor("Fmaj7") == juce::Array<int>({ 65, 69, 72, 76 }));
+        expect(ChordPreview::notesFor("G/B") == juce::Array<int>({ 59, 67, 71, 74 }));
+        expect(ChordPreview::notesFor("unsupported").isEmpty());
+        engine.previewChord("Am7");
+        block.clear();
+        io.processBlock(block, notes);
+        expectWithinAbsoluteError(block.getMagnitude(0, params.blockSize), 0.0f, 1e-6f);
+        engine.setChordPreviewEnabled(true);
+        engine.previewChord("Am7");
+        block.clear();
+        io.processBlock(block, notes);
+        expect(block.getMagnitude(0, params.blockSize) > 0.001f);
+        engine.setChordPreviewEnabled(false);
+        block.clear();
+        io.processBlock(block, notes);
+        expectWithinAbsoluteError(block.getMagnitude(0, params.blockSize), 0.0f, 1e-6f);
+        project.getFolder().deleteRecursively();
+    }
+};
+
+class MetronomeModeTests : public juce::UnitTest
+{
+public:
+    MetronomeModeTests() : UnitTest("Metronome modes", "8track") {}
+
+    void runTest() override
+    {
+        beginTest("A playback count-in is audible with record-only enabled, then the song starts without click");
+        AudioEngine engine;
+        auto& devices = engine.getTracktion().getDeviceManager();
+        auto& io = devices.getHostedAudioDeviceInterface();
+        te::HostedAudioDeviceInterface::Parameters settings;
+        settings.sampleRate = 48000;
+        settings.blockSize = 128;
+        io.initialise(settings);
+        io.prepareToPlay(settings.sampleRate, settings.blockSize);
+        devices.dispatchPendingUpdates();
+        Project project(engine);
+        auto dir = juce::File::createTempFile("8track-metronome");
+        dir.createDirectory();
+        auto source = writeWav(dir.getChildFile("guide.wav"), settings.sampleRate, 5 * 48000, 0.125f);
+        juce::String error;
+        expect(project.importAudio(source, 0, 0, error), error);
+        engine.bpm = 120;
+        engine.metronomeOn = true;
+        engine.metronomeRecordOnly = true;
+        engine.countInOn = false;
+        engine.playbackCountInOn = true;
+        engine.syncNow();
+        const auto start = (juce::int64) (3 * settings.sampleRate);
+        juce::MessageManager::getInstance()->runDispatchLoopUntil(250);
+        engine.setPosition(start);
+        engine.play();
+        expectWithinAbsoluteError(project.getEdit().getTransport().getPlaybackCountInEndSeconds(), 3.0, 1e-8);
+
+        juce::AudioBuffer<float> block(2, settings.blockSize);
+        juce::MidiBuffer midi;
+        int clicks = 0, silent = 0, song = 0;
+        float peakAfter = 0;
+        bool clickActive = false;
+        for (int i = 0; i < 920; ++i)
+        {
+            if (i % 8 == 0)
+                juce::Thread::sleep(2);
+            block.clear();
+            io.processBlock(block, midi);
+            auto* context = project.getEdit().getCurrentPlaybackContext();
+            const double time = context->getUnloopedPosition().inSeconds();
+            const auto magnitude = block.getMagnitude(0, settings.blockSize);
+            if (time < 2.99)
+            {
+                const bool active = magnitude > 0.0001f;
+                if (active && !clickActive) ++clicks;
+                clickActive = active;
+                if (magnitude < 1e-6f) ++silent;
+            }
+            else if (time > 3.05)
+            {
+                peakAfter = juce::jmax(peakAfter, magnitude);
+                if (block.getRMSLevel(0, 0, settings.blockSize) > 0.05f) ++song;
+            }
+        }
+        expect(clicks >= 4 && silent > 100, "count-in clicks and silent gaps");
+        expect(song > 10, "song audio after the count-in");
+        expectWithinAbsoluteError(peakAfter, 0.125f, 0.001f, "no metronome mixed into the playing song");
+        engine.stop();
+        expectEquals(engine.getPosition(), start);
+
+        beginTest("Playback count-in runs once before a loop starting at bar one");
+        engine.getTrack(0).mute = true;
+        engine.metronomeOn = false;
+        engine.punchIn = 0;
+        engine.punchOut = 48000;
+        engine.setRangeMode(AudioEngine::RangeMode::Loop);
+        engine.syncNow();
+        engine.setPosition(0);
+        engine.play();
+        bool heardCountIn = false;
+        double earliest = 2.0;
+        float peakDuringLoop = 0;
+        for (int i = 0; i < 1450; ++i)
+        {
+            block.clear();
+            io.processBlock(block, midi);
+            const auto magnitude = block.getMagnitude(0, settings.blockSize);
+            auto* context = project.getEdit().getCurrentPlaybackContext();
+            const auto elapsed = context->getUnloopedPosition().inSeconds();
+            earliest = juce::jmin(earliest, elapsed);
+            if (elapsed < 0)
+                heardCountIn = heardCountIn || magnitude > 0.001f;
+            if (elapsed > 0.05)
+                peakDuringLoop = juce::jmax(peakDuringLoop, magnitude);
+        }
+        expect(heardCountIn, "first timeline position " + juce::String(earliest));
+        expectWithinAbsoluteError(peakDuringLoop, 0.0f, 1e-6f);
+        expect(project.getEdit().getCurrentPlaybackContext()->getUnloopedPosition().inSeconds() > 1.0);
+        engine.stop();
+
+        beginTest("Count-in and record-only preferences are recalled per project");
+        auto saved = dir.getChildFile("Song");
+        expect(project.saveAs(saved, error), error);
+        project.newProject();
+        expect(!engine.playbackCountInOn.load());
+        expect(project.load(saved, error), error);
+        expect(!engine.countInOn.load());
+        expect(engine.playbackCountInOn.load());
+        expect(engine.metronomeRecordOnly.load());
+        dir.deleteRecursively();
+    }
+};
+
+static MetronomeModeTests metronomeModeTests;
+class LyricLayoutTests : public juce::UnitTest
+{
+public:
+    LyricLayoutTests() : UnitTest("Lyric rows", "8track") {}
+
+    void runTest() override
+    {
+        beginTest("Later lyrics go below earlier overlapping lyrics and reuse rows when there is room");
+        expect(lyricRowsFor({ { 0, 45 }, { 20, 60 }, { 40, 90 }, { 60, 76 }, { 100, 120 } })
+               == std::vector<int>({ 0, 1, 2, 3, 0 }));
+        expect(lyricRowsFor({ { 0, 20 }, { 20, 40 }, { 40, 60 } }) == std::vector<int>({ 0, 0, 0 }));
+
+        beginTest("An inserted earlier lyric takes the top row while an edited short line can fit beside it");
+        expect(lyricRowsFor({ { 40, 100 }, { 70, 130 } }) == std::vector<int>({ 0, 1 }));
+        expect(lyricRowsFor({ { 20, 85 }, { 40, 100 }, { 70, 130 } }) == std::vector<int>({ 0, 1, 2 }));
+        expect(lyricRowsFor({ { 20, 40 }, { 40, 100 }, { 70, 130 } }) == std::vector<int>({ 0, 0, 1 }));
+    }
+};
+
+static LyricLayoutTests lyricLayoutTests;
+class PluginWindowRequestTests : public juce::UnitTest
+{
+public:
+    PluginWindowRequestTests() : UnitTest("Plugin windows", "8track") {}
+
+    void runTest() override
+    {
+        struct Windows final : te::UIBehaviour
+        {
+            std::unique_ptr<juce::Component> createPluginWindow(te::PluginWindowState&) override
+            {
+                ++created;
+                return std::make_unique<juce::Component>();
+            }
+
+            int created = 0;
+        };
+
+        auto ui = std::make_unique<Windows>();
+        auto* windows = ui.get();
+        AudioEngine engine(std::move(ui));
+        Project project(engine);
+        auto* plugin = engine.getAudioTrack(0)->getVolumePlugin();
+        auto& state = *plugin->windowState;
+        auto pump = [] { juce::MessageManager::getInstance()->runDispatchLoopUntil(150); };
+
+        beginTest("An explicit open waits out a modal and opens exactly one window");
+        juce::Component modal;
+        modal.enterModalState(false);
+        plugin->showWindowExplicitly();
+        plugin->showWindowExplicitly();
+        pump();
+        expectEquals(windows->created, 0);
+        modal.exitModalState(0);
+        pump();
+        expect(state.isWindowShowing());
+        expectEquals(windows->created, 1);
+        plugin->showWindowExplicitly();
+        expectEquals(windows->created, 1);
+        state.closeWindowExplicitly();
+        expect(!state.isWindowShowing());
+
+        beginTest("Closing a deferred window cancels the pending open");
+        modal.enterModalState(false);
+        plugin->showWindowExplicitly();
+        state.closeWindowExplicitly();
+        modal.exitModalState(0);
+        pump();
+        expect(!state.isWindowShowing());
+        expectEquals(windows->created, 1);
+    }
+};
+
+static PluginWindowRequestTests pluginWindowRequestTests;
+class TunerTests : public juce::UnitTest
+{
+public:
+    TunerTests() : UnitTest("Tuner", "8track") {}
+
+    void runTest() override
+    {
+        beginTest("The pitch detector identifies guitar and bass fundamentals, including harmonic-rich notes");
+        constexpr double rate = 12000;
+        std::array<float, TunerCapture::analysisSize> wave {};
+        for (double frequency : { 30.868, 41.203, 82.407, 440.0, 659.255, 1318.51 })
+        {
+            for (size_t i = 0; i < wave.size(); ++i)
+            {
+                const double phase = juce::MathConstants<double>::twoPi * frequency * static_cast<double>(i) / rate;
+                wave[i] = static_cast<float>(0.15 * std::sin(phase) + 0.25 * std::sin(2 * phase));
+            }
+            const auto detected = TunerCapture::frequencyOf(wave, rate);
+            expect(detected > 0);
+            if (detected > 0)
+                expectWithinAbsoluteError(1200.0 * std::log2(detected / frequency), 0.0, 3.0);
+        }
+
+        wave.fill(0.0f);
+        expectWithinAbsoluteError(TunerCapture::frequencyOf(wave, rate), 0.0, 1e-9);
+        juce::Random random(17);
+        for (auto& sample : wave)
+            sample = random.nextFloat() - 0.5f;
+        expectWithinAbsoluteError(TunerCapture::frequencyOf(wave, rate), 0.0, 1e-9);
+
+        beginTest("The tuner picks up armed hardware inputs and leaves device output silent");
+        AudioEngine engine;
+        auto& dm = engine.getTracktion().getDeviceManager();
+        auto& io = dm.getHostedAudioDeviceInterface();
+        te::HostedAudioDeviceInterface::Parameters settings;
+        settings.sampleRate = 48000;
+        settings.blockSize = 128;
+        io.initialise(settings);
+        io.prepareToPlay(settings.sampleRate, settings.blockSize);
+        dm.dispatchPendingUpdates();
+        dm.setAllWaveInputsToNumChannels(1);
+        for (auto* input : dm.getWaveInputDevices())
+            input->setEnabled(true);
+        dm.dispatchPendingUpdates();
+
+        Project project(engine);
+        engine.getTrack(0).inputChannel = 0;
+        engine.getTrack(1).inputChannel = 1;
+        engine.getTrack(1).armed = true;
+        engine.syncNow();
+        const auto inputs = engine.getArmedInputChannels();
+        expectEquals(static_cast<int>(inputs.size()), 1);
+        if (inputs.empty())
+            return;
+        expectEquals(inputs.front().channel, 1);
+        TunerCapture tuner(dm);
+        TunerCapture::Channels channels;
+        channels.fill(-1);
+        channels.front() = inputs.front().channel;
+        tuner.setChannels(channels);
+
+        juce::AudioBuffer<float> block(2, settings.blockSize);
+        juce::MidiBuffer midi;
+        auto feedInputs = [&]
+        {
+            float peak = 0;
+            for (int i = 0; i < 80; ++i)
+            {
+                for (int s = 0; s < settings.blockSize; ++s)
+                {
+                    const double phase = juce::MathConstants<double>::twoPi * (i * settings.blockSize + s) / settings.sampleRate;
+                    block.setSample(0, s, static_cast<float>(0.7 * std::sin(440 * phase)));
+                    block.setSample(1, s, static_cast<float>(0.15 * std::sin(110 * phase)));
+                }
+                io.processBlock(block, midi);
+                peak = juce::jmax(peak, block.getMagnitude(0, settings.blockSize));
+            }
+            return peak;
+        };
+        expectWithinAbsoluteError(feedInputs(), 0.0f, 1e-7f);
+        const auto reading = tuner.readPitch();
+        expect(reading.has_value());
+        if (reading)
+        {
+            expectEquals(reading->channel, 1);
+            expectWithinAbsoluteError(reading->frequency, 110.0, 0.1);
+        }
+
+        engine.getTrack(0).armed = true;
+        expectEquals(static_cast<int>(engine.getArmedInputChannels().size()), 2);
+        channels[0] = 0;
+        channels[1] = 1;
+        tuner.setChannels(channels);
+        expectWithinAbsoluteError(feedInputs(), 0.0f, 1e-7f);
+        const auto strongest = tuner.readPitch();
+        expect(strongest.has_value());
+        if (strongest)
+        {
+            expectEquals(strongest->channel, 0);
+            expectWithinAbsoluteError(strongest->frequency, 440.0, 1.0);
+        }
+
+        engine.getTrack(0).armed = false;
+        engine.getTrack(1).armed = false;
+        expect(engine.getArmedInputChannels().empty());
+        channels.fill(-1);
+        tuner.setChannels(channels);
+        expect(!tuner.readPitch());
+    }
+};
+
+static TunerTests tunerTests;
+class PianoRollTests : public juce::UnitTest
+{
+public:
+    PianoRollTests() : UnitTest("Piano roll", "8track") {}
+
+    void runTest() override
+    {
+        beginTest("Right-drag selects a group, and paste preserves its note data across clips");
+        AudioEngine engine;
+        Project project(engine);
+        using te::BeatPosition;
+        const auto beat = [](double value) { return BeatPosition::fromBeats(value); };
+        const auto length = te::BeatDuration::fromBeats(0.25);
+        auto& tempo = project.getEdit().tempoSequence;
+        auto sample = [&](double n) { return engine.toSamples(tempo.toTime(beat(n))); };
+        engine.setTrackMidi(0, true);
+        auto* source = project.createMidiClip(0, 0, sample(8));
+        auto* destination = project.createMidiClip(0, sample(8), sample(8));
+        expect(source != nullptr && destination != nullptr);
+        if (source == nullptr || destination == nullptr)
+            return;
+
+        auto* first = source->getSequence().addNote(60, beat(0.31), length, 73, 2, nullptr);
+        first->setNoteOffVelocity(31, nullptr);
+        source->getSequence().addNote(64, beat(0.68), length, 108, 0, nullptr);
+        source->getSequence().addNote(68, beat(5), length, 110, 0, nullptr);
+
+        PianoRoll roll(engine, project);
+        constexpr int width = 980, height = 406;
+        roll.setSize(width, height);
+        roll.setVisible(true);
+        const auto clipID = [](const auto& clip) { return static_cast<juce::int64>(clip.itemID.getRawID()); };
+        roll.setClip(clipID(*source));
+
+        const auto pointAt = [](double n, float y)
+        {
+            return juce::Point<float>(PianoRoll::kKeyboardWidth + static_cast<float>(n) * (width - PianoRoll::kKeyboardWidth) / 8.0f, y);
+        };
+        const int rows = (height - PianoRoll::kHeaderHeight - PianoRoll::kExpressionHeight) / PianoRoll::kRowHeight;
+        const auto pitches = source->getSequence().getNoteNumberRange();
+        const int top = (pitches.getStart() + pitches.getEnd()) / 2 + rows / 2;
+        const auto y = [top](int pitch) { return static_cast<float>(PianoRoll::kHeaderHeight + (top - pitch) * PianoRoll::kRowHeight + 4); };
+        const auto now = juce::Time::getCurrentTime();
+        auto mouse = [&](auto position, auto origin, int buttons, bool dragged = false)
+        {
+            return juce::MouseEvent(juce::Desktop::getInstance().getMainMouseSource(), position, juce::ModifierKeys(buttons),
+                                   0, 0, 0, 0, 0, &roll, &roll, now, origin, now, 1, dragged);
+        };
+        const auto a = pointAt(0.1, y(65)), b = pointAt(1.6, y(59));
+        roll.mouseDown(mouse(a, a, juce::ModifierKeys::rightButtonModifier));
+        roll.mouseDrag(mouse(b, a, juce::ModifierKeys::rightButtonModifier, true));
+        roll.mouseUp(mouse(b, a, 0, true));
+        expect(roll.hasSelectedNotes());
+        const juce::ModifierKeys command(juce::ModifierKeys::commandModifier);
+        roll.keyPressed(juce::KeyPress('C', command, 'c'));
+        roll.setClip(clipID(*destination));
+        engine.setPosition(sample(10));
+        roll.keyPressed(juce::KeyPress('V', command, 'v'));
+
+        auto& notes = destination->getSequence();
+        expectEquals(notes.getNumNotes(), 2);
+        if (notes.getNumNotes() != 2)
+            return;
+        expectWithinAbsoluteError(notes.getNote(0)->getStartBeat().inBeats(), 2.0, 1e-6);
+        expectWithinAbsoluteError(notes.getNote(1)->getStartBeat().inBeats(), 2.37, 1e-6);
+        expectEquals(notes.getNote(0)->getNoteNumber(), 60);
+        expectEquals(notes.getNote(1)->getNoteNumber(), 64);
+        expectEquals(notes.getNote(0)->getNoteOffVelocity(), 31);
+        expectEquals(notes.getNote(1)->getVelocity(), 108);
+
+        beginTest("Quantize snaps selected starts to the chosen grid without changing duration");
+        juce::ComboBox* grid = nullptr;
+        juce::ComboBox* expression = nullptr;
+        for (auto* child : roll.getChildren())
+            if (auto* box = dynamic_cast<juce::ComboBox*>(child))
+            {
+                if (box->getItemText(0) == "1/2") grid = box;
+                else if (box->getItemText(0) == "Velocity") expression = box;
+            }
+        expect(grid != nullptr && expression != nullptr);
+        if (grid == nullptr || expression == nullptr)
+            return;
+        for (const int denominator : { 2, 4, 8, 16, 32 })
+            expect(grid->indexOfItemId(denominator) >= 0);
+        grid->setSelectedId(8, juce::dontSendNotification);
+        roll.keyPressed(juce::KeyPress('Q', {}, 'q'));
+        expectWithinAbsoluteError(notes.getNote(1)->getStartBeat().inBeats(), 2.5, 1e-6);
+        expectWithinAbsoluteError(notes.getNote(1)->getLengthBeats().inBeats(), length.inBeats(), 1e-6);
+        expect(project.undo());
+        expectWithinAbsoluteError(notes.getNote(1)->getStartBeat().inBeats(), 2.37, 1e-6);
+
+        beginTest("Dragging a velocity bar changes the selected notes by the same amount");
+        auto valueY = [](int value)
+        {
+            return height - 6 - static_cast<float>(value) * (PianoRoll::kExpressionHeight - 12) / 127;
+        };
+        const auto velocity = pointAt(2, valueY(73)), louder = velocity.translated(0, -5);
+        roll.mouseDown(mouse(velocity, velocity, juce::ModifierKeys::leftButtonModifier));
+        roll.mouseDrag(mouse(louder, velocity, juce::ModifierKeys::leftButtonModifier, true));
+        roll.mouseUp(mouse(louder, velocity, 0, true));
+        expectEquals(notes.getNote(0)->getVelocity(), 83);
+        expectEquals(notes.getNote(1)->getVelocity(), 118);
+        expect(project.undo());
+        expectEquals(notes.getNote(0)->getVelocity(), 73);
+
+        beginTest("CC points can be added, moved, and removed with undo");
+        expression->setSelectedId(66, juce::dontSendNotification); // CC 64, sustain
+        const auto controller = pointAt(1.01, valueY(64)), shifted = pointAt(1.51, valueY(95));
+        roll.mouseDown(mouse(controller, controller, juce::ModifierKeys::leftButtonModifier));
+        roll.mouseDrag(mouse(shifted, controller, juce::ModifierKeys::leftButtonModifier, true));
+        roll.mouseUp(mouse(shifted, controller, 0, true));
+        auto* cc = notes.getControllerEventAt(beat(1.5), 64);
+        expect(cc != nullptr);
+        if (cc != nullptr)
+        {
+            expect(cc->getBeatPosition() == beat(1.5));
+            expectEquals(cc->getControllerValue() >> 7, 95);
+        }
+        roll.mouseDown(mouse(shifted, shifted, juce::ModifierKeys::rightButtonModifier));
+        roll.mouseUp(mouse(shifted, shifted, 0));
+        expectEquals(notes.getNumControllerEvents(), 0);
+        expect(project.undo());
+        expectEquals(notes.getNumControllerEvents(), 1);
+
+        beginTest("Piano roll arrows move selected notes without changing spacing");
+        roll.keyPressed(juce::KeyPress('A', command, 0));
+        expect(roll.keyPressed(juce::KeyPress(juce::KeyPress::rightKey, {}, 0)));
+        expectWithinAbsoluteError(notes.getNote(0)->getStartBeat().inBeats(), 2.5, 1e-6);
+        expectWithinAbsoluteError(notes.getNote(1)->getStartBeat().inBeats(), 2.87, 1e-6);
+        expect(roll.keyPressed(juce::KeyPress(juce::KeyPress::upKey, juce::ModifierKeys::shiftModifier, 0)));
+        expectEquals(notes.getNote(0)->getNoteNumber(), 72);
+        expectEquals(notes.getNote(1)->getNoteNumber(), 76);
+        expect(project.undo());
+        expect(project.undo());
+
+        beginTest("Piano roll duplicate places a copy after the selection and is undoable");
+        expect(roll.keyPressed(juce::KeyPress('D', command, 0)));
+        expectEquals(notes.getNumNotes(), 4);
+        if (notes.getNumNotes() == 4)
+        {
+            expectWithinAbsoluteError(notes.getNote(2)->getStartBeat().inBeats(), 2.62, 1e-6);
+            expectWithinAbsoluteError(notes.getNote(3)->getStartBeat().inBeats(), 2.99, 1e-6);
+            expectEquals(notes.getNote(2)->getNoteNumber(), 60);
+            expectEquals(notes.getNote(3)->getVelocity(), 108);
+        }
+        expect(project.undo());
+        expectEquals(notes.getNumNotes(), 2);
+    }
+};
+
+class ShortcutTests : public juce::UnitTest
+{
+public:
+    ShortcutTests() : UnitTest("Keyboard shortcuts", "8track") {}
+
+    void runTest() override
+    {
+        using namespace Shortcuts;
+        beginTest("Identical keys dispatch according to focus and text input keeps its keys");
+        const auto key = [](int code, int flags = 0) { return juce::KeyPress(code, flags, 0); };
+        const auto verify = [&](Context context, const juce::KeyPress& k, Command command)
+        {
+            const auto* binding = Shortcuts::find(context, k);
+            expect(binding != nullptr && binding->context == context && binding->command == command);
+        };
+        verify(Context::Arrangement, key(juce::KeyPress::leftKey), cmdPrevious);
+        verify(Context::PianoRoll, key(juce::KeyPress::leftKey), cmdPrevious);
+        verify(Context::Songwriting, key(juce::KeyPress::leftKey), cmdPrevious);
+        verify(Context::PianoRoll, key('d', juce::ModifierKeys::commandModifier), cmdDuplicate);
+        verify(Context::Songwriting, key(juce::KeyPress::returnKey), cmdEditSongNote);
+        expect(Shortcuts::find(Context::PianoRoll, key('S')) == nullptr);
+        expect(Shortcuts::find(Context::Mixer, key(juce::KeyPress::backspaceKey)) == nullptr);
+        expect(Shortcuts::find(Context::Text, key(juce::KeyPress::spaceKey)) == nullptr);
+        expect(Shortcuts::find(Context::Text, key('Z', juce::ModifierKeys::commandModifier)) == nullptr);
+        expect(Shortcuts::find(Context::Arrangement, key('S', juce::ModifierKeys::altModifier)) == nullptr);
+        const auto* help = Shortcuts::find(Context::PianoRoll, key('/', juce::ModifierKeys::commandModifier));
+        expect(help != nullptr && help->command == cmdShowShortcuts);
+        const auto* tuner = Shortcuts::find(Context::PianoRoll, key('t'));
+        expect(tuner != nullptr && tuner->command == cmdShowTuner);
+        expect(Shortcuts::find(Context::Text, key('t')) == nullptr);
+
+        beginTest("The songwriting cursor deletes only the selected entry and clears the target on navigation");
+        AudioEngine engine;
+        Project project(engine);
+        TimelineView timeline;
+        Ruler ruler(engine, project, timeline);
+        ruler.setSize(800, 160);
+        ruler.setSongwritingExpanded(true);
+        using Entry = Project::SongEntry;
+        const auto first = te::BeatPosition::fromBeats(2), second = te::BeatPosition::fromBeats(3);
+        project.setSongNote(Entry::Chord, first, "Cm");
+        project.setSongNote(Entry::Chord, second, "G7");
+        project.setSongNote(Entry::Lyric, first, "This line stays");
+        const auto clickChord = [&](te::BeatPosition beat)
+        {
+            const auto x = timeline.xFor(engine.toSamples(project.getEdit().tempoSequence.toTime(beat)));
+            const juce::Point<float> point(x + 3.0f, Ruler::baseHeight + 10.0f);
+            const auto now = juce::Time::getCurrentTime();
+            const juce::MouseEvent e(juce::Desktop::getInstance().getMainMouseSource(), point,
+                                     juce::ModifierKeys::leftButtonModifier, 0, 0, 0, 0, 0,
+                                     &ruler, &ruler, now, point, now, 1, false);
+            ruler.mouseDown(e);
+            ruler.mouseUp(e);
+        };
+        clickChord(first);
+        expect(ruler.hasSelectedSongNote());
+        ruler.performSongShortcut(cmdNext);
+        expect(!ruler.hasSelectedSongNote());
+        ruler.performSongShortcut(cmdDelete);
+        expectEquals(static_cast<int>(project.songNotes(Entry::Chord).size()), 2);
+        clickChord(second);
+        ruler.performSongShortcut(cmdDelete);
+        const auto remaining = project.songNotes(Entry::Chord);
+        expectEquals(static_cast<int>(remaining.size()), 1);
+        if (!remaining.empty())
+            expectEquals(remaining.front().text, juce::String("Cm"));
+        expectEquals(static_cast<int>(project.songNotes(Entry::Lyric).size()), 1);
+        expect(project.undo());
+        expectEquals(static_cast<int>(project.songNotes(Entry::Chord).size()), 2);
+
+        beginTest("Shortcut help shows the shared bindings and filters the list");
+        ShortcutHelp page;
+        auto* search = page.findChildWithID("shortcut-search");
+        juce::ListBox* list = nullptr;
+        for (auto* child : page.getChildren())
+            if (auto* box = dynamic_cast<juce::ListBox*>(child))
+                list = box;
+        expect(search != nullptr && list != nullptr);
+        if (auto* editor = dynamic_cast<juce::TextEditor*>(search); editor != nullptr && list != nullptr)
+        {
+            auto* model = list->getListBoxModel();
+            const auto allRows = model->getNumRows();
+            editor->setText("Quantize", false);
+            editor->onTextChange();
+            expect(allRows > 2);
+            expectEquals(model->getNumRows(), 2);
+            expect(model->getNameForRow(1).contains("Quantize"));
+            editor->setText(JUCE_MAC ? "Cmd+E" : "Ctrl+E", false);
+            editor->onTextChange();
+            expectEquals(model->getNumRows(), 2);
+            expect(model->getNameForRow(1).contains("Export audio"));
+        }
+    }
+};
+
+/** 8track's own effects: in the insert slots like any plugin, and what each one does to sound. */
+class EffectTests : public juce::UnitTest
+{
+public:
+    EffectTests() : juce::UnitTest("Effects", "8track") {}
+
+    static constexpr double kRate = 48000.0;
+
+    /** An effect outside any track, initialised for offline processing. */
+    template <typename T>
+    struct Standalone
+    {
+        Standalone(te::Edit& edit)
+        {
+            plugin = edit.getPluginCache().createNewPlugin(T::xmlTypeName, {});
+            effect = dynamic_cast<T*>(plugin.get());
+            plugin->baseClassInitialise({ te::TimePosition(), kRate, 512 });
+        }
+        ~Standalone() { plugin->baseClassDeinitialise(); }
+        te::Plugin::Ptr plugin;
+        T* effect = nullptr;
+        T* operator->() { return effect; }
+    };
+
+    static void set(te::AutomatableParameter* p, float v) { p->setParameter(v, juce::sendNotification); }
+
+    static void render(te::Plugin& p, juce::AudioBuffer<float>& b, bool playing = false, double startSeconds = 0.0)
+    {
+        for (int s = 0; s < b.getNumSamples(); s += 512)
+        {
+            const int n = juce::jmin(512, b.getNumSamples() - s);
+            const te::TimeRange range(te::TimePosition::fromSeconds(startSeconds + s / kRate), te::TimeDuration::fromSeconds(n / kRate));
+            te::PluginRenderContext fc(&b, s, n, nullptr, 0.0, range, playing, false, false, false);
+            p.applyToBuffer(fc);
+        }
+    }
+
+    static float sampleAt(const juce::File& file, double seconds)
+    {
+        juce::WavAudioFormat wav;
+        std::unique_ptr<juce::AudioFormatReader> reader(wav.createReaderFor(file.createInputStream().release(), true));
+        if (reader == nullptr)
+            return -100.0f;
+        juce::AudioBuffer<float> buffer((int) reader->numChannels, 1);
+        reader->read(&buffer, 0, 1, (juce::int64) (seconds * reader->sampleRate), true, true);
+        return buffer.getSample(0, 0);
+    }
+
+    static juce::AudioBuffer<float> sine(double hz, double seconds, float level = 0.5f, int channels = 2)
+    {
+        juce::AudioBuffer<float> b(channels, (int) (seconds * kRate));
+        for (int i = 0; i < b.getNumSamples(); ++i)
+            for (int ch = 0; ch < channels; ++ch)
+                b.setSample(ch, i, level * (float) std::sin(juce::MathConstants<double>::twoPi * hz * i / kRate));
+        return b;
+    }
+
+    static float rms(const juce::AudioBuffer<float>& b, int ch, double from, double to)
+    {
+        const int start = (int) (from * kRate), end = juce::jmin(b.getNumSamples(), (int) (to * kRate));
+        return b.getRMSLevel(ch, start, end - start);
+    }
+
+    /** The strongest frequency within 10% of a guess: a DFT scanned in 0.05 Hz steps. */
+    static double frequency(const juce::AudioBuffer<float>& b, double from, double to, double guess)
+    {
+        const int start = (int) (from * kRate), end = (int) (to * kRate);
+        double best = 0, bestPower = -1;
+        for (double hz = guess * 0.9; hz <= guess * 1.1; hz += 0.05)
+        {
+            double re = 0, im = 0;
+            const double w = juce::MathConstants<double>::twoPi * hz / kRate;
+            for (int i = start; i < end; ++i)
+            {
+                re += b.getSample(0, i) * std::cos(w * i);
+                im += b.getSample(0, i) * std::sin(w * i);
+            }
+            if (re * re + im * im > bestPower)
+                bestPower = re * re + im * im, best = hz;
+        }
+        return best;
+    }
+
+    /** Level of one frequency in dB (a DFT bin, Hann windowed), relative to full scale. */
+    static float levelAt(const juce::AudioBuffer<float>& b, double hz, double from, double to)
+    {
+        const int start = (int) (from * kRate), end = (int) (to * kRate), n = end - start;
+        double re = 0, im = 0, wsum = 0;
+        for (int i = 0; i < n; ++i)
+        {
+            const double w = 0.5 - 0.5 * std::cos(juce::MathConstants<double>::twoPi * i / n);
+            const double x = b.getSample(0, start + i) * w;
+            re += x * std::cos(juce::MathConstants<double>::twoPi * hz * (start + i) / kRate);
+            im += x * std::sin(juce::MathConstants<double>::twoPi * hz * (start + i) / kRate);
+            wsum += w;
+        }
+        return juce::Decibels::gainToDecibels((float) (2.0 * std::sqrt(re * re + im * im) / wsum), -200.0f);
+    }
+
+    void expectNear(double actual, double expected, double relative, const juce::String& what)
+    {
+        expect(std::abs(actual - expected) <= relative * expected, what + ": " + juce::String(actual) + ", expected " + juce::String(expected));
+    }
+
+    void runTest() override
+    {
+        AudioEngine engine;
+        auto dir = juce::File::createTempFile("8track-effects");
+        dir.createDirectory();
+        {
+            Project project(engine);
+            auto& edit = project.getEdit();
+            juce::String error;
+
+            beginTest("Each effect goes in an insert slot, undoes, and offers its controls for automation");
+            std::vector<EffectPlugin::Type> types;
+            for (auto& t : EffectPlugin::getTypes())
+                if (t.kind == EffectPlugin::Kind::Effect)
+                    types.push_back(t);
+            expect(types.size() >= 7);
+            std::map<juce::String, int> trackOf;   // the track each effect went on
+            for (size_t i = 0; i < types.size(); ++i)
+            {
+                const int track = (int) i % kNumTracks;
+                trackOf[types[i].xmlType] = track;
+                auto* plugin = engine.addEffect(track, types[i].xmlType, error);
+                expect(plugin != nullptr, error);
+                const auto inserts = engine.getInserts(track);
+                expect(!inserts.empty() && inserts.back() == plugin, types[i].name);
+                expectEquals(plugin->getName(), types[i].name);
+                const auto targets = engine.getAutomationTargets(track);
+                expect(std::any_of(targets.begin(), targets.end(), [&](auto& t) { return t.group == types[i].name; }),
+                       types[i].name + " can be automated");
+            }
+            auto find = [&](const char* xmlType) -> te::Plugin*
+            {
+                for (auto* p : engine.getInserts(trackOf[xmlType]))
+                    if (p->getPluginType() == xmlType)
+                        return p;
+                return nullptr;
+            };
+            expect(engine.addEffect(7, "eightTrackNothing", error) == nullptr && error.isNotEmpty());
+            const int lastTrack = trackOf[types.back().xmlType];
+            const auto before = engine.getInserts(lastTrack).size();
+            edit.getUndoManager().undo();
+            expectEquals((int) engine.getInserts(lastTrack).size(), (int) before - 1, "undo removes the last one");
+            edit.getUndoManager().redo();
+            expectEquals((int) engine.getInserts(lastTrack).size(), (int) before, "and redo brings it back");
+
+            beginTest("Effects follow the song tempo");
+            auto* delay = dynamic_cast<DelayEffect*>(find(DelayEffect::xmlTypeName));
+            expect(delay != nullptr);
+            engine.bpm = 90.0;
+            engine.syncNow();
+            expectWithinAbsoluteError(delay->getTempo(), 90.0, 1.0e-6);
+            expectWithinAbsoluteError(delay->getDelaySeconds(), 60.0 / 90.0, 1.0e-6, "a synced quarter note");
+
+            beginTest("Effect settings and bypass survive save and reopen");
+            set(delay->feedback, 0.6f);
+            set(delay->pingPong, 1.0f);
+            dynamic_cast<FilterEffect*>(find(FilterEffect::xmlTypeName))->mode->setParameter(2.0f, juce::sendNotification);
+            find(GateEffect::xmlTypeName)->setEnabled(false);
+            auto saved = dir.getChildFile("WithEffects");
+            expect(project.saveAs(saved, error), error);
+            project.newProject();
+            expect(project.load(saved, error), error);
+            if (auto* reopened = dynamic_cast<DelayEffect*>(find(DelayEffect::xmlTypeName)))
+            {
+                expectWithinAbsoluteError(reopened->feedback->getCurrentValue(), 0.6f, 1.0e-4f);
+                expect(reopened->pingPong->getCurrentValue() > 0.5f);
+                expectWithinAbsoluteError(reopened->getTempo(), 90.0, 1.0e-6, "and the tempo");
+            }
+            else expect(false, "the delay came back");
+            if (auto* filter = dynamic_cast<FilterEffect*>(find(FilterEffect::xmlTypeName)))
+                expectEquals(juce::roundToInt(filter->mode->getCurrentValue()), 2, "band pass");
+            expect(!find(GateEffect::xmlTypeName)->isEnabled(), "the gate is still bypassed");
+
+            auto& fresh = project.getEdit();
+
+            beginTest("Noise Gate: closes on quiet noise, opens for a note, and closes after it");
+            {
+                Standalone<GateEffect> gate(fresh);
+                juce::AudioBuffer<float> b(2, (int) kRate);
+                juce::Random r(1);
+                for (int i = 0; i < b.getNumSamples(); ++i)
+                {
+                    const bool note = i >= kRate * 0.25 && i < kRate * 0.5;
+                    const float v = note ? 0.5f * (float) std::sin(juce::MathConstants<double>::twoPi * 440.0 * i / kRate)
+                                         : 0.001f * (r.nextFloat() * 2.0f - 1.0f);
+                    b.setSample(0, i, v);
+                    b.setSample(1, i, v);
+                }
+                render(*gate.plugin, b);
+                expect(rms(b, 0, 0.0, 0.25) < 1.0e-6f, "quiet noise is gated");
+                expectWithinAbsoluteError(rms(b, 0, 0.27, 0.5), 0.5f / std::sqrt(2.0f), 0.01f, "the note passes untouched");
+                expect(rms(b, 1, 0.9, 1.0) < 1.0e-5f, "silent again after hold and release");
+
+                set(gate->range, -20.0f);
+                juce::AudioBuffer<float> quiet(2, (int) kRate / 2);
+                for (int i = 0; i < quiet.getNumSamples(); ++i)
+                    quiet.setSample(0, i, 0.001f), quiet.setSample(1, i, 0.001f);
+                render(*gate.plugin, quiet);
+                expectWithinAbsoluteError(quiet.getSample(0, quiet.getNumSamples() - 1), 0.0001f, 1.0e-5f, "Floor turns it down by 20 dB");
+            }
+
+            beginTest("Delay: echoes on the beat, repeats with feedback, and ping-pongs");
+            {
+                Standalone<DelayEffect> d(fresh);
+                d->setTempo(120.0);
+                set(d->mix, 1.0f);   // echoes only
+                set(d->feedback, 0.5f);
+                set(d->lowCut, 20.0f);
+                set(d->highCut, 20000.0f);
+                juce::AudioBuffer<float> b(2, (int) (kRate * 1.1));
+                b.clear();
+                b.setSample(0, 0, 1.0f);
+                b.setSample(1, 0, 1.0f);
+                render(*d.plugin, b);
+                expectEquals(b.findMinMax(0, 0, 23000).getEnd(), 0.0f, "nothing before the first echo");
+                expectWithinAbsoluteError(b.getSample(0, 24000), 1.0f, 1.0e-3f, "a quarter note at 120 bpm is 24000 samples");
+                expectWithinAbsoluteError(b.getSample(0, 48000), 0.5f, 1.0e-3f, "the second echo at half level");
+                expect(d->getTailLength() > 2.0, "renders keep the echoes");
+
+                d.plugin->reset();
+                set(d->sync, 0.0f);
+                set(d->time, 100.0f);
+                set(d->pingPong, 1.0f);
+                b.clear();
+                b.setSample(0, 0, 1.0f);
+                b.setSample(1, 0, 1.0f);
+                render(*d.plugin, b);
+                expectWithinAbsoluteError(b.getSample(0, 4800), 1.0f, 1.0e-3f, "100 ms, first echo on the left");
+                expectWithinAbsoluteError(b.getSample(1, 4800), 0.0f, 1.0e-3f);
+                expectWithinAbsoluteError(b.getSample(1, 9600), 0.5f, 1.0e-3f, "then the right");
+                expectWithinAbsoluteError(b.getSample(0, 9600), 0.0f, 1.0e-3f);
+            }
+
+            beginTest("Auto Pan: sweeps left and right, and locks to the song position");
+            {
+                Standalone<AutoPanEffect> pan(fresh);
+                set(pan->sync, 0.0f);
+                set(pan->rate, 1.0f);
+                juce::AudioBuffer<float> b(2, (int) kRate);
+                for (int ch = 0; ch < 2; ++ch)
+                    juce::FloatVectorOperations::fill(b.getWritePointer(ch), 1.0f, b.getNumSamples());
+                render(*pan.plugin, b);
+                expectWithinAbsoluteError(b.getSample(0, 0), 1.0f, 0.01f, "starts centred");
+                expect(b.getSample(0, 12000) < 0.05f && b.getSample(1, 12000) > 1.35f, "a quarter cycle in: right");
+                expect(b.getSample(1, 36000) < 0.05f && b.getSample(0, 36000) > 1.35f, "three quarters: left");
+
+                pan.plugin->reset();
+                set(pan->sync, 1.0f);
+                pan->division->setParameter((float) EffectPlugin::divisionNames().indexOf("1/1"), juce::sendNotification);
+                pan->setTempo(120.0);
+                juce::AudioBuffer<float> c(2, 4096);
+                for (int ch = 0; ch < 2; ++ch)
+                    juce::FloatVectorOperations::fill(c.getWritePointer(ch), 1.0f, c.getNumSamples());
+                render(*pan.plugin, c, true, 0.5);   // one beat into a four-beat cycle
+                expect(c.getSample(0, 2000) < 0.05f && c.getSample(1, 2000) > 1.35f, "synced: right on beat 2");
+            }
+
+            beginTest("Filter: low, high pass and notch, with a tempo-synced LFO on the cutoff");
+            {
+                Standalone<FilterEffect> f(fresh);
+                set(f->cutoff, 500.0f);
+                set(f->slope, 1.0f);
+                auto high = sine(5000.0, 0.5), low = sine(100.0, 0.5);
+                render(*f.plugin, high);
+                f.plugin->reset();
+                render(*f.plugin, low);
+                expect(juce::Decibels::gainToDecibels(rms(high, 0, 0.1, 0.5) / 0.3536f) < -60.0f, "24 dB low pass removes 5 kHz");
+                expectWithinAbsoluteError(rms(low, 0, 0.1, 0.5), 0.3536f, 0.02f, "and keeps 100 Hz");
+
+                set(f->mode, (float) EffectSvf::HighPass);
+                f.plugin->reset();
+                low = sine(100.0, 0.5);
+                render(*f.plugin, low);
+                expect(juce::Decibels::gainToDecibels(rms(low, 0, 0.1, 0.5) / 0.3536f) < -30.0f, "high pass removes 100 Hz");
+
+                set(f->mode, (float) EffectSvf::Notch);
+                set(f->cutoff, 1000.0f);
+                set(f->slope, 0.0f);
+                f.plugin->reset();
+                auto mid = sine(1000.0, 0.5);
+                render(*f.plugin, mid);
+                expect(juce::Decibels::gainToDecibels(rms(mid, 0, 0.2, 0.5) / 0.3536f) < -30.0f, "notch removes its frequency");
+
+                set(f->mode, (float) EffectSvf::LowPass);
+                set(f->lfoDepth, 2.0f);
+                set(f->lfoSync, 1.0f);
+                f->lfoDivision->setParameter((float) EffectPlugin::divisionNames().indexOf("1/1"), juce::sendNotification);
+                f->setTempo(120.0);
+                f.plugin->reset();
+                juce::AudioBuffer<float> b(2, 512);
+                b.clear();
+                render(*f.plugin, b, true, 0.5);   // the sine LFO's peak
+                const float hz = FilterEffect::kMinHz * std::pow(FilterEffect::kMaxHz / FilterEffect::kMinHz, f->getDisplay().value);
+                expectWithinAbsoluteError(hz, 4000.0f, 100.0f, "+2 octaves at the LFO's peak");
+            }
+
+            beginTest("Pitch Shifter: shifts by semitones, keeps pitch when shifting formants, and lines dry up with wet");
+            {
+                Standalone<PitchEffect> p(fresh);
+                const double latency = p.plugin->getLatencySeconds();
+                expect(latency > 0.01 && latency < 0.15, "latency " + juce::String(latency));
+
+                // Signalsmith Stretch tracks peaks between FFT bins, so a pure tone can land up to
+                // about 20 cents off: allow 1.5%.
+                set(p->pitch, 12.0f);
+                auto b = sine(220.0, 2.0);
+                render(*p.plugin, b);
+                expectNear(frequency(b, 0.5, 1.9, 440.0), 440.0, 0.015, "an octave up");
+
+                set(p->pitch, -7.0f);
+                p.plugin->reset();
+                b = sine(220.0, 2.0);
+                render(*p.plugin, b);
+                expectNear(frequency(b, 0.5, 1.9, 146.8), 220.0 * std::pow(2.0, -7.0 / 12.0), 0.015, "a fifth down");
+
+                set(p->pitch, 0.0f);
+                set(p->formant, 5.0f);
+                p.plugin->reset();
+                b = sine(220.0, 2.0);
+                render(*p.plugin, b);
+                expectNear(frequency(b, 0.5, 1.9, 220.0), 220.0, 0.002, "formants move, pitch doesn't");
+
+                set(p->mix, 0.0f);
+                p.plugin->reset();
+                const auto in = sine(220.0, 1.0);
+                b = in;
+                render(*p.plugin, b);
+                const int offset = juce::roundToInt(latency * kRate);
+                float worst = 0.0f;
+                for (int i = offset; i < b.getNumSamples(); ++i)
+                    worst = juce::jmax(worst, std::abs(b.getSample(0, i) - in.getSample(0, i - offset)));
+                expect(worst < 1.0e-6f, "dry is the input, delayed by the reported latency");
+            }
+
+            beginTest("Compressor: turns down what goes over the threshold by the ratio");
+            {
+                Standalone<CompressorEffect> c(fresh);
+                set(c->threshold, -18.0f);
+                set(c->ratio, 4.0f);
+                set(c->knee, 0.0f);
+                set(c->attack, 1.0f);
+                set(c->detect, 1.0f);   // RMS, so a sine reads steadily
+                auto b = sine(200.0, 1.0);   // peaks at -6 dB: 12 dB over
+                render(*c.plugin, b);
+                const float outDb = juce::Decibels::gainToDecibels(rms(b, 0, 0.5, 1.0) * std::sqrt(2.0f));
+                expectWithinAbsoluteError(outDb, -15.0f, 0.75f, "12 dB over at 4:1 comes out 3 dB over");
+                expectWithinAbsoluteError(c->getDisplay().value * 24.0f, 9.0f, 1.0f, "9 dB of reduction shown");
+
+                set(c->ratio, 20.0f);
+                c.plugin->reset();
+                b = sine(200.0, 1.0);
+                render(*c.plugin, b);
+                expectWithinAbsoluteError(juce::Decibels::gainToDecibels(rms(b, 0, 0.5, 1.0) * std::sqrt(2.0f)), -18.0f, 0.75f,
+                                          "infinite ratio holds it at the threshold");
+
+                set(c->ratio, 4.0f);
+                c.plugin->reset();
+                b = sine(200.0, 1.0, 0.05f);   // -26 dB: under
+                render(*c.plugin, b);
+                expectWithinAbsoluteError(rms(b, 0, 0.5, 1.0), 0.05f / std::sqrt(2.0f), 0.001f, "under the threshold: untouched");
+            }
+
+            beginTest("Compressor key sources: other tracks and buses, never a loop");
+            {
+                juce::String err;
+                auto* comp = dynamic_cast<CompressorEffect*>(engine.addEffect(5, CompressorEffect::xmlTypeName, err));
+                expect(comp != nullptr, err);
+                if (comp != nullptr)
+                {
+                    engine.setTrackRoute(5, AudioEngine::Route::Bus1, true);
+                    engine.syncNow();
+                    auto* own = engine.getAudioTrack(5);
+                    auto* bus1 = engine.getAudioTrack(AudioEngine::kFirstStereoBus);
+                    auto* bus2 = engine.getAudioTrack(AudioEngine::kFirstStereoBus + 1);
+                    const auto sources = comp->getKeySources();
+                    auto has = [&](te::AudioTrack* t) { return std::find(sources.begin(), sources.end(), t) != sources.end(); };
+                    expect(!has(own), "not its own track");
+                    expect(!has(bus1), "not a bus the track feeds");
+                    expect(has(engine.getAudioTrack(0)) && has(engine.getAudioTrack(7)), "the other tracks");
+
+                    expect(has(bus2), "Bus 2: the track's send to it is off");
+                    comp->setKeySource(bus2);
+                    engine.setTrackRoute(5, AudioEngine::Route::Bus2, true);
+                    expect(comp->getKeySource() == nullptr, "sending to the key bus disconnects the key: no loop");
+                    fresh.getUndoManager().undo();
+                    expect(comp->getKeySource() == bus2 && !engine.hasTrackRoute(5, AudioEngine::Route::Bus2),
+                           "one undo puts back both");
+
+                    comp->setKeySource(engine.getAudioTrack(0));
+                    expect(comp->getKeySource() == engine.getAudioTrack(0));
+                    expectEquals(comp->getNumWires(), 4, "main and key wired");
+                    expectEquals(comp->getSelectors().front().get(), 1, "the menu shows the first track");
+                    fresh.getUndoManager().undo();
+                    expect(comp->getKeySource() == bus2, "undo goes back to the previous key");
+                    comp->setKeySource(nullptr);
+                    expect(comp->getKeySource() == nullptr && comp->getSelectors().front().get() == 0, "back to this track");
+                    engine.removeInsert(*comp);
+                    engine.setTrackRoute(5, AudioEngine::Route::Bus1, false);
+                }
+            }
+
+            beginTest("Limiter: nothing over the ceiling, with the latency it reports");
+            {
+                Standalone<LimiterEffect> l(fresh);
+                set(l->gain, 12.0f);
+                set(l->ceiling, -1.0f);
+                set(l->release, 5.0f);
+                juce::AudioBuffer<float> b(2, (int) kRate);
+                juce::Random r(3);
+                for (int i = 0; i < b.getNumSamples(); ++i)
+                {
+                    const float burst = (i / 4800) % 2 == 0 ? 0.9f : 0.1f;   // loud and quiet every 100 ms
+                    const float v = burst * (float) std::sin(i * 0.3) + 0.05f * (r.nextFloat() - 0.5f);
+                    b.setSample(0, i, v);
+                    b.setSample(1, i, -v);
+                }
+                const auto input = b;
+                render(*l.plugin, b);
+                const float limit = juce::Decibels::decibelsToGain(-1.0f);
+                float peak = 0.0f, truePeak = 0.0f;
+                for (int i = 1; i + 2 < b.getNumSamples(); ++i)
+                {
+                    peak = juce::jmax(peak, std::abs(b.getSample(0, i)));
+                    // A 4x Hermite reconstruction between samples
+                    const float y0 = b.getSample(0, i - 1), y1 = b.getSample(0, i), y2 = b.getSample(0, i + 1), y3 = b.getSample(0, i + 2);
+                    for (float t : { 0.25f, 0.5f, 0.75f })
+                    {
+                        const float c1 = 0.5f * (y2 - y0), c2 = y0 - 2.5f * y1 + 2.0f * y2 - 0.5f * y3, c3 = 0.5f * (y3 - y0) + 1.5f * (y1 - y2);
+                        truePeak = juce::jmax(truePeak, std::abs(((c3 * t + c2) * t + c1) * t + y1));
+                    }
+                }
+                expect(peak <= limit + 1.0e-6f, "sample peak " + juce::String(peak));
+                expect(truePeak <= limit * 1.01f, "inter-sample peak " + juce::String(truePeak));
+                const int latency = juce::roundToInt(l.plugin->getLatencySeconds() * kRate);
+                expectEquals(latency, 144, "3 ms at 48 kHz");
+                // Quiet parts come through at the gain, delayed by the latency.
+                const int quiet = 4800 + 2400;   // the middle of the first quiet burst
+                expectWithinAbsoluteError(b.getSample(0, quiet + latency), input.getSample(0, quiet) * 3.98f, 0.02f,
+                                          "below the ceiling: just the gain (after the release)");
+            }
+
+            beginTest("Drive: every model adds harmonics; the lopsided ones add even harmonics");
+            {
+                Standalone<DriveEffect> d(fresh);
+                set(d->cab, (float) DriveEffect::NoCab);
+                set(d->tone, 1.0f);
+                set(d->drive, 24.0f);
+                set(d->bias, 0.5f);
+                for (int m = 0; m < 4; ++m)
+                {
+                    set(d->model, (float) m);
+                    d.plugin->reset();
+                    auto b = sine(250.0, 0.5, 0.3f);
+                    render(*d.plugin, b);
+                    const float f1 = levelAt(b, 250.0, 0.1, 0.5), h2 = levelAt(b, 500.0, 0.1, 0.5), h3 = levelAt(b, 750.0, 0.1, 0.5);
+                    const auto name = DriveEffect::modelNames()[m];
+                    // Overdrive clips the mids (above ~700 Hz) and keeps the lows clean, so 250 Hz drives it less.
+                    expect(h3 - f1 > (m == DriveEffect::Overdrive ? -36.0f : -30.0f), name + ": 3rd harmonic " + juce::String(h3 - f1, 1) + " dB");
+                    if (m == DriveEffect::Fuzz || m == DriveEffect::Tube)
+                        expect(h2 - f1 > -30.0f, name + ": 2nd harmonic " + juce::String(h2 - f1, 1) + " dB");
+                    else
+                        expect(h2 - f1 < -50.0f, name + ": symmetric, no 2nd harmonic: " + juce::String(h2 - f1, 1) + " dB");
+                }
+
+                beginTest("Drive: oversampled, so a loud high note doesn't alias");
+                set(d->model, (float) DriveEffect::Distortion);
+                set(d->drive, 36.0f);
+                d.plugin->reset();
+                auto high = sine(7000.0, 0.5, 0.5f);
+                render(*d.plugin, high);
+                // The 5th harmonic (35 kHz) would fold back to 13 kHz without oversampling.
+                const float alias = levelAt(high, 13000.0, 0.1, 0.5) - levelAt(high, 7000.0, 0.1, 0.5);
+                expect(alias < -45.0f, "alias at 13 kHz: " + juce::String(alias, 1) + " dB");
+
+                beginTest("Drive: the 4x12 cabinet rolls off the top");
+                set(d->drive, 0.0f);
+                set(d->model, (float) DriveEffect::Tube);
+                set(d->bias, 0.0f);
+                set(d->cab, (float) DriveEffect::ClosedStack);
+                d.plugin->reset();
+                auto mid = sine(1000.0, 0.5, 0.01f), top = sine(9000.0, 0.5, 0.01f);
+                render(*d.plugin, mid);
+                d.plugin->reset();
+                render(*d.plugin, top);
+                const float rolloff = levelAt(top, 9000.0, 0.1, 0.5) - levelAt(mid, 1000.0, 0.1, 0.5);
+                expect(rolloff < -20.0f, "9 kHz vs 1 kHz: " + juce::String(rolloff, 1) + " dB");
+            }
+
+            beginTest("Drive: an impulse response loads into the project and is the cabinet");
+            {
+                Standalone<DriveEffect> d(fresh);
+                auto ir = dir.getChildFile("cab-ir.wav");
+                {
+                    juce::AudioBuffer<float> impulse(1, 1000);
+                    impulse.clear();
+                    impulse.setSample(0, 0, 1.0f);
+                    impulse.setSample(0, 480, 1.0f);   // and an echo 10 ms later
+                    ir.deleteFile();
+                    std::unique_ptr<juce::OutputStream> stream = ir.createOutputStream();
+                    juce::WavAudioFormat wav;
+                    auto writer = wav.createWriterFor(stream, juce::AudioFormatWriterOptions().withSampleRate(kRate).withNumChannels(1).withBitsPerSample(24));
+                    writer->writeFromAudioSampleBuffer(impulse, 0, impulse.getNumSamples());
+                }
+                juce::String err;
+                expect(d->loadImpulseResponse(ir, err), err);
+                expectEquals(juce::roundToInt(d->cab->getCurrentValue()), (int) DriveEffect::ImpulseResponse, "the cabinet switches to it");
+                const auto loaded = d->getImpulseResponse();
+                expect(loaded.existsAsFile() && loaded != ir, "copied into the project: " + loaded.getFullPathName());
+                std::vector<EffectPlugin::FileReference> refs;
+                d->getFileReferences(refs);
+                expect(refs.size() == 1 && refs.front().state[refs.front().property].toString().isNotEmpty(), "Save As will copy it");
+
+                set(d->drive, 0.0f);
+                set(d->model, (float) DriveEffect::Tube);
+                set(d->bias, 0.0f);
+                set(d->tone, 1.0f);
+                juce::AudioBuffer<float> silence(2, 4800);
+                for (int i = 0; i < 20; ++i)   // the convolution loads its IR in the background
+                {
+                    silence.clear();
+                    render(*d.plugin, silence);
+                    juce::Thread::sleep(20);
+                }
+                juce::AudioBuffer<float> click(2, 4800);
+                click.clear();
+                for (int i = 1000; i < 1010; ++i)
+                    click.setSample(0, i, 0.01f), click.setSample(1, i, 0.01f);
+                render(*d.plugin, click);
+                const int latency = juce::roundToInt(d.plugin->getLatencySeconds() * kRate);
+                auto energy = [&](int from, int to)
+                {
+                    float e = 0.0f;
+                    for (int i = from; i < to; ++i)
+                        e += click.getSample(0, i) * click.getSample(0, i);
+                    return e;
+                };
+                const float direct = energy(1000 + latency - 5, 1000 + latency + 30);
+                const float echo = energy(1480 + latency - 5, 1480 + latency + 30);
+                const float between = energy(1000 + latency + 100, 1480 + latency - 50);
+                expect(direct > 1.0e-8f && echo > direct * 0.5f, "the click and its echo 10 ms later");
+                expect(between < echo * 0.05f, "nothing much in between (just the filters' tail)");
+
+                expect(d->loadImpulseResponse({}, err));
+                expect(d->getImpulseResponse() == juce::File(), "cleared");
+            }
+
+            beginTest("Chorus: Juno is wide stereo at the input's level; CE-2 is mono and moving; Dimension is wide; Mix 0 is dry");
+            {
+                Standalone<ChorusEffect> c(fresh);
+                auto correlation = [](const juce::AudioBuffer<float>& b, int from)
+                {
+                    double lr = 0, ll = 0, rr = 0;
+                    for (int i = from; i < b.getNumSamples(); ++i)
+                    {
+                        const double l = b.getSample(0, i), r = b.getSample(1, i);
+                        lr += l * r; ll += l * l; rr += r * r;
+                    }
+                    return lr / std::sqrt(ll * rr + 1.0e-20);
+                };
+                auto wobble = [](const juce::AudioBuffer<float>& b, int ch)   // how much the level moves, 20 ms windows
+                {
+                    float lo = 1e9f, hi = 0.0f;
+                    for (int start = (int) kRate / 4; start + 960 < b.getNumSamples(); start += 960)
+                    {
+                        const float level = b.getRMSLevel(ch, start, 960);
+                        lo = juce::jmin(lo, level); hi = juce::jmax(hi, level);
+                    }
+                    return juce::Decibels::gainToDecibels(hi / juce::jmax(lo, 1.0e-9f));
+                };
+
+                set(c->mode, (float) ChorusEffect::JunoI);
+                set(c->hiss, 0.0f);
+                auto b = sine(440.0, 2.0, 0.3f);
+                render(*c.plugin, b);
+                expect(correlation(b, (int) kRate / 4) < 0.9, "Juno I: left and right differ");
+                expectWithinAbsoluteError(juce::Decibels::gainToDecibels(rms(b, 0, 0.25, 2.0) / (0.3f / std::sqrt(2.0f))), 0.0f, 3.0f,
+                                          "about the input's level");
+
+                set(c->mode, (float) ChorusEffect::CE2);
+                set(c->depth, 1.0f);
+                set(c->rate, 1.0f);
+                c.plugin->reset();
+                b = sine(1000.0, 2.0, 0.3f);
+                render(*c.plugin, b);
+                expectWithinAbsoluteError((float) correlation(b, (int) kRate / 4), 1.0f, 1.0e-4f, "CE-2 is mono");
+                expect(wobble(b, 0) > 3.0f, "CE-2 beats as the delay moves: " + juce::String(wobble(b, 0), 1) + " dB");
+
+                set(c->mode, (float) ChorusEffect::Dimension3);
+                c.plugin->reset();
+                b = sine(1000.0, 2.0, 0.3f);
+                render(*c.plugin, b);
+                expect(correlation(b, (int) kRate / 4) < 0.95, "Dimension is wide");
+
+                set(c->mix, 0.0f);
+                c.plugin->reset();
+                const auto in = sine(330.0, 0.5, 0.3f);
+                b = in;
+                render(*c.plugin, b);
+                float diff = 0.0f;
+                for (int i = 0; i < b.getNumSamples(); ++i)
+                    diff = juce::jmax(diff, std::abs(b.getSample(0, i) - in.getSample(0, i)));
+                expect(diff < 1.0e-6f, "Mix 0: dry");
+            }
+
+            beginTest("Reverb: the tail follows Decay, waits for Pre-delay, and Mix 0 is dry");
+            {
+                Standalone<ReverbEffect> rv(fresh);
+                auto db = [](float v) { return juce::Decibels::gainToDecibels(v, -200.0f); };
+                auto impulse = [](double seconds)
+                {
+                    juce::AudioBuffer<float> b(2, (int) (seconds * kRate));
+                    b.clear();
+                    b.setSample(0, 0, 1.0f);
+                    b.setSample(1, 0, 1.0f);
+                    return b;
+                };
+                set(rv->mix, 1.0f);
+                set(rv->preDelay, 0.0f);
+                auto drop = [&](float seconds)   // how far the tail falls from 0.3 s to 1.3 s
+                {
+                    set(rv->decay, seconds);
+                    rv.plugin->reset();
+                    auto b = impulse(1.5);
+                    render(*rv.plugin, b);
+                    return db(rms(b, 0, 0.25, 0.35)) - db(rms(b, 0, 1.25, 1.35));
+                };
+                const float shortDrop = drop(0.8f), longDrop = drop(5.0f);
+                logMessage("REVERB short " + juce::String(shortDrop) + " long " + juce::String(longDrop));
+                expect(shortDrop > 25.0f, "a 0.8 s decay falls " + juce::String(shortDrop, 1) + " dB in a second");
+                expect(longDrop < 20.0f && longDrop > 3.0f, "a 5 s decay falls " + juce::String(longDrop, 1) + " dB");
+
+                for (int sp = 0; sp < 6; ++sp)
+                {
+                    set(rv->space, (float) sp);
+                    set(rv->decay, 2.0f);
+                    rv.plugin->reset();
+                    auto b = impulse(1.0);
+                    render(*rv.plugin, b);
+                    const float level = rms(b, 0, 0.0, 1.0);
+                    expect(std::isfinite(level) && level > 1.0e-4f && level < 0.5f,
+                           ReverbEffect::spaceNames()[sp] + " rings: " + juce::String(db(level), 1) + " dB");
+                }
+
+                set(rv->space, (float) ReverbEffect::Plate);
+                set(rv->preDelay, 200.0f);
+                rv.plugin->reset();
+                auto b = impulse(0.5);
+                render(*rv.plugin, b);
+                expect(b.getMagnitude(0, 0, (int) (0.19 * kRate)) < 1.0e-4f, "nothing before the pre-delay");
+                expect(b.getMagnitude(0, (int) (0.2 * kRate), (int) (0.3 * kRate)) > 1.0e-3f, "then the reverb");
+
+                set(rv->mix, 0.0f);
+                rv.plugin->reset();
+                const auto in = sine(330.0, 0.5, 0.3f);
+                b = in;
+                render(*rv.plugin, b);
+                float diff = 0.0f;
+                for (int i = 0; i < b.getNumSamples(); ++i)
+                    diff = juce::jmax(diff, std::abs(b.getSample(0, i) - in.getSample(0, i)));
+                expect(diff < 1.0e-6f, "Mix 0: dry");
+            }
+
+            beginTest("Reverb: shimmer climbs an octave, and stays bounded at full shimmer and decay");
+            {
+                Standalone<ReverbEffect> rv(fresh);
+                set(rv->mix, 1.0f);
+                set(rv->decay, 4.0f);
+                set(rv->preDelay, 0.0f);
+                set(rv->lowCut, 20.0f);
+                auto burstThenSilence = [&]
+                {
+                    auto b = sine(440.0, 3.0, 0.3f);
+                    for (int ch = 0; ch < 2; ++ch)
+                        b.clear(ch, (int) (0.4 * kRate), b.getNumSamples() - (int) (0.4 * kRate));
+                    return b;
+                };
+                auto octaveOverRoot = [&](float amount)
+                {
+                    set(rv->shimmer, amount);
+                    rv.plugin->reset();
+                    auto b = burstThenSilence();
+                    render(*rv.plugin, b);
+                    return levelAt(b, 880.0, 1.5, 2.5) - levelAt(b, 440.0, 1.5, 2.5);
+                };
+                const float plain = octaveOverRoot(0.0f), shimmering = octaveOverRoot(0.8f);
+                logMessage("SHIMMER " + juce::String(plain) + " " + juce::String(shimmering));
+                expect(shimmering - plain > 10.0f, "the octave in the tail: " + juce::String(plain, 1) + " dB without shimmer, "
+                                                   + juce::String(shimmering, 1) + " dB with");
+
+                set(rv->space, (float) ReverbEffect::Cathedral);
+                set(rv->decay, 30.0f);
+                set(rv->shimmer, 1.0f);
+                set(rv->interval, 4.0f);   // two octaves
+                rv.plugin->reset();
+                juce::Random random(7);
+                juce::AudioBuffer<float> noise(2, (int) (10.0 * kRate));
+                for (int i = 0; i < noise.getNumSamples(); ++i)
+                {
+                    const float v = i < (int) (2.0 * kRate) ? random.nextFloat() * 1.6f - 0.8f : 0.0f;
+                    noise.setSample(0, i, v);
+                    noise.setSample(1, i, v);
+                }
+                render(*rv.plugin, noise);
+                const float peak = noise.getMagnitude(0, noise.getNumSamples());
+                logMessage("PEAK " + juce::String(peak));
+                expect(std::isfinite(peak) && peak < 8.0f, "bounded: peak " + juce::String(peak, 2));
+            }
+
+            beginTest("Arpeggiator: the patterns");
+            {
+                using A = ArpeggiatorEffect;
+                const std::vector<int> held { 64, 60, 67 };
+                expect(A::pattern(A::Up, held, 1) == std::vector<int> { 60, 64, 67 });
+                expect(A::pattern(A::Up, held, 2) == std::vector<int> { 60, 64, 67, 72, 76, 79 });
+                expect(A::pattern(A::Down, held, 1) == std::vector<int> { 67, 64, 60 });
+                expect(A::pattern(A::UpDown, held, 1) == std::vector<int> { 60, 64, 67, 64 });
+                expect(A::pattern(A::DownUp, held, 1) == std::vector<int> { 67, 64, 60, 64 });
+                expect(A::pattern(A::UpAndDown, held, 1) == std::vector<int> { 60, 64, 67, 67, 64, 60 });
+                expect(A::pattern(A::AsPlayed, held, 1) == std::vector<int> { 64, 60, 67 });
+                expect(A::pattern(A::Chord, held, 3) == held, "chords ignore octaves");
+                expect(A::pattern(A::Up, { 120 }, 2) == std::vector<int> { 120 }, "nothing above 127");
+            }
+
+            beginTest("Arpeggiator: in time with the song, stopping when you let go, latching, swinging");
+            {
+                Standalone<ArpeggiatorEffect> arp(fresh);
+                arp->setTempo(120.0);   // a 1/16 step is 0.125 s
+                struct Event { double time; int note; bool on; };
+                // Runs the arp for a while; `play` gives the keys to press or release in each block.
+                auto run = [&](double seconds, bool playing, std::function<void(double, te::MidiMessageArray&)> play)
+                {
+                    std::vector<Event> out;
+                    juce::AudioBuffer<float> audio(2, 512);
+                    for (int s0 = 0; s0 < (int) (seconds * kRate); s0 += 512)
+                    {
+                        const double t = s0 / kRate;
+                        te::MidiMessageArray midi;
+                        if (play)
+                            play(t, midi);
+                        audio.clear();
+                        const te::TimeRange range(te::TimePosition::fromSeconds(t), te::TimeDuration::fromSeconds(512 / kRate));
+                        te::PluginRenderContext fc(&audio, 0, 512, &midi, 0.0, range, playing, false, false, false);
+                        arp.plugin->applyToBuffer(fc);
+                        for (auto& m : midi)
+                            if (m.isNoteOnOrOff() && (t + m.getTimeStamp() < seconds - 1.0e-9 || !m.isNoteOn()))
+                                out.push_back({ t + m.getTimeStamp(), m.getNoteNumber(), m.isNoteOn() });   // the last block runs over
+                    }
+                    return out;
+                };
+                auto press = [](te::MidiMessageArray& midi, std::initializer_list<int> notes)
+                {
+                    for (int n : notes)
+                        midi.addMidiMessage(juce::MidiMessage::noteOn(1, n, (juce::uint8) 100), 0.0, {});
+                };
+                auto onsOf = [](const std::vector<Event>& events)
+                {
+                    std::vector<Event> ons;
+                    for (auto& e : events)
+                        if (e.on)
+                            ons.push_back(e);
+                    return ons;
+                };
+
+                auto events = run(1.0, true, [&](double t, auto& midi) { if (t == 0.0) press(midi, { 67, 60, 64 }); });
+                auto ons = onsOf(events);
+                expectEquals((int) ons.size(), 8, "eight sixteenths in a second at 120");
+                const int expected[] = { 60, 64, 67, 60, 64, 67, 60, 64 };
+                for (size_t i = 0; i < ons.size() && i < 8; ++i)
+                {
+                    expectEquals(ons[i].note, expected[i]);
+                    expectWithinAbsoluteError(ons[i].time, 0.125 * (double) i, 1.0e-6, "on the grid");
+                }
+                int offs = 0;
+                for (auto& e : events)
+                    if (!e.on && std::abs(std::fmod(e.time, 0.125) - 0.0625) < 1.0e-6)
+                        ++offs;
+                expect(offs >= 7, "half-step gates: " + juce::String(offs));
+
+                arp.plugin->reset();
+                events = run(0.6, false, [&](double t, auto& midi)
+                {
+                    if (t > 0.1 && t < 0.1 + 512 / kRate)
+                        press(midi, { 60 });
+                    if (t > 0.4 && t < 0.4 + 512 / kRate)
+                        midi.addMidiMessage(juce::MidiMessage::noteOff(1, 60), 0.0, {});
+                });
+                ons = onsOf(events);
+                expect(!ons.empty() && ons.front().time < 0.1 + 2 * 512 / kRate, "stopped: the first note comes at once");
+                expect(!ons.empty() && ons.back().time < 0.41, "and it stops when you let go");
+                int sounding = 0;
+                for (auto& e : events)
+                    sounding += e.on ? 1 : -1;
+                expectEquals(sounding, 0, "every note is let go");
+
+                arp.plugin->reset();
+                set(arp->latch, 1.0f);
+                events = run(1.0, true, [&](double t, auto& midi)
+                {
+                    if (t == 0.0)
+                        press(midi, { 60, 64 });
+                    if (t > 0.2 && t < 0.2 + 512 / kRate)
+                        for (int n : { 60, 64 })
+                            midi.addMidiMessage(juce::MidiMessage::noteOff(1, n), 0.0, {});
+                    if (t > 0.5 && t < 0.5 + 512 / kRate)
+                        press(midi, { 72 });   // a new chord replaces the latched one
+                });
+                ons = onsOf(events);
+                expectEquals((int) ons.size(), 8, "latched: it keeps going");
+                expect(ons.size() == 8 && ons[7].note == 72 && ons[5].note == 72, "the new key replaces the latched chord");
+                set(arp->latch, 0.0f);
+
+                arp.plugin->reset();
+                set(arp->swing, 0.5f);
+                ons = onsOf(run(0.5, true, [&](double t, auto& midi) { if (t == 0.0) press(midi, { 60 }); }));
+                expect(ons.size() >= 4, "swung notes");
+                if (ons.size() >= 4)
+                {
+                    expectWithinAbsoluteError(ons[1].time, 0.125 + 0.03125, 1.0e-6, "the off-beat is late");
+                    expectWithinAbsoluteError(ons[2].time, 0.25, 1.0e-6, "the beat isn't");
+                }
+                set(arp->swing, 0.0f);
+            }
+
+            beginTest("Arpeggiator: only on MIDI tracks, ahead of the instrument");
+            {
+                error.clear();
+                expect(engine.addEffect(0, ArpeggiatorEffect::xmlTypeName, error) == nullptr && error.contains("MIDI"),
+                       "not on an audio track");
+                engine.setTrackMidi(7, true);
+                auto* a = engine.addEffect(7, ArpeggiatorEffect::xmlTypeName, error);
+                expect(a != nullptr, error);
+                auto& list = engine.getAudioTrack(7)->pluginList;
+                expect(list.indexOf(a) == 0, "first in the chain, so the instrument hears it");
+                edit.getUndoManager().undo();
+                expect(list.indexOf(a) < 0, "and it undoes");
+                engine.setTrackMidi(7, false);
+            }
+
+            beginTest("Analog Synth: plays in tune, releases, is silent between notes, and goes mono");
+            {
+                Standalone<AnalogSynth> syn(fresh);
+                set(syn->cutoff, 1.0f);
+                set(syn->envAmount, 0.0f);
+                set(syn->resonance, 0.0f);
+                set(syn->sub, 0.0f);
+                set(syn->chorus, 0.0f);
+                set(syn->release, 0.1f);
+                // Plays `notes` (on at `on`, off at `off`, seconds) into a fresh buffer.
+                struct Note { int number; double on, off; };
+                auto play = [&](std::vector<Note> notes, double seconds)
+                {
+                    juce::AudioBuffer<float> b(2, (int) (seconds * kRate));
+                    b.clear();
+                    for (int s0 = 0; s0 < b.getNumSamples(); s0 += 512)
+                    {
+                        const int n = juce::jmin(512, b.getNumSamples() - s0);
+                        const double t0 = s0 / kRate, t1 = (s0 + n) / kRate;
+                        te::MidiMessageArray midi;
+                        for (auto& note : notes)
+                        {
+                            if (note.on >= t0 && note.on < t1)
+                                midi.addMidiMessage(juce::MidiMessage::noteOn(1, note.number, (juce::uint8) 100), note.on - t0, {});
+                            if (note.off >= t0 && note.off < t1)
+                                midi.addMidiMessage(juce::MidiMessage::noteOff(1, note.number), note.off - t0, {});
+                        }
+                        const te::TimeRange range(te::TimePosition::fromSeconds(t0), te::TimeDuration::fromSeconds(n / kRate));
+                        te::PluginRenderContext fc(&b, s0, n, &midi, 0.0, range, true, false, false, false);
+                        syn.plugin->applyToBuffer(fc);
+                    }
+                    return b;
+                };
+                auto db = [](float v) { return juce::Decibels::gainToDecibels(v, -200.0f); };
+
+                auto silent = play({}, 0.5);
+                expect(db(rms(silent, 0, 0.0, 0.5)) < -90.0f, "no notes, no hiss: " + juce::String(db(rms(silent, 0, 0.0, 0.5)), 1) + " dB");
+
+                auto a = play({ { 69, 0.1, 0.6 } }, 1.2);
+                const double hz = frequency(a, 0.3, 0.55, 440.0);
+                expectWithinAbsoluteError(hz, 440.0, 440.0 * 0.01, "A4 at 8'");
+                expect(levelAt(a, 220.0, 0.3, 0.55) < levelAt(a, 440.0, 0.3, 0.55) - 40.0f, "not an octave down");
+                expect(db(rms(a, 0, 0.3, 0.55)) > -30.0f, "and loud enough: " + juce::String(db(rms(a, 0, 0.3, 0.55)), 1) + " dB");
+                expect(db(rms(a, 0, 1.0, 1.2)) < db(rms(a, 0, 0.3, 0.55)) - 50.0f, "it lets go");
+                expect(rms(a, 0, 0.0, 0.095) < 1.0e-4f, "nothing before the note");
+                int onset = -1;
+                for (int i = 0; i < a.getNumSamples() && onset < 0; ++i)
+                    if (std::abs(a.getSample(0, i)) > 1.0e-3f)
+                        onset = i;
+                expect(onset >= (int) (0.1 * kRate) && onset < (int) (0.1 * kRate) + 480, "the note starts on its sample: " + juce::String(onset));
+
+                set(syn->range, 2.0f);
+                auto up = play({ { 69, 0.0, 0.5 } }, 0.5);
+                expectWithinAbsoluteError(frequency(up, 0.2, 0.45, 880.0), 880.0, 880.0 * 0.01, "4' is an octave up");
+                expect(levelAt(up, 440.0, 0.2, 0.45) < levelAt(up, 880.0, 0.2, 0.45) - 40.0f, "and nothing at 440");
+                set(syn->range, 1.0f);
+
+                set(syn->voiceMode, (float) AnalogSynth::Mono);
+                auto mono = play({ { 57, 0.0, 0.8 }, { 64, 0.3, 0.8 } }, 0.8);
+                expectWithinAbsoluteError(frequency(mono, 0.5, 0.75, 329.63), 329.63, 329.63 * 0.015, "Mono: the last key wins");
+                expect(levelAt(mono, 220.0, 0.5, 0.75) < levelAt(mono, 329.63, 0.5, 0.75) - 30.0f, "and the first note's gone");
+
+                set(syn->voiceMode, (float) AnalogSynth::PolyI);
+                auto chord = play({ { 57, 0.0, 0.8 }, { 64, 0.0, 0.8 } }, 0.8);
+                expect(levelAt(chord, 220.0, 0.3, 0.75) > -40.0f && levelAt(chord, 329.63, 0.3, 0.75) > -40.0f, "Poly: both notes");
+
+                set(syn->chorus, 3.0f);
+                auto wide = play({ { 60, 0.0, 0.8 } }, 0.8);
+                double lr = 0, ll = 0, rr = 0;
+                for (int i = (int) (0.2 * kRate); i < (int) (0.7 * kRate); ++i)
+                {
+                    lr += wide.getSample(0, i) * wide.getSample(1, i);
+                    ll += wide.getSample(0, i) * wide.getSample(0, i);
+                    rr += wide.getSample(1, i) * wide.getSample(1, i);
+                }
+                expect(lr / std::sqrt(ll * rr) < 0.95, "the chorus spreads it");
+            }
+
+            // Plays MIDI notes into an instrument: { note, on, off } in seconds.
+            struct Hit { int note; double on, off; };
+            auto playInto = [&](te::Plugin& p, std::vector<Hit> notes, double seconds)
+            {
+                p.reset();   // nothing left sounding from the last go
+                juce::AudioBuffer<float> b(2, (int) (seconds * kRate));
+                b.clear();
+                for (int s0 = 0; s0 < b.getNumSamples(); s0 += 512)
+                {
+                    const int n = juce::jmin(512, b.getNumSamples() - s0);
+                    const double t0 = s0 / kRate, t1 = (s0 + n) / kRate;
+                    te::MidiMessageArray midi;
+                    for (auto& h : notes)
+                    {
+                        if (h.on >= t0 && h.on < t1)
+                            midi.addMidiMessage(juce::MidiMessage::noteOn(1, h.note, (juce::uint8) 127), h.on - t0, {});
+                        if (h.off >= t0 && h.off < t1)
+                            midi.addMidiMessage(juce::MidiMessage::noteOff(1, h.note), h.off - t0, {});
+                    }
+                    const te::TimeRange range(te::TimePosition::fromSeconds(t0), te::TimeDuration::fromSeconds(n / kRate));
+                    te::PluginRenderContext fc(&b, s0, n, &midi, 0.0, range, true, false, false, false);
+                    p.applyToBuffer(fc);
+                }
+                return b;
+            };
+            auto writeTone = [&](const juce::String& name, double hz, double seconds)
+            {
+                auto f = dir.getChildFile(name);
+                f.deleteFile();
+                auto tone = sine(hz, seconds, 0.5f, 1);
+                std::unique_ptr<juce::OutputStream> stream = f.createOutputStream();
+                juce::WavAudioFormat wav;
+                auto writer = wav.createWriterFor(stream, juce::AudioFormatWriterOptions().withSampleRate(kRate).withNumChannels(1).withBitsPerSample(24));
+                writer->writeFromAudioSampleBuffer(tone, 0, tone.getNumSamples());
+                return f;
+            };
+
+            beginTest("Drum Sampler: pads play their sounds from C1 up, tuned, choked, copied into the project");
+            {
+                Standalone<DrumSampler> d(fresh);
+                const auto hit = writeTone("hit.wav", 1000.0, 0.4);
+                const auto hat = writeTone("hat.wav", 3000.0, 0.4);
+                juce::String err;
+                expect(d->loadPad(0, hit, err), err);
+                expect(d->loadPad(2, hat, err), err);
+                expect(d->getPadFile(0).existsAsFile() && d->getPadFile(0) != hit, "copied into the project");
+                std::vector<EffectPlugin::FileReference> refs;
+                d->getFileReferences(refs);
+                expectEquals((int) refs.size(), (int) DrumSampler::kPads, "every pad's file goes with Save As");
+                expect(!d->loadPad(1, dir.getChildFile("nothing.wav"), err) && err.isNotEmpty(), "a missing file says why");
+
+                auto b = playInto(*d.plugin, { { 36, 0.0, 0.05 } }, 0.5);
+                expectWithinAbsoluteError(frequency(b, 0.05, 0.35, 1000.0), 1000.0, 10.0, "C1 plays pad 1, all the way (note-off doesn't stop it)");
+                expect(rms(b, 0, 0.42, 0.5) < 1.0e-4f, "then stops at the end of the sound");
+                b = playInto(*d.plugin, { { 37, 0.0, 0.1 } }, 0.2);
+                expect(b.getMagnitude(0, b.getNumSamples()) < 1.0e-6f, "an empty pad is silent");
+
+                set(d->pads[0].tune, 12.0f);
+                b = playInto(*d.plugin, { { 36, 0.0, 0.1 } }, 0.3);
+                expectWithinAbsoluteError(frequency(b, 0.02, 0.18, 2000.0), 2000.0, 20.0, "+12 is an octave up");
+                set(d->pads[0].tune, 0.0f);
+
+                set(d->pads[0].decay, 0.25f);
+                b = playInto(*d.plugin, { { 36, 0.0, 0.1 } }, 0.4);
+                expect(rms(b, 0, 0.15, 0.3) < 1.0e-3f && rms(b, 0, 0.01, 0.05) > 0.1f, "a quarter decay fades it in the first quarter");
+                set(d->pads[0].decay, 1.0f);
+
+                set(d->pads[0].choke, 1.0f);
+                set(d->pads[2].choke, 1.0f);
+                b = playInto(*d.plugin, { { 38, 0.0, 0.1 }, { 36, 0.1, 0.2 } }, 0.35);
+                expect(levelAt(b, 3000.0, 0.15, 0.3) < levelAt(b, 1000.0, 0.15, 0.3) - 40.0f, "the second pad chokes the first");
+
+                set(d->pads[0].pan, -1.0f);
+                b = playInto(*d.plugin, { { 36, 0.0, 0.1 } }, 0.2);
+                expect(rms(b, 1, 0.02, 0.18) < 1.0e-4f && rms(b, 0, 0.02, 0.18) > 0.1f, "panned hard left");
+
+                d->audition(0, 127);
+                b = juce::AudioBuffer<float>(2, (int) (0.1 * kRate));
+                b.clear();
+                render(*d.plugin, b);
+                expect(rms(b, 0, 0.0, 0.1) > 0.1f, "clicking a pad plays it");
+                expect(d->getActivity(0) > 0.1f, "and lights it");
+
+                const auto padState = d.plugin->state.createCopy();
+                Standalone<DrumSampler> again(fresh);
+                again.plugin->restorePluginStateFromValueTree(padState);
+                expect(again->getPadSample(0) != nullptr && again->getPadSample(2) != nullptr, "the pads come back with the project");
+            }
+
+            beginTest("Sampler: plays one sound up the keyboard from its root, loops, and keeps a recording");
+            {
+                Standalone<KeySampler> k(fresh);
+                const auto a = writeTone("a440.wav", 440.0, 0.5);
+                juce::String err;
+                expect(k->loadFile(a, err), err);
+                set(k->root, 69.0f);
+                auto b = playInto(*k.plugin, { { 81, 0.0, 0.3 } }, 0.3);
+                expectWithinAbsoluteError(frequency(b, 0.02, 0.2, 880.0), 880.0, 9.0, "an octave above the root");
+                b = playInto(*k.plugin, { { 57, 0.0, 0.3 } }, 0.3);
+                expectWithinAbsoluteError(frequency(b, 0.02, 0.2, 220.0), 220.0, 3.0, "an octave below");
+                expect(levelAt(b, 440.0, 0.02, 0.2) < levelAt(b, 220.0, 0.02, 0.2) - 40.0f, "and not the original");
+
+                b = playInto(*k.plugin, { { 69, 0.0, 1.5 } }, 1.0);
+                expect(rms(b, 0, 0.6, 0.9) < 1.0e-4f, "without Loop, it stops at the end");
+                set(k->loop, 1.0f);
+                b = playInto(*k.plugin, { { 69, 0.0, 1.5 } }, 1.0);
+                expect(rms(b, 0, 0.6, 0.9) > 0.1f, "with Loop, it keeps going while held");
+                set(k->release, 0.01f);
+                b = playInto(*k.plugin, { { 69, 0.0, 0.6 } }, 1.0);
+                expect(rms(b, 0, 0.7, 1.0) < 1.0e-4f, "and stops when let go");
+                set(k->loop, 0.0f);
+
+                // A recording (as if from an input): kept in the project, its note found.
+                auto tone = sine(329.63, 1.0, 0.4f, 1);
+                auto take = Sample::fromBuffer(std::move(tone), kRate, "take");
+                expect(k->useRecording(take, err), err);
+                expect(k->getFile().existsAsFile() && k->getFile().getParentDirectory().getFileName() == "Audio",
+                       "saved into the project's Audio folder: " + k->getFile().getFullPathName());
+                expectEquals(juce::roundToInt(k->root->getCurrentValue()), 64, "Root is E4, heard from the recording");
+                b = playInto(*k.plugin, { { 76, 0.0, 0.3 } }, 0.3);
+                expectWithinAbsoluteError(frequency(b, 0.02, 0.2, 659.26), 659.26, 7.0, "and it plays in tune from there");
+                expect(!k->useRecording(nullptr, err) && err.isNotEmpty(), "a silent take says so");
+            }
+
+            beginTest("Sidechain in the real mix: a muted key track ducks another track");
+            {
+                const double sr = engine.getSampleRate();
+                auto loud = writeWav(dir.getChildFile("key.wav"), sr, (int) sr * 2, 0.5f);
+                auto soft = writeWav(dir.getChildFile("soft.wav"), sr, (int) sr * 2, 0.05f);
+                project.newProject();
+                juce::String err;
+                expect(project.importAudio(loud, 0, 0, err), err);
+                expect(project.importAudio(soft, 1, 0, err), err);
+                engine.getTrack(0).mute = true;   // the key still feeds the compressor
+                engine.syncNow();
+                auto* comp = dynamic_cast<CompressorEffect*>(engine.addEffect(1, CompressorEffect::xmlTypeName, err));
+                expect(comp != nullptr, err);
+                set(comp->threshold, -20.0f);
+                set(comp->ratio, 20.0f);
+                set(comp->attack, 0.1f);
+                set(comp->knee, 0.0f);
+
+                auto unkeyed = dir.getChildFile("unkeyed.wav"), keyed = dir.getChildFile("keyed.wav");
+                expect(project.exportMix(unkeyed, err), err);
+                comp->setKeySource(engine.getAudioTrack(0));
+                expect(project.exportMix(keyed, err), err);
+                const float plain = std::abs(sampleAt(unkeyed, 1.0)), ducked = std::abs(sampleAt(keyed, 1.0));
+                expect(plain > 0.01f, "the soft track is under the threshold: " + juce::String(plain));
+                // The key is 14 dB over -20 dB, so at (nearly) infinite ratio the soft track drops ~14 dB.
+                expectWithinAbsoluteError(juce::Decibels::gainToDecibels(ducked / plain), -14.0f, 1.5f,
+                                          "keyed: ducked by the muted track");
+
+                beginTest("Limiter on the master: the export never goes over the ceiling");
+                auto* limiter = dynamic_cast<LimiterEffect*>(engine.addEffect(AudioEngine::kMasterBus, LimiterEffect::xmlTypeName, err));
+                expect(limiter != nullptr, err);
+                engine.removeInsert(*comp);
+                engine.getTrack(0).mute = false;
+                engine.syncNow();
+                set(limiter->gain, 12.0f);
+                set(limiter->ceiling, -3.0f);
+                auto limited = dir.getChildFile("limited.wav");
+                expect(project.exportMix(limited, err), err);
+                expectWithinAbsoluteError(std::abs(sampleAt(limited, 1.0)), juce::Decibels::decibelsToGain(-3.0f), 0.01f,
+                                          "held at -3 dB");
+            }
+
+            beginTest("Every effect handles mono, and never makes NaNs");
+            for (auto& type : types)
+            {
+                auto plugin = project.getEdit().getPluginCache().createNewPlugin(type.xmlType, {});
+                plugin->baseClassInitialise({ te::TimePosition(), kRate, 512 });
+                for (auto* param : plugin->getAutomatableParameters())
+                    param->setParameter(param->getValueRange().getEnd(), juce::sendNotification);   // everything up
+                auto mono = sine(330.0, 0.5, 0.9f, 1);
+                render(*plugin, mono, true);
+                bool finite = true;
+                for (int i = 0; i < mono.getNumSamples(); ++i)
+                    finite = finite && std::isfinite(mono.getSample(0, i));
+                expect(finite, type.name);
+                plugin->baseClassDeinitialise();
+            }
+        }
+        dir.deleteRecursively();
+    }
+};
+
+static ShortcutTests shortcutTests;
+static PianoRollTests pianoRollTests;
+static SongwritingTests songwritingTests;
 static LoopTests loopTests;
+static MidiAssignTests midiAssignTests;
+static MidiInputRoutingTests midiInputRoutingTests;
+static ClipOperationTests clipOperationTests;
 static ArrangementTests arrangementTests;
 static TracktionProjectTests tracktionProjectTests;
 static PluginInsertTests pluginInsertTests;
+static StereoBusTests stereoBusTests;
 static StereoInputTests stereoInputTests;
 static MidiTrackTests midiTrackTests;
 static AutomationTests automationTests;
+static EffectTests effectTests;
 
 int main()
 {

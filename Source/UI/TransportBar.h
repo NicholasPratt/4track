@@ -14,12 +14,13 @@ public:
     void resized() override;
 
     /** Call from the UI timer. */
-    void tick();
+    void tick(bool canRecall);
     /** Re-reads tempo/toggles after a project load. */
     void refresh();
     void showRangeMode();
+    void showTuner();
 
-    std::function<void()> onPlay, onStop, onRecord, onToStart, onRangeMode;
+    std::function<void()> onRecall, onPlay, onStop, onRecord, onToStart, onRangeMode;
     std::function<void()> onZoomIn, onZoomOut, onToggleMixer, onGridChanged;
 
     void setMasterPeaks(float l, float r) { masterMeter.setPeaks(l, r); }
@@ -31,6 +32,7 @@ private:
     TimelineView& view;
 
     juce::Label projectName;
+    juce::TextButton recall { "Keep what I just played" };
     IconButton toStart { "Go to start", IconButton::Icon::ToStart },
                play    { "Play", IconButton::Icon::Play, Theme::monitor },
                stop    { "Stop", IconButton::Icon::Stop },
@@ -39,12 +41,17 @@ private:
     juce::Rectangle<int> displayArea;
     juce::String barsText, timeText;
 
-    juce::Slider bpm;
-    juce::ComboBox timeSig;
+    /** Shows the tempo and time signature; opens the TempoPopup. */
+    juce::TextButton tempo;
+    juce::Component::SafePointer<juce::CallOutBox> tempoPopup;
+    void showTempoPopup();
+    void showTempo();
 
-    ToggleChip click   { "Click", Theme::accent, "Metronome (C)" },
-               countIn { "Count-in", Theme::accent, "One bar of click before recording starts" },
-               punch   { "Punch", Theme::record, "Off / Punch / Loop (P). Punch records only inside the range; Loop repeats it, "
+    IconButton click { "Metronome", IconButton::Icon::Metronome },
+               countIn { "Recording count-in", IconButton::Icon::CountIn },
+               tuner { "Tuner", IconButton::Icon::Tuner };
+    std::unique_ptr<juce::DocumentWindow> tunerWindow;
+    ToggleChip punch   { "Punch", Theme::record, "Off / Punch / Loop (P). Punch records only inside the range; Loop repeats it, "
                                                  "and recording in a loop works like a looper. Drag on the lower strip of the ruler to set the range." },
                snap    { "Snap", Theme::accent, "Snap edits to the grid (hold Cmd while dragging to bypass)" },
                mixer   { "Mixer", Theme::accent, "Show the mixer (X)" };

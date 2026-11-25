@@ -15,7 +15,10 @@
       drag a clip's edge      trim it
       drag a top corner       adjust the fade-in or fade-out
       click empty space       move the playhead there
-      right-click a clip      cut / copy / paste / duplicate / split / delete / fades / gain
+      drag on empty space     draw a rectangle: selects the clips it touches (shift adds to the
+                              selection), then offers join / normalise / transpose and more
+      right-click a clip      cut / copy / paste / duplicate / split / delete / fades / gain /
+                              join / normalise / transpose
       right-click empty space paste the copied clips there
       wheel / trackpad        scroll;  cmd + wheel or pinch to zoom
       hold cmd while dragging to turn snapping off for that drag
@@ -30,7 +33,8 @@
     committed as one undo step on mouse-up.
 */
 class TrackLanes : public juce::Component,
-                   public juce::FileDragAndDropTarget
+                   public juce::FileDragAndDropTarget,
+                   public juce::DragAndDropTarget
 {
 public:
     TrackLanes(AudioEngine&, Project&, TimelineView&);
@@ -68,6 +72,12 @@ public:
     bool isInterestedInFileDrag(const juce::StringArray& files) override;
     void filesDropped(const juce::StringArray& files, int x, int y) override;
 
+    bool isInterestedInDragSource(const SourceDetails&) override;
+    void itemDragEnter(const SourceDetails&) override;
+    void itemDragMove(const SourceDetails&) override;
+    void itemDragExit(const SourceDetails&) override;
+    void itemDropped(const SourceDetails&) override;
+
 private:
     enum class Zone { None, Body, TrimStart, TrimEnd, FadeIn, FadeOut };
     struct Hit { juce::int64 clipId = 0; int track = -1; Zone zone = Zone::None; };
@@ -76,8 +86,14 @@ private:
     juce::Rectangle<float> clipRect(const Clip& c, int track) const;
     juce::int64 snapped(juce::int64 s, const juce::ModifierKeys& mods) const;
     std::function<bool(Arrangement&)> editForDrag(const juce::MouseEvent& e) const;
+    juce::Rectangle<float> takeControl(const Clip&, int track) const;
     void showClipMenu(juce::int64 clipId, int track, juce::int64 position);
     void showEmptyMenu(int track, juce::int64 position);
+    /** Join, normalise and transpose, for the selection. */
+    void addSelectionActions(juce::PopupMenu&) const;
+    /** Runs a menu result from addSelectionActions; false if it wasn't one of those. */
+    bool performSelectionAction(int result);
+    void updateMarquee(const juce::MouseEvent&);
 
     void paintGrid(juce::Graphics&, float top, float bottom);
     void paintClip(juce::Graphics&, const Clip&, int track, bool selected, bool hovered);
@@ -103,12 +119,26 @@ private:
     std::set<juce::int64> selection;
     Hit hover;
 
+    struct ChordDrop
+    {
+        int track;
+        te::TimeRange range;
+        juce::String symbol;
+    };
+    std::optional<ChordDrop> chordDropAt(const SourceDetails&);
+    void insertDroppedChord(const ChordDrop&, bool allowConversion);
+    std::optional<ChordDrop> chordDropPreview;
+
     // Drag state
     Hit dragHit;
     bool dragActive = false;
     juce::int64 dragDownSample = 0;
     int dragDownTrack = 0;
     std::optional<Arrangement> preview;
+
+    // Rectangle selection, while dragging on empty space
+    std::optional<juce::Rectangle<float>> marquee;
+    std::set<juce::int64> marqueeBase;   // the selection it adds to
 
     // Waveforms, built and cached by Tracktion. Keyed by file path.
     std::map<juce::String, std::unique_ptr<te::SmartThumbnail>> thumbnails;

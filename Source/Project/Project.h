@@ -4,6 +4,7 @@
 #include "../Model/Arrangement.h"
 #include <functional>
 #include <map>
+#include <set>
 
 /**
     The open project: a Tracktion Edit plus the folder it lives in.
@@ -53,8 +54,46 @@ public:
     /** The Tracktion MIDI clip for an Arrangement clip id, for editing its notes. */
     te::MidiClip* getMidiClip(juce::int64 clipId) const;
 
+    // Clip operations on a selection, each one undo step.
+    /** True if some track has two or more of these clips, so joinClips would do something. */
+    bool canJoin(const std::set<juce::int64>& ids) const;
+    /** Joins the clips on each track into one clip, from the first one's start to the last
+        one's end. Audio clips are rendered (with their gain and fades, silence in any gaps)
+        into a new file in the project's Audio folder; MIDI clips are merged. Returns the
+        joined clips' ids, or nothing (with error set) if it couldn't. */
+    std::set<juce::int64> joinClips(const std::set<juce::int64>& ids, juce::String& error);
+    /** Sets each audio clip's gain so its loudest sample peaks at 0 dBFS (up to +40 dB).
+        The audio file isn't changed. */
+    bool normaliseClips(const std::set<juce::int64>& ids);
+    /** Moves every note in these MIDI clips by this many semitones (kept within 0..127). */
+    bool transposeClips(const std::set<juce::int64>& ids, int semitones);
+
     /** Copies an audio file into the project and places it as a clip. */
     bool importAudio(const juce::File& file, int track, juce::int64 position, juce::String& error);
+
+    void chooseTake(juce::int64 clipID, int index);
+    bool canRecall(int track) const;
+    bool recall(int track, juce::String& error);
+    juce::Result addSection(const juce::String&, te::TimeRange);
+    void duplicateSection(te::ArrangerClip&);
+
+    enum class SongEntry { Chord, Lyric };
+    struct SongNote { te::BeatPosition beat; juce::String text; juce::ValueTree entry; };
+    std::vector<SongNote> songNotes(SongEntry) const;
+    // An existing lyric is edited by identity, so other lines at the same beat stay intact.
+    void setSongNote(SongEntry, te::BeatPosition, const juce::String&, juce::ValueTree entry = {});
+    void moveLyric(juce::ValueTree lyric, te::BeatPosition);
+    juce::ValueTree adjacentLyric(juce::ValueTree lyric, int direction) const;
+    void reorderLyric(juce::ValueTree lyric, int direction);
+    void mergeLyric(juce::ValueTree lyric, int direction);
+    juce::String getLyricDraft() const;
+    void setLyricDraft(const juce::String&);
+    juce::String timelineLyricText() const;
+    juce::String lyricSheetText() const;
+    juce::int64 songNotesEnd() const;
+    te::BeatDuration chordDuration(te::BeatPosition source) const;
+    bool canPlaceChord(int track, te::TimeRange) const;
+    te::MidiClip* placeChord(int track, te::TimeRange, const juce::String& symbol, bool allowConversion);
 
     // Files
     bool isUntitled() const { return untitled; }
@@ -68,11 +107,29 @@ public:
     bool saveAs(const juce::File& newFolder, juce::String& error);
     bool load(const juce::File& folderOrFile, juce::String& error);
 
-    /** Renders the whole arrangement, with a reverb tail, to a WAV file. */
+    struct ExportSettings
+    {
+        enum class Format { wav, mp3 };
+        Format format = Format::wav;
+        int wavBitDepth = 24;
+        int mp3BitrateKbps = 192;
+
+        static constexpr int wavBitDepths[] { 16, 24, 32 };
+        static constexpr int mp3Bitrates[] { 64, 96, 128, 160, 192, 224, 256, 320 };
+        const char* extension() const { return format == Format::mp3 ? "mp3" : "wav"; }
+    };
+
+    /** Renders the whole arrangement, with a reverb tail. */
     bool exportMix(const juce::File& file, juce::String& error);
+    bool exportMix(const juce::File& file, const ExportSettings&, juce::String& error);
 
     /** Call when the device sample rate changes: clip positions are re-read at the new rate. */
     void handleSampleRateChange() { rebuild(); }
+
+    /** Runs slow file work (rendering, copying, scanning audio) that doesn't touch the Edit.
+        The UI sets this to run it on a background thread behind a busy indicator; by
+        default it just runs the work. */
+    std::function<void(const juce::String& message, const std::function<void()>& work)> runInBackground;
 
     /** Called after anything changes that the UI should redraw. */
     std::function<void()> onChanged;
@@ -91,6 +148,10 @@ private:
     juce::File makeUntitledFolder() const;
     juce::File editFile() const { return folder.getChildFile(kProjectFileName); }
     juce::int64 fileLength(const juce::File&) const;
+    static bool renderClips(const std::vector<Clip>& clips, const juce::File& dest, double sampleRate,
+                            te::AudioFileFormatManager&, juce::String& error);
+    static float peakOf(const Clip&, juce::AudioFormatManager&, double sampleRate);
+    void background(const juce::String& message, const std::function<void()>& work);
 
     void valueTreePropertyChanged(juce::ValueTree&, const juce::Identifier&) override;
     void valueTreeChildAdded(juce::ValueTree&, juce::ValueTree&) override;

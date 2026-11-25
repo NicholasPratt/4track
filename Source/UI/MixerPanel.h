@@ -56,18 +56,19 @@ private:
 
     Knob lowCut { "LO CUT", Theme::mute }, highCut { "HI CUT", Theme::mute },
          midFreq { "FREQ", Theme::mute }, midGain { "GAIN", Theme::mute },
-         send { "REVERB", Theme::solo }, pan { "PAN", Theme::accent };
+         send1 { "B1 LVL", Theme::monitor }, send2 { "B2 LVL", Theme::solo }, pan { "PAN", Theme::accent };
     InsertSlots inserts;
+    juce::TextButton mainRoute { "Main" }, bus1Route { "B1" }, bus2Route { "B2" };
     juce::TextButton mute { "M" }, solo { "S" };
     juce::Slider fader;
     juce::Label faderValue;
     LevelMeter meter { true };
 };
 
-class MasterStrip : public juce::Component
+class OutputStrip : public juce::Component
 {
 public:
-    MasterStrip(AudioEngine&, Project&);
+    OutputStrip(AudioEngine&, Project&, int mixerIndex);
     void refresh();
     void setMeter(float l, float r) { meter.setPeaks(l, r); }
     void paint(juce::Graphics&) override;
@@ -75,8 +76,12 @@ public:
 
 private:
     AudioEngine& engine;
-    Project& project;
-    Knob room { "ROOM", Theme::solo }, damping { "DAMP", Theme::solo }, wet { "REVERB", Theme::solo };
+    OutputParams& params;
+    const bool bus1;
+    const juce::String name;
+    const juce::Colour colour;
+    Knob room { "ROOM", Theme::monitor }, damping { "DAMP", Theme::monitor }, wet { "WET", Theme::monitor };
+    juce::TextButton reverb { "Reverb" }, toMain { "Main" }, toBus2 { "Bus 2" };
     InsertSlots inserts;
     juce::Slider fader;
     juce::Label faderValue;
@@ -90,6 +95,7 @@ public:
     void refresh();
     void setMeter(int track, float l, float r) { strips[(size_t) track]->setMeter(l, r); }
     void setMasterMeter(float l, float r) { master.setMeter(l, r); }
+    void setBusMeter(int bus, float l, float r) { (bus == 0 ? bus1 : bus2).setMeter(l, r); }
     void paint(juce::Graphics&) override;
     void resized() override;
 
@@ -97,5 +103,5 @@ public:
 
 private:
     std::array<std::unique_ptr<ChannelStrip>, kNumTracks> strips;
-    MasterStrip master;
+    OutputStrip bus1, bus2, master;
 };

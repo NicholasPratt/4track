@@ -1,0 +1,770 @@
+diff --git a/modules/juce b/modules/juce
+--- a/modules/juce
++++ b/modules/juce
+@@ -1 +1 @@
+-Subproject commit 7ff644f65d7daa1428c34b9738ebb5c449dc9172
++Subproject commit 7ff644f65d7daa1428c34b9738ebb5c449dc9172-dirty
+diff --git a/modules/tracktion_engine/playback/devices/tracktion_InputDevice.h b/modules/tracktion_engine/playback/devices/tracktion_InputDevice.h
+index b10abc63619..6f8fded0d5f 100644
+--- a/modules/tracktion_engine/playback/devices/tracktion_InputDevice.h
++++ b/modules/tracktion_engine/playback/devices/tracktion_InputDevice.h
+@@ -233,7 +233,8 @@ public:
+     /** Takes the retrospective buffer and creates clips from it, as if recording had been
+         triggered in the past and stopped at the time of calling this function.
+     */
+-    virtual juce::Array<Clip*> applyRetrospectiveRecord (bool armedOnly) = 0;
++    virtual bool hasRetrospectiveData() = 0;
++    virtual juce::Array<Clip*> applyRetrospectiveRecord (bool armedOnly, EditItemID onlyTarget = {}) = 0;
+ 
+     //==============================================================================
+     juce::ValueTree state;          /** The state of this instance. */
+diff --git a/modules/tracktion_engine/playback/devices/tracktion_MidiInputDevice.cpp b/modules/tracktion_engine/playback/devices/tracktion_MidiInputDevice.cpp
+index 912a57e5417..fb840518546 100644
+--- a/modules/tracktion_engine/playback/devices/tracktion_MidiInputDevice.cpp
++++ b/modules/tracktion_engine/playback/devices/tracktion_MidiInputDevice.cpp
+@@ -265,7 +265,10 @@ struct RetrospectiveMidiBuffer
+             + adjust - lengthInSeconds;
+ 
+             if (m.getTimeStamp() > cutoffTime)
++            {
+                 sequence.add (m);
++                availableUntilMs.store (juce::Time::getMillisecondCounterHiRes() + lengthInSeconds * 1000.0);
++            }
+ 
+             // remove all events that are no longer in the time window
+             int unused = 0;
+@@ -279,16 +282,19 @@ struct RetrospectiveMidiBuffer
+         }
+     }
+ 
+-    juce::MidiMessageSequence takeMidiMessages()
++    juce::MidiMessageSequence takeMidiMessages (double adjust)
+     {
+         juce::MidiMessageSequence result;
+ 
+         {
+             lock.lock();
+ 
++            const auto cutoff = juce::Time::getMillisecondCounterHiRes() * 0.001 + adjust - lengthInSeconds;
+             for (auto m : sequence)
+-                result.addEvent (m);
++                if (m.getTimeStamp() >= cutoff)
++                    result.addEvent (m);
+ 
++            availableUntilMs = 0;
+             sequence.clear();
+ 
+             lock.unlock();
+@@ -323,6 +329,7 @@ struct RetrospectiveMidiBuffer
+         return result;
+     }
+ 
++    std::atomic<double> availableUntilMs { 0 };
+     juce::Array<juce::MidiMessage> sequence;
+     double lengthInSeconds = 0;
+     RealTimeSpinLock lock;
+@@ -1370,7 +1377,14 @@ public:
+         return createdClips;
+     }
+ 
+-    juce::Array<Clip*> applyRetrospectiveRecord (bool armedOnly) override
++    bool hasRetrospectiveData() override
++    {
++        if (auto* buffer = getMidiInput().getRetrospectiveMidiBuffer())
++            return buffer->availableUntilMs.load() > juce::Time::getMillisecondCounterHiRes();
++        return false;
++    }
++
++    juce::Array<Clip*> applyRetrospectiveRecord (bool armedOnly, EditItemID onlyTarget) override
+     {
+         CRASH_TRACER
+ 
+@@ -1384,10 +1398,12 @@ public:
+ 
+         for (auto track : getTargetTracks (*this))
+         {
++            if (onlyTarget.isValid() && onlyTarget != track->itemID)
++                continue;
+             if (armedOnly && ! isRecordingActive (track->itemID))
+                 continue;
+ 
+-            auto sequence = retrospective->takeMidiMessages();
++            auto sequence = retrospective->takeMidiMessages (mi.getAdjustSecs());
+ 
+             if (sequence.getNumEvents() == 0)
+                 return {};
+@@ -1446,10 +1462,15 @@ public:
+ 
+             if (sequence.getNumEvents() > 0)
+             {
++                const TimeRange range (TimePosition::fromSeconds (start), TimePosition::fromSeconds (start + length));
++                if (onlyTarget.isValid())
++                    track->deleteRegion (range, nullptr);
+                 auto clip = mi.addMidiAsTransaction (edit, track->getClipOwnerID(), nullptr, std::move (sequence),
+-                                                     { TimePosition::fromSeconds (start), TimePosition::fromSeconds (start + length) },
++                                                     range,
+                                                      MidiInputDevice::MergeMode::never,
+                                                      channelToApply);
++                if (clip == nullptr)
++                    continue;
+                 clip->setOffset (TimeDuration::fromSeconds (offset));
+                 clips.add (clip);
+ 
+diff --git a/modules/tracktion_engine/playback/devices/tracktion_WaveInputDevice.cpp b/modules/tracktion_engine/playback/devices/tracktion_WaveInputDevice.cpp
+index 55cefedd947..ecbf61bf0be 100644
+--- a/modules/tracktion_engine/playback/devices/tracktion_WaveInputDevice.cpp
++++ b/modules/tracktion_engine/playback/devices/tracktion_WaveInputDevice.cpp
+@@ -160,7 +160,7 @@ struct RetrospectiveRecordBuffer
+     {
+         if (numSamplesIn < numSamples)
+         {
+-            lastStreamTime = streamTime;
++            lastStreamEnd = streamTime + (double) numSamplesIn / sampleRate;
+ 
+             fifo.ensureFreeSpace (numSamplesIn);
+             fifo.write (inputBuffer);
+@@ -175,7 +175,7 @@ struct RetrospectiveRecordBuffer
+         if (context.isPlaying())
+         {
+             pei.pausedTime = 0s;
+-            pei.lastEditTime = context.globalStreamTimeToEditTime (streamTime);
++            pei.lastEditTime = context.globalStreamTimeToEditTime (streamTime + (double) numSamplesIn / sampleRate);
+         }
+         else
+         {
+@@ -203,7 +203,7 @@ struct RetrospectiveRecordBuffer
+     double lengthInSeconds = 30.0;
+ 
+     AudioFifo fifo { 1, 1 };
+-    double lastStreamTime = 0;
++    double lastStreamEnd = 0;
+ 
+     int numChannels = 0;
+     int numSamples = 0;
+@@ -1031,12 +1031,20 @@ public:
+         return false;
+     }
+ 
+-    juce::Array<Clip*> applyRetrospectiveRecord (bool armedOnly) override
++    bool hasRetrospectiveData() override
++    {
++        auto* buffer = getWaveInput().getRetrospectiveRecordBuffer();
++        return buffer != nullptr && buffer->fifo.getNumReady() > 0;
++    }
++
++    juce::Array<Clip*> applyRetrospectiveRecord (bool armedOnly, EditItemID onlyTarget) override
+     {
+         juce::Array<Clip*> clips;
+ 
+         for (auto dstTrack : getTargetTracks (*this))
+         {
++            if (onlyTarget.isValid() && onlyTarget != dstTrack->itemID)
++                continue;
+             if (armedOnly && ! isRecordingActive (dstTrack->itemID))
+                 continue;
+ 
+@@ -1044,8 +1052,8 @@ public:
+ 
+             auto recordBuffer = wi.getRetrospectiveRecordBuffer();
+ 
+-            if (recordBuffer == nullptr)
+-                return nullptr;
++            if (recordBuffer == nullptr || recordBuffer->fifo.getNumReady() == 0)
++                continue;
+ 
+             auto format = getFormatToUse();
+             const auto res = getDestinationRecordingFile (edit, dstTrack->itemID, *format, getWaveInput().getFilenameMask());
+@@ -1062,58 +1070,43 @@ public:
+                                         recordBuffer->sampleRate,
+                                         wi.bitDepth, metadata, 0);
+ 
+-                if (writer.isOpen())
+-                {
+-                    int numReady;
+-                    juce::AudioBuffer<float> scratchBuffer (recordBuffer->numChannels, 1000);
+-
+-                    while ((numReady = recordBuffer->fifo.getNumReady()) > 0)
+-                    {
+-                        auto toRead = std::min (numReady, scratchBuffer.getNumSamples());
++                if (! writer.isOpen())
++                    return clips;
+ 
+-                        if (! recordBuffer->fifo.read (scratchBuffer, 0, toRead)
+-                             || ! writer.appendBuffer (scratchBuffer, toRead))
+-                            return nullptr;
+-                    }
++                int numReady;
++                juce::AudioBuffer<float> scratchBuffer (recordBuffer->numChannels, 1000);
++                while ((numReady = recordBuffer->fifo.getNumReady()) > 0)
++                {
++                    const auto toRead = std::min (numReady, scratchBuffer.getNumSamples());
++                    if (! recordBuffer->fifo.read (scratchBuffer, 0, toRead)
++                         || ! writer.appendBuffer (scratchBuffer, toRead))
++                        return clips;
+                 }
+             }
+ 
+-            auto proj = getProjectForEdit (edit);
+-
+-            if (proj == nullptr)
++            ProjectItem::Ptr projectItem;
++            if (auto proj = getProjectForEdit (edit))
+             {
+-                jassertfalse; // TODO
+-                return nullptr;
++                projectItem = proj->createNewItem (recordedFile, ProjectItem::waveItemType(),
++                                                   recordedFile.getFileNameWithoutExtension(), {},
++                                                   ProjectItem::Category::recorded, true);
++                if (projectItem == nullptr)
++                    continue;
+             }
+ 
+-            auto projectItem = proj->createNewItem (recordedFile, ProjectItem::waveItemType(),
+-                                                    recordedFile.getFileNameWithoutExtension(),
+-                                                    {}, ProjectItem::Category::recorded, true);
+-
+-            if (projectItem == nullptr)
+-                continue;
+-
+-            jassert (projectItem->getProjectItemRef().isValid());
+-
+             auto clipName = getNameForNewClip (*dstTrack);
+             TimePosition start;
+             const auto recordedLength = TimeDuration::fromSeconds (AudioFile (dstTrack->edit.engine, recordedFile).getLength());
+ 
+             if (context.isPlaying() || recordBuffer->wasRecentlyPlaying (edit))
+             {
+-                const auto blockSizeSeconds = edit.engine.getDeviceManager().getBlockLength();
+-                auto adjust = -wi.getAdjustmentSeconds() + blockSizeSeconds;
+-
+-                adjust = adjust - TimeDuration::fromSamples (context.getLatencySamples(), edit.engine.getDeviceManager().getSampleRate());
+-
+-                // TODO: Still not quite sure why the adjustment needs to be a block more with
+-                // the tracktion_graph engine, this may need correcting in the future
+-                if (context.getNodePlayHead() != nullptr)
+-                    adjust = adjust + blockSizeSeconds;
++                // Both clocks mark the exclusive end of the captured block.
++                const auto adjust = -wi.getAdjustmentSeconds()
++                    - TimeDuration::fromSamples (context.getLatencySamples(), edit.engine.getDeviceManager().getSampleRate());
+ 
+                 if (context.isPlaying())
+                 {
+-                    start = context.globalStreamTimeToEditTime (recordBuffer->lastStreamTime) - recordedLength + adjust;
++                    start = context.globalStreamTimeToEditTime (recordBuffer->lastStreamEnd) - recordedLength + adjust;
+                 }
+                 else
+                 {
+@@ -1140,7 +1133,9 @@ public:
+                 clipPos.time = clipPos.time.withStart (0s);
+             }
+ 
+-            auto newClip = dstTrack->insertWaveClip (clipName, projectItem->getProjectItemRef(), clipPos, false);
++            auto newClip = projectItem != nullptr
++                ? dstTrack->insertWaveClip (clipName, projectItem->getProjectItemRef(), clipPos, onlyTarget.isValid())
++                : dstTrack->insertWaveClip (clipName, recordedFile, clipPos, onlyTarget.isValid());
+ 
+             if (newClip == nullptr)
+                 continue;
+@@ -1838,7 +1833,7 @@ struct WaveInputRecordingThread::BlockQueue
+         void load (AudioFileWriter& w, const juce::AudioBuffer<float>& newBuffer,
+                    int start, int numSamples, const RecordingThumbnailManager::Thumbnail::Ptr& thumb)
+         {
+-            buffer.setSize (newBuffer.getNumChannels(), numSamples);
++            buffer.setSize (newBuffer.getNumChannels(), numSamples, false, false, true);
+ 
+             for (int i = buffer.getNumChannels(); --i >= 0;)
+                 buffer.copyFrom (i, 0, newBuffer, i, start, numSamples);
+@@ -1862,6 +1857,23 @@ struct WaveInputRecordingThread::BlockQueue
+     std::atomic<int> numPending { 0 };
+     std::mutex processingMutex;
+ 
++    // Called before the worker starts, while the queue has no recording users.
++    void reserveBlocks (int count, int samples)
++    {
++        for (auto* b = firstFree; b != nullptr; b = b->next)
++        {
++            b->buffer.setSize (2, samples, false, false, true);
++            --count;
++        }
++
++        while (count-- > 0)
++        {
++            auto* block = new QueuedBlock();
++            block->buffer.setSize (2, samples, false, false, true);
++            addToFreeQueue (block);
++        }
++    }
++
+     QueuedBlock* findFreeBlock()
+     {
+         const juce::ScopedLock sl (freeQueueLock);
+@@ -2073,6 +2085,11 @@ void WaveInputRecordingThread::prepareToStart()
+     flushAndStop();
+     sleep (2);
+     jassert (! isThreadRunning());
++    const auto& devices = engine.getDeviceManager();
++    const int samples = juce::jmax (1, devices.getBlockSize());
++    // Allow 100 ms of writer jitter with eight simultaneous stereo takes.
++    const int blocks = juce::jlimit (32, 4096, 8 * (int) std::ceil (0.1 * devices.getSampleRate() / samples));
++    queue->reserveBlocks (blocks, samples);
+     startThread (juce::Thread::Priority::normal);
+ }
+ 
+diff --git a/modules/tracktion_engine/playback/graph/tracktion_ClickNode.cpp b/modules/tracktion_engine/playback/graph/tracktion_ClickNode.cpp
+index 48805df96cc..0806f6b70cb 100644
+--- a/modules/tracktion_engine/playback/graph/tracktion_ClickNode.cpp
++++ b/modules/tracktion_engine/playback/graph/tracktion_ClickNode.cpp
+@@ -203,15 +203,15 @@ bool ClickGenerator::isMutedAtTime (TimePosition time) const
+     const bool clickEnabled = edit.clickTrackEnabled.get();
+ 
+     auto range = edit.getClickTrackRange();
++    if (range.contains (time))
++        return false;
++
+     if (! range.isEmpty() && time < range.getStart())
+         return true;
+ 
+     if (clickEnabled && edit.clickTrackRecordingOnly)
+         return ! (edit.getTransport().isRecording() || context.getNumActivelyRecordingDevices() >= 1);
+ 
+-    if (! clickEnabled)
+-        return ! range.contains (time);
+-
+     return ! clickEnabled;
+ }
+ 
+diff --git a/modules/tracktion_engine/playback/graph/tracktion_EditNodeBuilder.cpp b/modules/tracktion_engine/playback/graph/tracktion_EditNodeBuilder.cpp
+index e46f6c79169..31bc39f3792 100644
+--- a/modules/tracktion_engine/playback/graph/tracktion_EditNodeBuilder.cpp
++++ b/modules/tracktion_engine/playback/graph/tracktion_EditNodeBuilder.cpp
+@@ -1989,6 +1989,65 @@ std::unique_ptr<tracktion::graph::Node> createMasterFadeInOutNode (Edit& edit,
+ }
+ 
+ //==============================================================================
++namespace
++{
++    class PlaybackCountInNode final : public Node
++    {
++    public:
++        PlaybackCountInNode (std::unique_ptr<Node> source, TransportControl& tc,
++                             tracktion::graph::PlayHead& ph, double rate)
++            : input (std::move (source)), transport (tc), playHead (ph), sampleRate (rate) {}
++
++        NodeProperties getNodeProperties() override
++        {
++            auto properties = input->getNodeProperties();
++            if (properties.nodeID != 0)
++                tracktion::hash_combine (properties.nodeID, static_cast<size_t> (0x72966cf3));
++            return properties;
++        }
++        std::vector<Node*> getDirectInputNodes() override { return { input.get() }; }
++        bool isReadyToProcess() override { return input->hasProcessed(); }
++
++        void process (ProcessContext& pc) override
++        {
++            const auto source = input->getProcessedOutput();
++            const double end = transport.getPlaybackCountInEndSeconds();
++            int mutedFrames = 0;
++            if (std::isfinite (end))
++            {
++                const auto start = playHead.referenceSamplePositionToTimelinePositionUnlooped (pc.referenceSampleRange.getStart());
++                const auto endSample = tracktion::toSamples (TimePosition::fromSeconds (end), sampleRate);
++                mutedFrames = static_cast<int> (juce::jlimit<int64_t> (0, pc.numSamples, endSample - start));
++            }
++
++            if (mutedFrames == 0)
++            {
++                setAudioOutput (input.get(), source.audio);
++                pc.buffers.midi.copyFrom (source.midi);
++                return;
++            }
++
++            auto audio = pc.buffers.audio;
++            audio.getFrameRange ({ 0, static_cast<choc::buffer::FrameCount> (mutedFrames) }).clear();
++            if (mutedFrames < static_cast<int> (pc.numSamples))
++            {
++                const choc::buffer::FrameRange audible { static_cast<choc::buffer::FrameCount> (mutedFrames), pc.numSamples };
++                copyIfNotAliased (audio.getFrameRange (audible), source.audio.getFrameRange (audible));
++            }
++            for (const auto& message : source.midi)
++                if (message.getTimeStamp() >= mutedFrames / sampleRate)
++                    pc.buffers.midi.add (message);
++            pc.buffers.midi.isAllNotesOff = source.midi.isAllNotesOff;
++        }
++
++    private:
++        std::unique_ptr<Node> input;
++        TransportControl& transport;
++        tracktion::graph::PlayHead& playHead;
++        double sampleRate;
++    };
++}
++
+ std::unique_ptr<tracktion::graph::Node> createNodeForEdit (EditPlaybackContext& epc, std::atomic<double>& audibleTimeToUpdate, const CreateNodeParams& params)
+ {
+     Edit& edit = epc.edit;
+@@ -2174,6 +2233,8 @@ std::unique_ptr<tracktion::graph::Node> createNodeForEdit (EditPlaybackContext&
+                                                                          ChannelMap::conversion (incomingChannels, deviceChannels));
+         }
+ 
++        node = makeNode<PlaybackCountInNode> (std::move (node), edit.getTransport(), playHeadState.playHead, params.sampleRate);
++
+         if (edit.isClickTrackDevice (*device))
+         {
+             auto clickAndTracksNode = makeSummingNode ({ node.release(),
+diff --git a/modules/tracktion_engine/playback/tracktion_DeviceManager.cpp b/modules/tracktion_engine/playback/tracktion_DeviceManager.cpp
+index 50116158958..4dac922ce6b 100644
+--- a/modules/tracktion_engine/playback/tracktion_DeviceManager.cpp
++++ b/modules/tracktion_engine/playback/tracktion_DeviceManager.cpp
+@@ -1361,6 +1361,18 @@ void DeviceManager::audioDeviceIOCallbackWithContext (const float* const* inputC
+     }
+ }
+ 
++void DeviceManager::addAudioInputObserver (AudioInputObserver* observer)
++{
++    const juce::ScopedLock lock (deviceManager.getAudioCallbackLock());
++    audioInputObservers.addIfNotAlreadyThere (observer);
++}
++
++void DeviceManager::removeAudioInputObserver (AudioInputObserver* observer)
++{
++    const juce::ScopedLock lock (deviceManager.getAudioCallbackLock());
++    audioInputObservers.removeFirstMatchingValue (observer);
++}
++
+ void DeviceManager::audioDeviceIOCallbackInternal (const float* const* inputChannelData, int numInputChannels,
+                                                    float* const* outputChannelData, int totalNumOutputChannels,
+                                                    int numSamples)
+@@ -1372,6 +1384,8 @@ void DeviceManager::audioDeviceIOCallbackInternal (const float* const* inputChan
+             performanceMeasurement.getStatisticsAndReset();
+ 
+         const ScopedPerformanceMeasurement spm (performanceMeasurement);
++        for (auto* observer : audioInputObservers)
++            observer->onAudioInput (inputChannelData, numInputChannels, numSamples, currentSampleRate);
+ 
+         if (currentCpuUsage > cpuLimitBeforeMuting)
+         {
+diff --git a/modules/tracktion_engine/playback/tracktion_DeviceManager.h b/modules/tracktion_engine/playback/tracktion_DeviceManager.h
+index 67376c29568..8ddc3c66b1b 100644
+--- a/modules/tracktion_engine/playback/tracktion_DeviceManager.h
++++ b/modules/tracktion_engine/playback/tracktion_DeviceManager.h
+@@ -253,6 +253,17 @@ public:
+         This can be used to set a limiter or similar on the whole ouput.
+         It shouldn't be used for musical effects.
+     */
++    struct AudioInputObserver
++    {
++        virtual ~AudioInputObserver() = default;
++        virtual void onAudioInput (const float* const*, int channels, int frames, double sampleRate) = 0;
++    };
++
++    /** Observers see the raw input before the device buffers are used for processing (the
++        tuner, a sampler recording). Call these on the message thread. */
++    void addAudioInputObserver (AudioInputObserver*);
++    void removeAudioInputObserver (AudioInputObserver*);
++
+     void setGlobalOutputAudioProcessor (std::unique_ptr<juce::AudioProcessor>);
+ 
+     /** Returns a previously set globalOutputAudioProcessor. */
+@@ -292,6 +303,7 @@ private:
+ 
+     std::shared_mutex contextLock;
+     juce::Array<EditPlaybackContext*> activeContexts;
++    juce::Array<AudioInputObserver*> audioInputObservers;
+     std::unique_ptr<juce::AudioProcessor> globalOutputAudioProcessor;
+     juce::HeapBlock<const float*> inputChannelsScratch;
+     juce::HeapBlock<float*> outputChannelsScratch;
+diff --git a/modules/tracktion_engine/playback/tracktion_EditPlaybackContext.cpp b/modules/tracktion_engine/playback/tracktion_EditPlaybackContext.cpp
+index a75ca7872fb..20db98b8429 100644
+--- a/modules/tracktion_engine/playback/tracktion_EditPlaybackContext.cpp
++++ b/modules/tracktion_engine/playback/tracktion_EditPlaybackContext.cpp
+@@ -973,6 +973,8 @@ void EditPlaybackContext::nextBlockStarted()
+ void EditPlaybackContext::fillNextNodeBlock (float* const* allChannels, int numChannels, int numSamples)
+ {
+     nodePlaybackContext->updateReferenceSampleRange (numSamples);
++    if (std::isfinite (transport.getPlaybackCountInEndSeconds()))
++        transport.updatePlaybackCountIn (getUnloopedPosition());
+ 
+     // Sync this playback context with a master context
+     if (nodeContextToSyncTo && nodePlaybackContext->playHead.isPlaying() && nodeContextToSyncTo->getNodePlayHead() != nullptr)
+diff --git a/modules/tracktion_engine/playback/tracktion_TransportControl.cpp b/modules/tracktion_engine/playback/tracktion_TransportControl.cpp
+index 879e3a6cb7c..f30b1f218f2 100644
+--- a/modules/tracktion_engine/playback/tracktion_TransportControl.cpp
++++ b/modules/tracktion_engine/playback/tracktion_TransportControl.cpp
+@@ -876,11 +876,20 @@ void TransportControl::forceOrphanFreezeAndProxyFilesPurge()
+ }
+ 
+ //==============================================================================
+-void TransportControl::play (bool justSendMMCIfEnabled)
++void TransportControl::play (bool justSendMMCIfEnabled, int countInBeats)
+ {
++    juce::ScopedValueSetter<int> countIn (nextPlaybackCountInBeats, countInBeats);
+     transportState->play (justSendMMCIfEnabled);
+ }
+ 
++void TransportControl::updatePlaybackCountIn (TimePosition unloopedPosition) noexcept
++{
++    auto end = playbackCountInEnd.load();
++    if (std::isfinite (end) && unloopedPosition.inSeconds() >= end
++        && playbackCountInEnd.compare_exchange_strong (end, -std::numeric_limits<double>::infinity()))
++        edit.setClickTrackRange ({});
++}
++
+ void TransportControl::playFromStart (bool justSendMMCIfEnabled)
+ {
+     setPosition (startPosition);
+@@ -1419,21 +1428,46 @@ void TransportControl::performPlay()
+ 
+         ensureContextAllocated();
+ 
++        edit.setClickTrackRange ({});
++        playbackCountInEnd = -std::numeric_limits<double>::infinity();
++
+         if (playbackContext)
+         {
+-            playHeadWrapper->play ({ transportState->startTime, transportState->endTime }, looping);
+-
+-            // Post the position change to be dispatched otherwise what we're effectively doing is setting
+-            // the position for "this" block and it will get incremented the next block, actually starting
+-            // playback 1 block from the start
+-            playHeadWrapper->setPosition (position);
++            const auto playRange = TimeRange (transportState->startTime, transportState->endTime);
++            if (nextPlaybackCountInBeats > 0 && ! edit.getAbletonLink().isConnected())
++            {
++                const auto& tempo = edit.tempoSequence;
++                const auto target = position.get();
++                const auto targetBeat = tempo.toBeats (target).inBeats();
++                const auto firstBeat = std::ceil (targetBeat - 1.0e-8) - nextPlaybackCountInBeats;
++                const auto preroll = tempo.toTime (BeatPosition::fromBeats (firstBeat - 0.25));
++                playbackCountInEnd = target.inSeconds();
++                edit.setClickTrackRange ({ tempo.toTime (BeatPosition::fromBeats (firstBeat - 0.125)), target });
++                if (looping)
++                {
++                    playHeadWrapper->setLoopTimes (true, playRange);
++                    playHeadWrapper->setRollInToLoop (preroll);
++                    playHeadWrapper->setPosition (preroll);
++                    playHeadWrapper->postPlay();
++                }
++                else
++                {
++                    playHeadWrapper->play (playRange.withStart (preroll), false);
++                    playHeadWrapper->setPosition (preroll);
++                    position = preroll;
++                }
++            }
++            else
++            {
++                playHeadWrapper->play (playRange, looping);
++                // Dispatch the position with the next block rather than skipping the first block.
++                playHeadWrapper->setPosition (position);
++            }
+         }
+         else
+         {
+             clearPlayingFlags();
+         }
+-
+-        edit.setClickTrackRange ({});
+     }
+ }
+ 
+@@ -1657,6 +1691,8 @@ void TransportControl::performStop()
+     CRASH_TRACER
+ 
+     const juce::ScopedValueSetter<bool> svs (isStopInProgress, true);
++    playbackCountInEnd = -std::numeric_limits<double>::infinity();
++    edit.setClickTrackRange ({});
+     screenSaverDefeater.reset();
+     sectionPlayer.reset();
+ 
+diff --git a/modules/tracktion_engine/playback/tracktion_TransportControl.h b/modules/tracktion_engine/playback/tracktion_TransportControl.h
+index 40ebde636f5..84835a5065f 100644
+--- a/modules/tracktion_engine/playback/tracktion_TransportControl.h
++++ b/modules/tracktion_engine/playback/tracktion_TransportControl.h
+@@ -68,7 +68,10 @@ public:
+                                     an MMC message is just output and playback will start
+                                     when the input MIDI device recieves one.
+     */
+-    void play (bool justSendMMCIfEnabled);
++    void play (bool justSendMMCIfEnabled, int countInBeats = 0);
++
++    void updatePlaybackCountIn (TimePosition unloopedPosition) noexcept;
++    double getPlaybackCountInEndSeconds() const noexcept { return playbackCountInEnd.load(); }
+ 
+     /** Sets the position to the startPosition and begins playback from there. */
+     void playFromStart (bool justSendMMCIfEnabled);
+@@ -406,6 +409,8 @@ public:
+ private:
+     //==============================================================================
+     struct TransportState;
++    int nextPlaybackCountInBeats = 0;
++    std::atomic<double> playbackCountInEnd { -std::numeric_limits<double>::infinity() };
+     std::unique_ptr<TransportState> transportState;
+     std::unique_ptr<EditPlaybackContext> playbackContext;
+     MonotonicBeat lastContextMonotonicBeat;     // where a freed context's beat count got to
+diff --git a/modules/tracktion_engine/plugins/external/tracktion_ExternalPlugin.cpp b/modules/tracktion_engine/plugins/external/tracktion_ExternalPlugin.cpp
+index 9b10781ba3c..9a7eae3b943 100644
+--- a/modules/tracktion_engine/plugins/external/tracktion_ExternalPlugin.cpp
++++ b/modules/tracktion_engine/plugins/external/tracktion_ExternalPlugin.cpp
+@@ -1904,6 +1904,7 @@ void ExternalPlugin::startPluginInstanceCreation (const juce::PluginDescription&
+ 
+ void ExternalPlugin::completePluginInstanceCreation (std::unique_ptr<juce::AudioPluginInstance> newInstance)
+ {
++    isAsyncInitialising = false;
+     if (! newInstance)
+     {
+         TRACKTION_LOG_ERROR (loadError);
+@@ -1913,7 +1914,6 @@ void ExternalPlugin::completePluginInstanceCreation (std::unique_ptr<juce::Audio
+     newInstance->enableAllBuses();
+     loadedInstance = LoadedInstance::create (*this, std::move (newInstance));
+     hasLoadedInstance = true;
+-    isAsyncInitialising = false;
+ 
+     auto pi = getAudioPluginInstance();
+ 
+diff --git a/modules/tracktion_engine/plugins/tracktion_PluginWindowState.cpp b/modules/tracktion_engine/plugins/tracktion_PluginWindowState.cpp
+index fc693be88a2..4897f0470a1 100644
+--- a/modules/tracktion_engine/plugins/tracktion_PluginWindowState.cpp
++++ b/modules/tracktion_engine/plugins/tracktion_PluginWindowState.cpp
+@@ -18,7 +18,7 @@ static bool isDialogOpen()
+ 
+     for (int i = juce::TopLevelWindow::getNumTopLevelWindows(); --i >= 0;)
+         if (auto w = juce::TopLevelWindow::getTopLevelWindow (i))
+-            if (dynamic_cast<juce::AlertWindow*> (w))
++            if (w->isShowing() && dynamic_cast<juce::AlertWindow*> (w))
+                 return true;
+ 
+     return false;
+@@ -53,8 +53,16 @@ void PluginWindowState::showWindowExplicitly()
+ {
+     TRACKTION_ASSERT_MESSAGE_THREAD
+     wasExplicitlyClosed = false;
++    temporarilyHidden = false;
++    explicitOpenPending = true;
+     stopTimer();
+-    showWindow();
++    if (isDialogOpen() || openingWindow)
++        startTimer (50);
++    else
++    {
++        explicitOpenPending = false;
++        showWindow (true);
++    }
+ }
+ 
+ void PluginWindowState::showWindowIfTemporarilyHidden()
+@@ -67,17 +75,15 @@ void PluginWindowState::closeWindowExplicitly()
+ {
+     TRACKTION_ASSERT_MESSAGE_THREAD
+ 
+-    if (pluginWindow && pluginWindow->isVisible())
+-    {
+-        wasExplicitlyClosed = true;
+-        deleteWindow();
+-        stopTimer();
+-    }
++    explicitOpenPending = false;
++    wasExplicitlyClosed = true;
++    deleteWindow();
++    stopTimer();
+ }
+ 
+ void PluginWindowState::hideWindowTemporarily()
+ {
+-    if (isWindowShowing())
++    if (isWindowShowing() || explicitOpenPending)
+     {
+         closeWindowExplicitly();
+         temporarilyHidden = true;
+@@ -101,28 +107,19 @@ void PluginWindowState::recreateWindowIfShowing()
+ 
+ void PluginWindowState::hideWindowForShutdown()
+ {
++    explicitOpenPending = false;
+     deleteWindow();
+     stopTimer();
+ }
+ 
+-void PluginWindowState::showWindow()
++void PluginWindowState::showWindow (bool takeFocus)
+ {
+-    if (isDialogOpen())
++    if (isDialogOpen() || openingWindow)
+         return;
+ 
+     if (! pluginWindow)
+     {
+-        // Ensure at least 40px of the window is on screen
+-        const auto displayRects = []
+-        {
+-            juce::RectangleList<int> trimmedDisplays;
+-
+-            for (auto rect : juce::Desktop::getInstance().getDisplays().getRectangleList (true))
+-                trimmedDisplays.addWithoutMerging (rect.withTrimmedLeft (100).withTrimmedRight (100).withTrimmedBottom (100));
+-
+-            return trimmedDisplays;
+-        }();
+-
++        const juce::ScopedValueSetter<bool> opening (openingWindow, true);
+         auto oldFocus = makeWeakRef (juce::Component::getCurrentlyFocusedComponent());
+ 
+         if (oldFocus == nullptr)
+@@ -135,7 +132,7 @@ void PluginWindowState::showWindow()
+ 
+         pluginWindow = engine.getUIBehaviour().createPluginWindow (*this);
+ 
+-        if (oldFocus != nullptr)
++        if (! takeFocus && oldFocus != nullptr)
+             oldFocus->grabKeyboardFocus();
+     }
+ 
+@@ -143,7 +140,7 @@ void PluginWindowState::showWindow()
+     {
+         windowOpenTime = juce::Time::getCurrentTime();
+         pluginWindow->setVisible (true);
+-        pluginWindow->toFront (false);
++        pluginWindow->toFront (takeFocus);
+     }
+ }
+ 
+@@ -227,6 +224,12 @@ void PluginWindowState::timerCallback()
+ {
+     stopTimer();
+ 
++    if (explicitOpenPending)
++    {
++        showWindowExplicitly();
++        return;
++    }
++
+     if (windowShowerCount > 0)
+     {
+         if ((pluginWindow == nullptr || ! pluginWindow->isVisible())
+@@ -248,8 +251,10 @@ juce::Point<int> PluginWindowState::choosePositionForPluginWindow()
+             if (p->isFocused())
+                 return p->getBounds().getPosition() + juce::Point<int> (80, 80);
+ 
+-    return juce::Desktop::getInstance().getDisplays()
+-            .getPrimaryDisplay()->userBounds.getRelativePoint (0.2f, 0.2f).roundToInt();
++    if (auto* display = juce::Desktop::getInstance().getDisplays().getPrimaryDisplay())
++        return display->userBounds.getRelativePoint (0.2f, 0.2f).roundToInt();
++
++    return {};
+ }
+ 
+ } // namespace tracktion::inline engine
+diff --git a/modules/tracktion_engine/plugins/tracktion_PluginWindowState.h b/modules/tracktion_engine/plugins/tracktion_PluginWindowState.h
+index 1fa9b3e318f..431613f5582 100644
+--- a/modules/tracktion_engine/plugins/tracktion_PluginWindowState.h
++++ b/modules/tracktion_engine/plugins/tracktion_PluginWindowState.h
+@@ -63,7 +63,9 @@ struct PluginWindowState  : private juce::Timer
+ private:
+     void timerCallback() override;
+ 
+-    void showWindow();
++    void showWindow(bool takeFocus = false);
++    bool explicitOpenPending = false;
++    bool openingWindow = false;
+     void deleteWindow();
+ 
+     JUCE_DECLARE_WEAK_REFERENCEABLE (PluginWindowState)

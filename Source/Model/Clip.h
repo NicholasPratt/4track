@@ -23,6 +23,8 @@ struct Clip
     // MIDI clips have no file: they play the notes stored in the Edit. A MIDI clip made by
     // an edit (e.g. the right half of a split) is created from a copy of midiState, the
     // state of the clip it came from.
+    juce::Array<juce::File> takes;
+    int activeTake = 0;
     bool midi = false;
     juce::ValueTree midiState;
     static constexpr juce::int64 kMidiSourceLength = (juce::int64) 1 << 50;   // MIDI clips can be extended freely

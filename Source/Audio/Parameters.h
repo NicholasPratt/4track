@@ -2,6 +2,7 @@
 
 #include <juce_audio_basics/juce_audio_basics.h>
 #include <atomic>
+#include <array>
 #include <cmath>
 
 enum class MonitorMode { Off = 0, Auto = 1, On = 2 };   // Auto = hear input while armed
@@ -24,7 +25,7 @@ struct TrackParams
 {
     std::atomic<float> volumeDb { 0.0f };    // -60 (= -inf) .. +6
     std::atomic<float> pan { 0.0f };         // -1 .. 1
-    std::atomic<float> send { 0.0f };        // reverb send, 0 .. 1 (post-fader)
+    std::array<std::atomic<float>, 2> sendLevels { 1.0f, 1.0f }; // post-fader, 0 .. 1
     std::atomic<float> lowCut { 20.0f };     // 20 = off
     std::atomic<float> highCut { 20000.0f }; // 20000 = off
     std::atomic<float> midFreq { 1000.0f };
@@ -48,18 +49,21 @@ struct TrackParams
 
     void resetMixer()
     {
-        volumeDb = 0.0f; pan = 0.0f; send = 0.0f;
+        volumeDb = 0.0f; pan = 0.0f;
+        for (auto& level : sendLevels) level = 1.0f;
         lowCut = 20.0f; highCut = 20000.0f; midFreq = 1000.0f; midGainDb = 0.0f;
         mute = false; solo = false; armed = false;
         monitor = (int) MonitorMode::Off;
     }
 };
 
-struct MasterParams
+struct OutputParams
 {
     std::atomic<float> volumeDb { 0.0f };
-    std::atomic<float> reverbRoom { 0.5f };
-    std::atomic<float> reverbDamping { 0.5f };
-    std::atomic<float> reverbWet { 0.33f };
     std::atomic<float> peakL { 0.0f }, peakR { 0.0f };
+};
+
+struct ReverbParams
+{
+    std::atomic<float> room { 0.5f }, damping { 0.5f }, wet { 0.33f };
 };

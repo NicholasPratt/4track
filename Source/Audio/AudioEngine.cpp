@@ -1,10 +1,79 @@
 #include "AudioEngine.h"
+#include "RecordingThumbnail.h"
+#include "Effects.h"
+#include "Dynamics.h"
+
+// The direct output sits after both sends. Fading this path leaves the sends and meters intact.
+class MainOutputGate final : public te::Plugin
+{
+public:
+    static constexpr auto xmlTypeName = "8trackMainOutput";
+    static const char* getPluginName() { return "Main Output"; }
+
+    explicit MainOutputGate(te::PluginCreationInfo info)
+        : Plugin(info), open(static_cast<bool>(state.getProperty(openProperty, true))) {}
+
+    juce::String getName() const override { return getPluginName(); }
+    juce::String getPluginType() override { return xmlTypeName; }
+    juce::String getSelectableDescription() override { return getPluginName(); }
+    bool canBeDisabled() override { return false; }
+    bool takesMidiInput() override { return true; }
+    BusLayout getBusses() const override { return BusLayout::singlePassThrough(); }
+    int getNumOutputChannelsGivenInputs(int channels) override { return channels; }
+
+    bool isOpen() const { return open.load(std::memory_order_relaxed); }
+    void setOpen(bool shouldOpen) { state.setProperty(openProperty, shouldOpen, getUndoManager()); }
+
+    void initialise(const te::PluginInitialisationInfo& info) override
+    {
+        gain.reset(info.sampleRate, 0.005);
+        gain.setCurrentAndTargetValue(isOpen() ? 1.0f : 0.0f);
+    }
+
+    void deinitialise() override {}
+
+    void applyToBuffer(const te::PluginRenderContext& context) override
+    {
+        auto* buffer = context.destBuffer;
+        if (buffer == nullptr)
+            return;
+        const bool shouldOpen = isOpen();
+        gain.setTargetValue(shouldOpen ? 1.0f : 0.0f);
+        if (!gain.isSmoothing())
+        {
+            if (!shouldOpen)
+                buffer->clear(context.bufferStartSample, context.bufferNumSamples);
+            return;
+        }
+        for (int i = 0; i < context.bufferNumSamples; ++i)
+        {
+            const auto level = gain.getNextValue();
+            for (int channel = 0; channel < buffer->getNumChannels(); ++channel)
+                buffer->getWritePointer(channel, context.bufferStartSample)[i] *= level;
+        }
+    }
+
+private:
+    void valueTreePropertyChanged(juce::ValueTree& tree, const juce::Identifier& property) override
+    {
+        if (tree == state && property == openProperty)
+            open.store(static_cast<bool>(state.getProperty(openProperty, true)), std::memory_order_relaxed);
+        Plugin::valueTreePropertyChanged(tree, property);
+    }
+
+    static inline const juce::Identifier openProperty { "mainEnabled" };
+    std::atomic<bool> open;
+    juce::SmoothedValue<float> gain;
+};
 
 namespace
 {
     constexpr juce::uint32 kPalette[kNumTracks] = {
         0xff4f9dff, 0xff34c79a, 0xfff2b84b, 0xffef6f6c, 0xffb084f5, 0xff4fd1e0, 0xfff58fc7, 0xffa3d65c
     };
+
+    const juce::Identifier kRecordCountIn { "eightTrackRecordCountIn" };
+    const juce::Identifier kPlaybackCountIn { "eightTrackPlaybackCountIn" };
 
     const juce::Identifier kMidiTrackProperty { "eightTrackMidi" };   // on a track's state: it's a MIDI track
 
@@ -51,11 +120,31 @@ namespace
     };
 }
 
+namespace
+{
+    /** With no UI (tests), Tracktion's long tasks (rendering) just run to the end. */
+    struct HeadlessBehaviour : AudioUIBehaviour
+    {
+        void runTaskWithProgressBar(te::ThreadPoolJobWithProgress& task) override
+        {
+            while (task.runJob() == juce::ThreadPoolJob::jobNeedsRunningAgain) {}
+        }
+    };
+}
+
 AudioEngine::AudioEngine(std::unique_ptr<te::UIBehaviour> ui)
-    : engine("8track", ui != nullptr ? std::move(ui) : std::make_unique<te::UIBehaviour>(),
+    : engine("8track", ui != nullptr ? std::move(ui) : std::make_unique<HeadlessBehaviour>(),
              std::make_unique<EngineBehaviour>())
 {
+    engine.getPluginManager().createBuiltInType<MidiOutPlugin>();   // before any Edit is loaded
+    engine.getPluginManager().createBuiltInType<MainOutputGate>();
+    EffectPlugin::registerTypes(engine.getPluginManager());
     setUpInputLayout();
+    ensureTrackMidiInputs();
+    // Tracktion's start-up asks for a quick MIDI scan and then replaces it with its regular
+    // 4-second check, so MIDI devices would only appear after a few seconds. Scan now.
+    engine.getDeviceManager().rescanMidiDeviceList();
+    refreshMidiActivity();
     getDeviceManager().addChangeListener(this);
     engine.getDeviceManager().addChangeListener(this);   // the input layout (stereo pairs) changed
     lastSampleRate = getSampleRate();
@@ -74,6 +163,12 @@ AudioEngine::~AudioEngine()
 {
     stopTimer();
     loopWatcher.stopTimer();
+    for (auto& a : midiActivity)
+        if (auto device = a->device.lock())
+            if (auto* physical = dynamic_cast<te::PhysicalMidiInputDevice*>(device.get()))
+                physical->removeListener(a.get());
+    midiActivity.clear();
+    cancelPendingUpdate();
     getDeviceManager().removeChangeListener(this);
     engine.getDeviceManager().removeChangeListener(this);
     jassert(edit == nullptr);   // Project detaches its Edit before it is destroyed
@@ -122,6 +217,24 @@ std::vector<AudioEngine::Input> AudioEngine::getInputs() const
     }
     std::sort(inputs.begin(), inputs.end(), [](auto& a, auto& b) { return a.channel < b.channel; });
     return inputs;
+}
+
+std::vector<AudioEngine::ArmedInputChannel> AudioEngine::getArmedInputChannels() const
+{
+    std::vector<ArmedInputChannel> result;
+    for (const auto& track : tracks)
+    {
+        if (!track.armed.load() || track.midi.load() || track.inputType.load() == (int) InputType::Mix)
+            continue;
+        if (auto* input = inputForChannel(track.inputChannel.load()))
+            for (const auto& channel : input->getChannels())
+            {
+                const int index = static_cast<int>(channel.indexInDevice);
+                if (std::none_of(result.begin(), result.end(), [index](const auto& entry) { return entry.channel == index; }))
+                    result.push_back({ index, track.name + "  ·  In " + juce::String(index + 1) });
+            }
+    }
+    return result;
 }
 
 bool AudioEngine::isInputPaired(int firstChannel) const
@@ -192,6 +305,7 @@ te::AudioTrack* AudioEngine::getAudioTrack(int index) const
 //==============================================================================
 void AudioEngine::attachEdit(te::Edit* newEdit, bool freshEdit)
 {
+    chordPreview.stop();
     detachMeters();
     edit = newEdit;
     for (auto& s : strips)
@@ -200,7 +314,14 @@ void AudioEngine::attachEdit(te::Edit* newEdit, bool freshEdit)
         s.lowCut = s.highCut = nullptr;
         s.eq = nullptr;
         s.volume = nullptr;
-        s.send = nullptr;
+        s.sends.fill(nullptr);
+        s.mainGate = nullptr;
+    }
+    for (auto& bus : buses)
+    {
+        bus.track = nullptr;
+        bus.volume = nullptr;
+        bus.input = nullptr;
     }
     reverb = nullptr;
     if (edit == nullptr)
@@ -214,6 +335,7 @@ void AudioEngine::attachEdit(te::Edit* newEdit, bool freshEdit)
     buildStrips();
     attachMeters();
     pullAll();
+    connectMidiOutPlugins();
     if (freshEdit)
     {
         for (int t = 0; t < kNumTracks; ++t)
@@ -225,10 +347,9 @@ void AudioEngine::attachEdit(te::Edit* newEdit, bool freshEdit)
             tracks[(size_t) t].inputChannel = 0;
         }
         master.volumeDb = 0.0f;
-        master.reverbRoom = 0.5f;
-        master.reverbDamping = 0.5f;
-        master.reverbWet = 0.33f;
         countInOn = true;
+        playbackCountInOn = false;
+        metronomeRecordOnly = false;
         punchOn = false;
         loopOn = false;
         punchIn = 0;
@@ -236,12 +357,13 @@ void AudioEngine::attachEdit(te::Edit* newEdit, bool freshEdit)
     }
     inputsDirty = true;
     sync();
+    updateEffectTempo();
     edit->getUndoManager().clearUndoHistory();   // building the mixer isn't an undoable edit
 }
 
 void AudioEngine::buildStrips()
 {
-    edit->ensureNumberOfAudioTracks(kNumTracks + 1);
+    edit->ensureNumberOfAudioTracks(kNumTracks + kStereoBusCount);
     auto audioTracks = te::getAudioTracks(*edit);
 
     for (int t = 0; t < kNumTracks; ++t)
@@ -257,7 +379,12 @@ void AudioEngine::buildStrips()
             else if (auto* eq = dynamic_cast<te::EqualiserPlugin*>(p))
                 s.eq = eq;
             else if (auto* send = dynamic_cast<te::AuxSendPlugin*>(p))
-                s.send = send;
+            {
+                if (juce::isPositiveAndBelow(send->getBusNumber(), kStereoBusCount))
+                    s.sends[(size_t) send->getBusNumber()] = send;
+            }
+            else if (auto* gate = dynamic_cast<MainOutputGate*>(p))
+                s.mainGate = gate;
         }
         s.volume = s.track->getVolumePlugin();
 
@@ -284,46 +411,67 @@ void AudioEngine::buildStrips()
             s.highCut->frequency->setParameter(20000.0f, juce::sendNotification);
             s.highCut->setEnabled(false);
         }
-        if (s.send == nullptr)
+        for (int bus = 0; bus < kStereoBusCount; ++bus)
         {
-            s.send = insertPlugin<te::AuxSendPlugin>(*edit, list, list.indexOf(s.volume) + 1);
-            s.send->busNumber = 0;
-            s.send->setGainDb(kOffDb);
+            auto*& send = s.sends[(size_t) bus];
+            if (send == nullptr)
+            {
+                const auto index = s.mainGate != nullptr ? list.indexOf(s.mainGate) : list.size();
+                send = insertPlugin<te::AuxSendPlugin>(*edit, list, index);
+                send->busNumber = bus;
+                send->setGainDb(0.0f);
+                send->setEnabled(false);
+            }
         }
+        if (s.mainGate == nullptr)
+            s.mainGate = insertPlugin<MainOutputGate>(*edit, list, list.size());
     }
 
-    // The reverb return: a track with no clips that the strips' sends feed.
-    auto* ret = audioTracks[kReverbTrack];
-    ret->setName("Reverb Return");
-    te::AuxReturnPlugin* auxReturn = nullptr;
-    for (auto* p : ret->pluginList.getPlugins())
+    for (int i = 0; i < kStereoBusCount; ++i)
     {
-        if (auto* r = dynamic_cast<te::AuxReturnPlugin*>(p)) auxReturn = r;
-        if (auto* r = dynamic_cast<te::ReverbPlugin*>(p))    reverb = r;
-    }
-    auto& retList = ret->pluginList;
-    if (auxReturn == nullptr)
-    {
-        auxReturn = insertPlugin<te::AuxReturnPlugin>(*edit, retList, 0);
-        auxReturn->busNumber = 0;
-    }
-    if (reverb == nullptr)
-    {
-        reverb = insertPlugin<te::ReverbPlugin>(*edit, retList, retList.indexOf(auxReturn) + 1);
-        reverb->setDry(0.0f);
-        reverb->setWet(0.33f);
+        auto& bus = buses[(size_t) i];
+        bus.track = audioTracks[kFirstStereoBus + i];
+        bus.volume = bus.track->getVolumePlugin();
+        const auto name = "Bus " + juce::String(i + 1);
+        bus.track->setName(name);
+        edit->setAuxBusName(i, name);
+        bus.track->setSoloIsolate(true);
+        auto& list = bus.track->pluginList;
+        for (auto* plugin : list.getPlugins())
+        {
+            if (auto* input = dynamic_cast<te::AuxReturnPlugin*>(plugin))
+                bus.input = input;
+            if (i == 0)
+                if (auto* room = dynamic_cast<te::ReverbPlugin*>(plugin))
+                    reverb = room;
+        }
+        if (bus.input == nullptr)
+        {
+            bus.input = insertPlugin<te::AuxReturnPlugin>(*edit, list, 0);
+            bus.input->busNumber = i;
+        }
+        if (i == 0 && reverb == nullptr)
+        {
+            reverb = insertPlugin<te::ReverbPlugin>(*edit, list, list.indexOf(bus.input) + 1);
+            reverb->setDry(0.0f);
+            reverb->setWet(0.33f);
+        }
     }
 }
 
 void AudioEngine::attachMeters()
 {
-    for (auto& s : strips)
-        if (s.track != nullptr)
-            if (auto* meter = s.track->getLevelMeterPlugin())
+    const auto attach = [](auto& strip)
+    {
+        if (strip.track != nullptr)
+            if (auto* meter = strip.track->getLevelMeterPlugin())
             {
-                s.measurer = &meter->measurer;
-                s.measurer->addClient(s.meter);
+                strip.measurer = &meter->measurer;
+                strip.measurer->addClient(strip.meter);
             }
+    };
+    for (auto& strip : strips) attach(strip);
+    for (auto& bus : buses) attach(bus);
 
     edit->getTransport().ensureContextAllocated();
     if (auto* context = edit->getCurrentPlaybackContext())
@@ -336,12 +484,14 @@ void AudioEngine::attachMeters()
 
 void AudioEngine::detachMeters()
 {
-    for (auto& s : strips)
+    const auto detach = [](auto& strip)
     {
-        if (s.measurer != nullptr)
-            s.measurer->removeClient(s.meter);
-        s.measurer = nullptr;
-    }
+        if (strip.measurer != nullptr)
+            strip.measurer->removeClient(strip.meter);
+        strip.measurer = nullptr;
+    };
+    for (auto& strip : strips) detach(strip);
+    for (auto& bus : buses) detach(bus);
     // Only detach from the master meter if its playback context is still the Edit's.
     if (masterMeasurer != nullptr && edit != nullptr && edit->getCurrentPlaybackContext() == meteredContext)
         masterMeasurer->removeClient(masterMeter);
@@ -378,8 +528,8 @@ void AudioEngine::pullAll()
         p.highCut = last.highCut = s.highCut->isEnabled() ? s.highCut->frequency->getCurrentValue() : 20000.0f;
         p.midFreq = last.midFreq = s.eq->midFreq1->getCurrentValue();
         p.midGainDb = last.midGainDb = s.eq->midGain1->getCurrentValue();
-        const float sendDb = s.send->getGainDb();
-        p.send = last.send = sendDb <= kMinDb ? 0.0f : juce::Decibels::decibelsToGain(sendDb);
+        for (size_t bus = 0; bus < s.sends.size(); ++bus)
+            p.sendLevels[bus] = last.sendLevels[bus] = dbToGain(s.sends[bus]->getGainDb());
         p.armed = false;
 
         // The input this track records from, if the Edit already has one assigned.
@@ -392,15 +542,19 @@ void AudioEngine::pullAll()
                 }
     }
 
-    master.volumeDb = syncedMaster.volumeDb = toUiDb(edit->getMasterVolumePlugin()->getVolumeDb());
-    master.reverbRoom = syncedMaster.room = reverb->roomSizeValue.get();
-    master.reverbDamping = syncedMaster.damping = reverb->dampValue.get();
-    master.reverbWet = syncedMaster.wet = reverb->wetValue.get();
+    master.volumeDb = syncedMasterVolumeDb = toUiDb(edit->getMasterVolumePlugin()->getVolumeDb());
+    for (auto& bus : buses)
+        bus.params.volumeDb = bus.syncedVolumeDb = toUiDb(bus.volume->getVolumeDb());
+    busReverb.room = syncedReverb.room = reverb->roomSizeValue.get();
+    busReverb.damping = syncedReverb.damping = reverb->dampValue.get();
+    busReverb.wet = syncedReverb.wet = reverb->wetValue.get();
 
     bpm = syncedBpm = edit->tempoSequence.getTempo(0)->getBpm();
     beatsPerBar = syncedBeatsPerBar = edit->tempoSequence.getTimeSig(0)->numerator.get();
     metronomeOn = syncedClick = edit->clickTrackEnabled.get();
-    countInOn = edit->getCountInMode() != te::Edit::CountIn::none;
+    countInOn = static_cast<bool>(edit->state.getProperty(kRecordCountIn, edit->getCountInMode() != te::Edit::CountIn::none));
+    playbackCountInOn = static_cast<bool>(edit->state.getProperty(kPlaybackCountIn, false));
+    metronomeRecordOnly = edit->clickTrackRecordingOnly.get();
     punchOn = syncedPunchOn = edit->recordingPunchInOut.get();
     loopOn = syncedLoopOn = edit->getTransport().looping.get() && !punchOn.load();
     const auto loop = edit->getTransport().getLoopRange();
@@ -431,6 +585,19 @@ void AudioEngine::sync()
     }
     if (inputsDirty)
         applyInputs();
+}
+
+void AudioEngine::setTrackMidi(int index, bool midi)
+{
+    auto& params = getTrack(index);
+    if (getState() == State::Recording || params.midi.load() == midi)
+        return;
+    if (!midi)
+        removeInstrument(index);
+    params.armed = false;
+    params.midi = midi;
+    params.monitor = (int) (midi ? MonitorMode::Auto : MonitorMode::Off);
+    sync();
 }
 
 void AudioEngine::syncTrack(int t)
@@ -472,11 +639,11 @@ void AudioEngine::syncTrack(int t)
     twoWay(p.midFreq, last.midFreq, s.eq->midFreq1->getCurrentValue(), [&](float v) { s.eq->setMidFreq1(v); });
     twoWay(p.midGainDb, last.midGainDb, s.eq->midGain1->getCurrentValue(), [&](float v) { s.eq->setMidGain1(v); });
 
-    const float sendDb = s.send->getGainDb();
-    twoWay(p.send, last.send, sendDb <= kMinDb ? 0.0f : juce::Decibels::decibelsToGain(sendDb), [&](float v)
-    {
-        s.send->setGainDb(v <= 0.001f ? kOffDb : juce::Decibels::gainToDecibels(v));
-    });
+    for (size_t bus = 0; bus < s.sends.size(); ++bus)
+        twoWay(p.sendLevels[bus], last.sendLevels[bus], dbToGain(s.sends[bus]->getGainDb()), [send = s.sends[bus]](float v)
+        {
+            send->setGainDb(v <= 0.001f ? kOffDb : juce::Decibels::gainToDecibels(v));
+        });
 
     // Name and colour are plain members, only ever changed by the UI.
     if (p.name != last.name)
@@ -494,10 +661,74 @@ void AudioEngine::syncTrack(int t)
 void AudioEngine::syncMaster()
 {
     auto vol = edit->getMasterVolumePlugin();
-    twoWay(master.volumeDb, syncedMaster.volumeDb, toUiDb(vol->getVolumeDb()), [&](float v) { vol->setVolumeDb(toEngineDb(v)); });
-    twoWay(master.reverbRoom, syncedMaster.room, reverb->roomSizeValue.get(), [&](float v) { reverb->setRoomSize(v); });
-    twoWay(master.reverbDamping, syncedMaster.damping, reverb->dampValue.get(), [&](float v) { reverb->setDamp(v); });
-    twoWay(master.reverbWet, syncedMaster.wet, reverb->wetValue.get(), [&](float v) { reverb->setWet(v); });
+    twoWay(master.volumeDb, syncedMasterVolumeDb, toUiDb(vol->getVolumeDb()), [&](float v) { vol->setVolumeDb(toEngineDb(v)); });
+    for (auto& bus : buses)
+        twoWay(bus.params.volumeDb, bus.syncedVolumeDb, toUiDb(bus.volume->getVolumeDb()), [&](float v) { bus.volume->setVolumeDb(toEngineDb(v)); });
+    twoWay(busReverb.room, syncedReverb.room, reverb->roomSizeValue.get(), [&](float v) { reverb->setRoomSize(v); });
+    twoWay(busReverb.damping, syncedReverb.damping, reverb->dampValue.get(), [&](float v) { reverb->setDamp(v); });
+    twoWay(busReverb.wet, syncedReverb.wet, reverb->wetValue.get(), [&](float v) { reverb->setWet(v); });
+}
+
+bool AudioEngine::hasTrackRoute(int track, Route route) const
+{
+    if (edit == nullptr || !juce::isPositiveAndBelow(track, kNumTracks))
+        return false;
+    const auto& strip = strips[(size_t) track];
+    if (route == Route::Main)
+        return strip.mainGate->isOpen();
+    return strip.sends[(size_t) route - 1]->isEnabled();
+}
+
+void AudioEngine::setTrackRoute(int track, Route route, bool enabled)
+{
+    if (edit == nullptr || !juce::isPositiveAndBelow(track, kNumTracks)
+        || getState() == State::Recording || hasTrackRoute(track, route) == enabled)
+        return;
+
+    auto& undo = edit->getUndoManager();
+    undo.beginNewTransaction("Change channel routing");
+    auto& strip = strips[(size_t) track];
+    if (route == Route::Main)
+        strip.mainGate->setOpen(enabled);
+    else
+        strip.sends[(size_t) route - 1]->setEnabled(enabled);
+    CompressorEffect::removeLoopingKeys(*edit);
+    undo.beginNewTransaction();
+}
+
+bool AudioEngine::bus1FeedsBus2() const
+{
+    return edit != nullptr && buses[0].track->getOutput().getDestinationTrack() == buses[1].track;
+}
+
+void AudioEngine::setBus1FeedsBus2(bool toBus2)
+{
+    if (edit == nullptr || getState() == State::Recording || bus1FeedsBus2() == toBus2)
+        return;
+    auto& undo = edit->getUndoManager();
+    undo.beginNewTransaction("Route Bus 1");
+    auto& output = buses[0].track->getOutput();
+    if (toBus2)
+        output.setOutputToTrack(buses[1].track);
+    else
+        output.setOutputToDefaultDevice(false);
+    CompressorEffect::removeLoopingKeys(*edit);
+    undo.beginNewTransaction();
+}
+
+bool AudioEngine::isBusReverbEnabled() const
+{
+    return reverb != nullptr && reverb->isEnabled();
+}
+
+void AudioEngine::setBusReverbEnabled(bool enabled)
+{
+    if (reverb == nullptr || isBusReverbEnabled() == enabled)
+        return;
+    auto& undo = edit->getUndoManager();
+    undo.beginNewTransaction(enabled ? "Enable Bus 1 reverb" : "Bypass Bus 1 reverb");
+    reverb->setEnabled(enabled);
+    undo.beginNewTransaction();
 }
 
 void AudioEngine::syncTransportSettings()
@@ -507,10 +738,12 @@ void AudioEngine::syncTransportSettings()
     {
         syncedBpm = bpm.load();
         tempo->setBpm(syncedBpm);
+        updateEffectTempo();
     }
     else if (std::abs(tempo->getBpm() - syncedBpm) > 1.0e-6)
     {
         bpm = syncedBpm = tempo->getBpm();
+        updateEffectTempo();
     }
 
     auto* sig = edit->tempoSequence.getTimeSig(0);
@@ -523,6 +756,13 @@ void AudioEngine::syncTransportSettings()
     {
         beatsPerBar = syncedBeatsPerBar = sig->numerator.get();
     }
+
+    if (!edit->state.hasProperty(kRecordCountIn) || static_cast<bool>(edit->state[kRecordCountIn]) != countInOn.load())
+        edit->state.setProperty(kRecordCountIn, countInOn.load(), nullptr);
+    if (static_cast<bool>(edit->state.getProperty(kPlaybackCountIn, false)) != playbackCountInOn.load())
+        edit->state.setProperty(kPlaybackCountIn, playbackCountInOn.load(), nullptr);
+    if (edit->clickTrackRecordingOnly.get() != metronomeRecordOnly.load())
+        edit->clickTrackRecordingOnly = metronomeRecordOnly.load();
 
     if (metronomeOn.load() != syncedClick)
     {
@@ -559,6 +799,10 @@ void AudioEngine::applyInputs()
     inputsDirty = false;
     edit->getTransport().ensureContextAllocated();
 
+    for (int t = 0; t < kNumTracks; ++t)
+        if (tracks[(size_t) t].midi.load())
+            configureTrackMidiInput(t);
+
     for (auto* instance : edit->getAllInputDevices())
     {
         auto& device = instance->getInputDevice();
@@ -572,9 +816,12 @@ void AudioEngine::applyInputs()
         for (int t = 0; t < kNumTracks; ++t)
         {
             auto& p = tracks[(size_t) t];
-            // MIDI tracks take every MIDI input; audio tracks take the input carrying their channel.
+            // A MIDI track takes its own virtual input (or, until Tracktion has made that, every
+            // hardware MIDI input); an audio track takes the input carrying its channel.
+            auto* own = p.midi.load() ? trackMidiInput(t) : nullptr;
             const bool wants = p.midi.load()
-                                   ? isMidi
+                                   ? (own != nullptr ? &device == own
+                                                     : device.getDeviceType() == te::InputDevice::physicalMidiDevice)
                                    : isWave && p.inputType.load() != (int) InputType::Mix
                                          && inputForChannel(p.inputChannel.load()) == &device;
             if (!wants)
@@ -612,12 +859,21 @@ void AudioEngine::applyInputs()
 std::vector<te::Plugin*> AudioEngine::getInserts(int track) const
 {
     std::vector<te::Plugin*> inserts;
+    if (edit == nullptr)
+        return inserts;
     if (track == kMasterBus)
     {
-        if (edit != nullptr)
-            for (auto* p : edit->getMasterPluginList().getPlugins())
-                if (p != edit->getMasterVolumePlugin().get() && dynamic_cast<te::LevelMeterPlugin*>(p) == nullptr)
-                    inserts.push_back(p);
+        for (auto* p : edit->getMasterPluginList().getPlugins())
+            if (p != edit->getMasterVolumePlugin().get() && dynamic_cast<te::LevelMeterPlugin*>(p) == nullptr)
+                inserts.push_back(p);
+        return inserts;
+    }
+    if (juce::isPositiveAndBelow(track - kFirstStereoBus, kStereoBusCount))
+    {
+        const auto& bus = buses[(size_t) (track - kFirstStereoBus)];
+        for (auto* p : bus.track->pluginList.getPlugins())
+            if (p != bus.input && p != reverb && p != bus.volume && dynamic_cast<te::LevelMeterPlugin*>(p) == nullptr)
+                inserts.push_back(p);
         return inserts;
     }
     auto& s = strips[(size_t) track];
@@ -626,8 +882,9 @@ std::vector<te::Plugin*> AudioEngine::getInserts(int track) const
 
     auto* instrument = getInstrument(track);
     for (auto* p : s.track->pluginList.getPlugins())
-        if (p != s.lowCut && p != s.eq && p != s.highCut && p != s.volume && p != s.send && p != instrument
-            && dynamic_cast<te::LevelMeterPlugin*>(p) == nullptr)
+        if (p != s.lowCut && p != s.eq && p != s.highCut && p != s.volume && p != s.mainGate && p != instrument
+            && std::find(s.sends.begin(), s.sends.end(), p) == s.sends.end()
+            && dynamic_cast<te::LevelMeterPlugin*>(p) == nullptr && dynamic_cast<MidiOutPlugin*>(p) == nullptr)
             inserts.push_back(p);
     return inserts;
 }
@@ -640,7 +897,7 @@ te::Plugin::Ptr AudioEngine::loadPlugin(const juce::PluginDescription& descripti
 
     auto plugin = edit->getPluginCache().createNewPlugin(te::ExternalPlugin::xmlTypeName, description);
     auto* external = dynamic_cast<te::ExternalPlugin*>(plugin.get());
-    if (external == nullptr || external->getAudioPluginInstance() == nullptr)
+    if (external == nullptr || (external->getAudioPluginInstance() == nullptr && !external->isInitialisingAsync()))
     {
         error = description.name + " couldn't be loaded";
         if (external != nullptr && external->getLoadError().isNotEmpty())
@@ -656,9 +913,40 @@ te::Plugin* AudioEngine::getInstrument(int track) const
     if (s.track == nullptr)
         return nullptr;
     for (auto* p : s.track->pluginList.getPlugins())
-        if (auto* external = dynamic_cast<te::ExternalPlugin*>(p); external != nullptr && external->isSynth())
+        if (p->isSynth())
             return p;
     return nullptr;
+}
+
+int AudioEngine::midiEffectsEnd(int track) const
+{
+    auto& list = strips[(size_t) track].track->pluginList;
+    int i = 0;
+    while (i < list.size())
+        if (auto* e = dynamic_cast<EffectPlugin*>(list[i]); e != nullptr && e->getKind() == EffectPlugin::Kind::MidiEffect)
+            ++i;
+        else
+            break;
+    return i;
+}
+
+te::Plugin* AudioEngine::setInstrument(int track, const juce::String& instrumentType, juce::String& error)
+{
+    if (edit == nullptr)
+    {
+        error = "There's no project open.";
+        return nullptr;
+    }
+    auto type = EffectPlugin::findType(instrumentType);
+    if (!type || type->kind != EffectPlugin::Kind::Instrument)
+    {
+        error = "8track doesn't have an instrument called " + instrumentType.quoted() + ".";
+        return nullptr;
+    }
+    auto plugin = edit->getPluginCache().createNewPlugin(instrumentType, {});
+    if (auto* effect = dynamic_cast<EffectPlugin*>(plugin.get()))
+        effect->setTempo(bpm.load());
+    return placeInstrument(track, plugin);
 }
 
 te::Plugin* AudioEngine::setInstrument(int track, const juce::PluginDescription& description, juce::String& error)
@@ -671,11 +959,18 @@ te::Plugin* AudioEngine::setInstrument(int track, const juce::PluginDescription&
     auto plugin = loadPlugin(description, error);
     if (plugin == nullptr)
         return nullptr;
+    return placeInstrument(track, plugin);
+}
 
-    edit->getUndoManager().beginNewTransaction("Set instrument " + description.name);
+te::Plugin* AudioEngine::placeInstrument(int track, te::Plugin::Ptr plugin)
+{
+    edit->getUndoManager().beginNewTransaction("Set instrument " + plugin->getName());
     if (auto* old = getInstrument(track))
         old->deleteFromParent();
-    strips[(size_t) track].track->pluginList.insertPlugin(plugin, 0, nullptr);
+    // After the MIDI effects and the MIDI Out plugin, if there is one: they see the notes first.
+    auto& list = strips[(size_t) track].track->pluginList;
+    auto* midiOut = getMidiOutPlugin(track);
+    list.insertPlugin(plugin, midiOut != nullptr ? list.indexOf(midiOut) + 1 : midiEffectsEnd(track), nullptr);
     return plugin.get();
 }
 
@@ -702,7 +997,8 @@ std::vector<AudioEngine::AutomationTarget> AudioEngine::getAutomationTargets(int
 
     add(s.volume->volParam.get(), "Volume", "Mixer");
     add(s.volume->panParam.get(), "Pan", "Mixer");
-    add(s.send->gain.get(), "Reverb Send", "Mixer");
+    add(s.sends[0]->gain.get(), "Bus 1 Send", "Mixer");
+    add(s.sends[1]->gain.get(), "Bus 2 Send", "Mixer");
     add(s.lowCut->frequency.get(), "Low Cut", "Mixer");
     add(s.highCut->frequency.get(), "High Cut", "Mixer");
     add(s.eq->midFreq1.get(), "EQ Freq", "Mixer");
@@ -729,6 +1025,392 @@ te::AutomatableParameter* AudioEngine::findAutomationTarget(int track, const juc
     return nullptr;
 }
 
+//==============================================================================
+// MIDI assign
+namespace
+{
+    const juce::Identifier kAssignments { "EIGHTTRACK_MIDI_ASSIGN" }, kAssignment { "ASSIGN" },
+                           kParamProp { "param" }, kChannelProp { "channel" }, kControllerProp { "cc" };
+}
+
+juce::String AudioEngine::parameterKey(te::AutomatableParameter& param)
+{
+    return juce::String((juce::int64) param.getOwnerID().getRawID()) + "/" + param.paramID;
+}
+
+te::AutomatableParameter* AudioEngine::findParameter(const juce::String& key) const
+{
+    if (edit == nullptr || key.isEmpty())
+        return nullptr;
+    for (int t = 0; t < kNumTracks; ++t)
+        if (auto* param = findAutomationTarget(t, key))
+            return param;
+    for (auto* plugin : getInserts(kMasterBus))
+        for (auto* param : plugin->getAutomatableParameters())
+            if (parameterKey(*param) == key)
+                return param;
+    return nullptr;
+}
+
+std::vector<AudioEngine::MidiAssignment> AudioEngine::getMidiAssignments() const
+{
+    std::vector<MidiAssignment> out;
+    if (edit == nullptr)
+        return out;
+    for (const auto& v : edit->state.getChildWithName(kAssignments))
+        out.push_back({ v[kParamProp].toString(), juce::jlimit(1, 16, (int) v[kChannelProp]),
+                        juce::jlimit(0, 127, (int) v[kControllerProp]) });
+    return out;
+}
+
+std::optional<AudioEngine::MidiAssignment> AudioEngine::getMidiAssignment(const juce::String& key) const
+{
+    for (auto& a : getMidiAssignments())
+        if (a.key == key)
+            return a;
+    return std::nullopt;
+}
+
+void AudioEngine::assignMidi(const juce::String& key, int channel, int controller)
+{
+    if (edit == nullptr || key.isEmpty())
+        return;
+    auto* um = &edit->getUndoManager();
+    um->beginNewTransaction("MIDI assign");
+    auto list = edit->state.getOrCreateChildWithName(kAssignments, um);
+    // One controller per parameter, one parameter per controller.
+    for (int i = list.getNumChildren(); --i >= 0;)
+    {
+        auto v = list.getChild(i);
+        if (v[kParamProp].toString() == key || ((int) v[kChannelProp] == channel && (int) v[kControllerProp] == controller))
+            list.removeChild(i, um);
+    }
+    juce::ValueTree v(kAssignment);
+    v.setProperty(kParamProp, key, nullptr);
+    v.setProperty(kChannelProp, channel, nullptr);
+    v.setProperty(kControllerProp, controller, nullptr);
+    list.appendChild(v, um);
+    um->beginNewTransaction();
+}
+
+void AudioEngine::removeMidiAssignment(const juce::String& key)
+{
+    if (edit == nullptr)
+        return;
+    auto list = edit->state.getChildWithName(kAssignments);
+    auto* um = &edit->getUndoManager();
+    um->beginNewTransaction("Remove MIDI assign");
+    for (int i = list.getNumChildren(); --i >= 0;)
+        if (list.getChild(i)[kParamProp].toString() == key)
+            list.removeChild(i, um);
+    um->beginNewTransaction();
+}
+
+void AudioEngine::queueController(int channel, int controller, int value)
+{
+    if (controllerQueue.try_push(std::array<int, 3> { channel, controller, value }))
+        triggerAsyncUpdate();
+}
+
+void AudioEngine::handleAsyncUpdate()
+{
+    std::array<int, 3> event;
+    for (int i = 0; i < 4096 && controllerQueue.try_pop(event); ++i)
+    {
+        const auto [channel, controller, value] = event;
+        if (onMidiLearn)
+            onMidiLearn(channel, controller);
+        else
+            handleController(channel, controller, value);
+    }
+    if (!controllerQueue.empty())
+        triggerAsyncUpdate();
+}
+
+void AudioEngine::handleController(int channel, int controller, int value)
+{
+    for (auto& a : getMidiAssignments())
+        if (a.channel == channel && a.controller == controller)
+            if (auto* param = findParameter(a.key))
+                param->setNormalisedParameter(juce::jlimit(0.0f, 1.0f, (float) value / 127.0f), juce::sendNotification);
+}
+
+//==============================================================================
+// MIDI devices
+namespace
+{
+    const juce::Identifier kMidiInProperty { "eightTrackMidiIn" };
+    const juce::Identifier kMidiChannelProperty { "eightTrackMidiChannel" };
+
+    /** Each MIDI track records from its own virtual input, which picks the device and channel. */
+    juce::String trackMidiInputName(int track) { return "8track Track " + juce::String(track + 1); }
+}
+
+std::vector<std::shared_ptr<te::MidiInputDevice>> AudioEngine::physicalMidiInputs() const
+{
+    std::vector<std::shared_ptr<te::MidiInputDevice>> inputs;
+    for (auto& device : engine.getDeviceManager().getMidiInDevices())
+        if (device->getDeviceType() == te::InputDevice::physicalMidiDevice)
+            inputs.push_back(device);
+    return inputs;
+}
+
+std::vector<AudioEngine::MidiInput> AudioEngine::getMidiInputs() const
+{
+    std::vector<MidiInput> inputs;
+    for (auto& device : physicalMidiInputs())
+    {
+        MidiInput in { device->getName(), device->isEnabled(), 0.0 };
+        for (auto& a : midiActivity)
+            if (a->name == device->getName())
+                in.lastActivityMs = a->lastMs.load();
+        inputs.push_back(in);
+    }
+    return inputs;
+}
+
+void AudioEngine::setMidiInputEnabled(int inputIndex, bool enabled)
+{
+    const auto inputs = physicalMidiInputs();
+    if (inputIndex >= 0 && inputIndex < (int) inputs.size())
+        inputs[(size_t) inputIndex]->setEnabled(enabled);   // Tracktion rescans and tells us
+}
+
+void AudioEngine::refreshMidiActivity()
+{
+    std::vector<std::unique_ptr<MidiActivity>> next;
+    for (auto& device : physicalMidiInputs())
+    {
+        auto* physical = dynamic_cast<te::PhysicalMidiInputDevice*>(device.get());
+        if (physical == nullptr)
+            continue;
+        auto a = std::make_unique<MidiActivity>();
+        a->owner = this;
+        a->device = device;
+        a->name = device->getName();
+        for (auto& old : midiActivity)
+            if (old->name == a->name)
+                a->lastMs = old->lastMs.load();
+        physical->addListener(a.get());
+        next.push_back(std::move(a));
+    }
+    for (auto& old : midiActivity)
+        if (auto device = old->device.lock())
+            if (auto* physical = dynamic_cast<te::PhysicalMidiInputDevice*>(device.get()))
+                physical->removeListener(old.get());
+    midiActivity = std::move(next);
+}
+
+te::MidiOutputDevice* AudioEngine::midiOutput(int index) const
+{
+    return engine.getDeviceManager().getMidiOutDevice(index);
+}
+
+std::vector<AudioEngine::MidiOutput> AudioEngine::getMidiOutputs()
+{
+    std::vector<MidiOutput> outputs;
+    auto& dm = engine.getDeviceManager();
+    for (int i = 0; i < dm.getNumMidiOutDevices(); ++i)
+        if (auto* d = dm.getMidiOutDevice(i))
+            outputs.push_back({ d->getName(), d->isEnabled(), d->isEnabled() && d->isSendingClock(),
+                                d->isSendingMMC(), d->isSendingTimecode(), d->getPreDelayMs() });
+    return outputs;
+}
+
+void AudioEngine::setMidiOutputEnabled(int outputIndex, bool enabled)
+{
+    if (auto* d = midiOutput(outputIndex))
+    {
+        d->setEnabled(enabled);   // Tracktion rescans its MIDI devices and reallocates playback
+        if (edit != nullptr)
+            edit->restartPlayback();
+    }
+}
+
+void AudioEngine::setSendingMidiClock(int outputIndex, bool shouldSend)
+{
+    auto* device = midiOutput(outputIndex);
+    if (device == nullptr)
+        return;
+    if (shouldSend && !device->isEnabled())
+        device->setEnabled(true);
+    device->setSendingClock(shouldSend);
+    // The playback graph only includes MIDI outputs that are in use, so rebuild it.
+    if (edit != nullptr)
+        edit->restartPlayback();
+}
+
+void AudioEngine::setSendingMMC(int outputIndex, bool shouldSend)
+{
+    if (auto* d = midiOutput(outputIndex))
+    {
+        if (shouldSend && !d->isEnabled())
+            d->setEnabled(true);
+        d->setSendingMMC(shouldSend);
+    }
+}
+
+void AudioEngine::setSendingTimecode(int outputIndex, bool shouldSend)
+{
+    if (auto* d = midiOutput(outputIndex); d != nullptr && d->isSendingTimecode() != shouldSend)
+    {
+        if (shouldSend && !d->isEnabled())
+            d->setEnabled(true);
+        d->flipSendingTimecode();
+        if (edit != nullptr)
+            edit->restartPlayback();
+    }
+}
+
+void AudioEngine::setMidiOutputDelayMs(int outputIndex, int ms)
+{
+    if (auto* d = midiOutput(outputIndex))
+    {
+        d->setPreDelayMs(ms);
+        connectMidiOutPlugins();   // the notes tracks send there take the same delay
+    }
+}
+
+//==============================================================================
+// MIDI tracks' routing
+te::MidiInputDevice* AudioEngine::trackMidiInput(int track) const
+{
+    const auto name = trackMidiInputName(track);
+    for (auto& device : engine.getDeviceManager().getMidiInDevices())
+        if (device->getDeviceType() == te::InputDevice::virtualMidiDevice && device->getName() == name)
+            return device.get();
+    return nullptr;
+}
+
+void AudioEngine::ensureTrackMidiInputs()
+{
+    // Created once per machine (Tracktion keeps them); they appear after its next device scan.
+    for (int t = 0; t < kNumTracks; ++t)
+        if (trackMidiInput(t) == nullptr)
+            [[maybe_unused]] auto r = engine.getDeviceManager().createVirtualMidiDevice(trackMidiInputName(t));
+}
+
+void AudioEngine::configureTrackMidiInput(int track)
+{
+    auto* input = dynamic_cast<te::VirtualMidiInputDevice*>(trackMidiInput(track));
+    if (input == nullptr)
+        return;
+    if (!input->isEnabled())
+        input->setEnabled(true);
+
+    const auto routing = getMidiRouting(track);
+    juce::StringArray sources;
+    for (auto& device : physicalMidiInputs())
+        if (routing.input.isEmpty() || device->getName() == routing.input)
+            sources.add(device->getDeviceID());
+    if (input->getMIDIInputSourceDevices() != sources)
+        input->setMIDIInputSourceDevices(sources);
+    for (int ch = 1; ch <= 16; ++ch)
+        input->setChannelAllowed(ch, routing.channel == 0 || routing.channel == ch);
+}
+
+MidiOutPlugin* AudioEngine::getMidiOutPlugin(int track) const
+{
+    auto& s = strips[(size_t) track];
+    if (s.track == nullptr)
+        return nullptr;
+    for (auto* p : s.track->pluginList.getPlugins())
+        if (auto* out = dynamic_cast<MidiOutPlugin*>(p))
+            return out;
+    return nullptr;
+}
+
+AudioEngine::MidiRouting AudioEngine::getMidiRouting(int track) const
+{
+    MidiRouting r;
+    auto& s = strips[(size_t) track];
+    if (s.track == nullptr)
+        return r;
+    r.input = s.track->state.getProperty(kMidiInProperty).toString();
+    r.channel = juce::jlimit(0, 16, (int) s.track->state.getProperty(kMidiChannelProperty, 0));
+    if (auto* out = getMidiOutPlugin(track))
+    {
+        r.output = out->deviceName.get();
+        r.replaceInstrument = out->replaceInstrument.get();
+    }
+    return r;
+}
+
+void AudioEngine::setMidiRouting(int track, const MidiRouting& r)
+{
+    auto& s = strips[(size_t) track];
+    if (edit == nullptr || s.track == nullptr || getMidiRouting(track) == r)
+        return;
+
+    auto* um = &edit->getUndoManager();
+    um->beginNewTransaction("MIDI routing");
+    s.track->state.setProperty(kMidiInProperty, r.input, um);
+    s.track->state.setProperty(kMidiChannelProperty, juce::jlimit(0, 16, r.channel), um);
+
+    auto* out = getMidiOutPlugin(track);
+    if (r.output.isEmpty())
+    {
+        if (out != nullptr)
+            out->deleteFromParent();
+    }
+    else
+    {
+        if (out == nullptr)
+        {
+            // After the MIDI effects and before the instrument, so it sees the track's notes
+            // as the instrument will play them.
+            auto plugin = edit->getPluginCache().createNewPlugin(MidiOutPlugin::create());
+            s.track->pluginList.insertPlugin(plugin, midiEffectsEnd(track), nullptr);
+            out = dynamic_cast<MidiOutPlugin*>(plugin.get());
+        }
+        if (out != nullptr)
+        {
+            out->deviceName = r.output;
+            out->replaceInstrument = r.replaceInstrument;
+        }
+    }
+    um->beginNewTransaction();
+
+    connectMidiOutPlugins();
+    applyInputs();
+}
+
+void AudioEngine::connectMidiOutPlugins()
+{
+    updateMidiOutLatency();
+    if (edit == nullptr)
+        return;
+    const auto available = juce::MidiOutput::getAvailableDevices();
+    for (int t = 0; t < kNumTracks; ++t)
+    {
+        auto* out = getMidiOutPlugin(t);
+        if (out == nullptr)
+            continue;
+        int port = -1;
+        for (auto& info : available)
+            if (info.name == out->deviceName.get())
+                port = midiOutSender.openPort(info.identifier);
+
+        // The port's delay setting (also used for its clock) applies to the notes too.
+        auto& dm = engine.getDeviceManager();
+        for (int i = 0; i < dm.getNumMidiOutDevices(); ++i)
+            if (auto* d = dm.getMidiOutDevice(i); d != nullptr && d->getName() == out->deviceName.get())
+                midiOutSender.setPortDelayMs(port, d->getPreDelayMs());
+        out->connect(midiOutSender, port);
+    }
+}
+
+void AudioEngine::updateMidiOutLatency()
+{
+    // CoreAudio's reported output latency already includes its I/O buffer.
+    if (auto* device = getDeviceManager().getCurrentAudioDevice())
+    {
+        const double rate = device->getCurrentSampleRate();
+        if (rate > 0)
+            midiOutSender.setOutputLatencyMs(1000.0 * device->getOutputLatencyInSamples() / rate);
+    }
+}
+
 juce::StringArray AudioEngine::getMidiInputNames() const
 {
     juce::StringArray names;
@@ -738,29 +1420,88 @@ juce::StringArray AudioEngine::getMidiInputNames() const
     return names;
 }
 
-te::Plugin* AudioEngine::addInsert(int track, const juce::PluginDescription& description, juce::String& error)
+bool AudioEngine::canAddInsert(int track, juce::String& error) const
 {
     if (edit == nullptr)
     {
         error = "There's no project open.";
-        return nullptr;
+        return false;
     }
     if ((int) getInserts(track).size() >= kMaxInserts)
     {
         error = (track == kMasterBus ? "The master" : "A track") + juce::String(" can have up to ")
                 + juce::String(kMaxInserts) + " plugins.";
-        return nullptr;
+        return false;
     }
+    return true;
+}
 
+te::Plugin* AudioEngine::addInsert(int track, const juce::PluginDescription& description, juce::String& error)
+{
+    if (!canAddInsert(track, error))
+        return nullptr;
     auto plugin = loadPlugin(description, error);
     if (plugin == nullptr)
         return nullptr;
+    return placeInsert(track, plugin);
+}
 
-    edit->getUndoManager().beginNewTransaction("Add " + description.name);
+te::Plugin* AudioEngine::addEffect(int track, const juce::String& effectType, juce::String& error)
+{
+    if (!canAddInsert(track, error))
+        return nullptr;
+    const auto type = EffectPlugin::findType(effectType);
+    if (!type || type->kind == EffectPlugin::Kind::Instrument)
+    {
+        error = "8track doesn't have an effect called " + effectType.quoted() + ".";
+        return nullptr;
+    }
+    const bool midiEffect = type->kind == EffectPlugin::Kind::MidiEffect;
+    if (midiEffect && (!juce::isPositiveAndBelow(track, kNumTracks) || !tracks[(size_t) track].midi.load()))
+    {
+        error = type->name + " works on MIDI tracks.";
+        return nullptr;
+    }
+    auto plugin = edit->getPluginCache().createNewPlugin(effectType, {});
+    auto* effect = dynamic_cast<EffectPlugin*>(plugin.get());
+    if (effect == nullptr)
+    {
+        error = type->name + " couldn't be created.";
+        return nullptr;
+    }
+    effect->setTempo(bpm.load());
+    if (midiEffect)
+    {
+        // First in the chain, after any other MIDI effects: before MIDI Out and the instrument.
+        edit->getUndoManager().beginNewTransaction("Add " + plugin->getName());
+        strips[(size_t) track].track->pluginList.insertPlugin(plugin, midiEffectsEnd(track), nullptr);
+        return plugin.get();
+    }
+    return placeInsert(track, plugin);
+}
+
+void AudioEngine::updateEffectTempo()
+{
+    if (edit == nullptr)
+        return;
+    for (auto* p : te::getAllPlugins(*edit, false))
+        if (auto* effect = dynamic_cast<EffectPlugin*>(p))
+            effect->setTempo(syncedBpm);
+}
+
+te::Plugin* AudioEngine::placeInsert(int track, te::Plugin::Ptr plugin)
+{
+    edit->getUndoManager().beginNewTransaction("Add " + plugin->getName());
     if (track == kMasterBus)
     {
         auto& list = edit->getMasterPluginList();
         list.insertPlugin(plugin, list.size(), nullptr);   // the master fader isn't in this list: it comes after
+        return plugin.get();
+    }
+    if (juce::isPositiveAndBelow(track - kFirstStereoBus, kStereoBusCount))
+    {
+        auto& bus = buses[(size_t) (track - kFirstStereoBus)];
+        bus.track->pluginList.insertPlugin(plugin, bus.track->pluginList.indexOf(bus.volume), nullptr);
         return plugin.get();
     }
     auto& s = strips[(size_t) track];
@@ -813,6 +1554,12 @@ void AudioEngine::drainMeters()
         atomicMax(master.peakL, levelToGain(masterMeter.getAndClearAudioLevel(0)));
         atomicMax(master.peakR, levelToGain(masterMeter.getAndClearAudioLevel(1)));
     }
+    for (auto& bus : buses)
+        if (bus.measurer != nullptr)
+        {
+            atomicMax(bus.params.peakL, levelToGain(bus.meter.getAndClearAudioLevel(0)));
+            atomicMax(bus.params.peakR, levelToGain(bus.meter.getAndClearAudioLevel(1)));
+        }
 }
 
 void AudioEngine::timerCallback()
@@ -843,13 +1590,30 @@ void AudioEngine::changeListenerCallback(juce::ChangeBroadcaster*)
     // be new objects.
     setUpInputLayout();
     normaliseInputChoices();
+    ensureTrackMidiInputs();   // MIDI devices were plugged in, unplugged, or switched on or off
+    refreshMidiActivity();
     if (edit != nullptr)
     {
         detachMeters();
         attachMeters();
+        connectMidiOutPlugins();
         inputsDirty = true;
     }
-    lastSampleRate = getSampleRate();
+    const auto rate = getSampleRate();
+    if (lastSampleRate > 0 && !juce::approximatelyEqual(rate, lastSampleRate))
+    {
+        auto rescale = [&](juce::int64 samples)
+        {
+            return (juce::int64) std::llround((double) samples * rate / lastSampleRate);
+        };
+        punchIn = rescale(punchIn.load());
+        punchOut = rescale(punchOut.load());
+        syncedPunchIn = rescale(syncedPunchIn);
+        syncedPunchOut = rescale(syncedPunchOut);
+        returnPosition = rescale(returnPosition);
+        armedLoopOffset = rescale(armedLoopOffset);
+    }
+    lastSampleRate = rate;
     sendChangeMessage();
 }
 
@@ -885,10 +1649,11 @@ void AudioEngine::play()
 {
     if (edit == nullptr || getState() != State::Stopped)
         return;
+    syncTransportSettings();
     returnPosition = getPosition();
     if (loopOn.load() && hasRange() && (getPosition() < punchIn.load() || getPosition() >= punchOut.load()))
         setPosition(punchIn.load());   // looping starts at the loop
-    edit->getTransport().play(false);
+    edit->getTransport().play(false, playbackCountInOn.load() ? beatsPerBar.load() : 0);
 }
 
 void AudioEngine::stop()
@@ -905,6 +1670,7 @@ void AudioEngine::stop()
 
 bool AudioEngine::record(const juce::File& takeFolder, juce::String& error)
 {
+    chordPreview.stop();
     if (edit == nullptr)
     {
         error = "There's no project open.";
@@ -912,13 +1678,19 @@ bool AudioEngine::record(const juce::File& takeFolder, juce::String& error)
     }
 
     auto& transport = edit->getTransport();
+    if (auto* context = transport.getCurrentPlaybackContext())
+        if (transport.isPlaying() && context->getUnloopedPosition().inSeconds() < transport.getPlaybackCountInEndSeconds())
+        {
+            error = "Wait for the playback count-in to finish before recording.";
+            return false;
+        }
     const bool looper = loopOn.load() && hasRange();
 
     // A looper that's already going: record toggles finishing at the end of this pass,
     // and cancels a start that hasn't happened yet.
     switch (loopRecord)
     {
-        case LoopRecord::Recording: loopRecord = LoopRecord::Finishing; lastLoopPosition = getPosition(); loopWatcher.startTimer(1); return true;
+        case LoopRecord::Recording: loopRecord = LoopRecord::Finishing; armedLoopOffset = loopPassOffset(); loopWatcher.startTimer(1); return true;
         case LoopRecord::Finishing: loopRecord = LoopRecord::Recording; loopWatcher.stopTimer(); return true;
         case LoopRecord::Waiting:   loopRecord = LoopRecord::Off; loopWatcher.stopTimer(); return true;
         case LoopRecord::Off:       break;
@@ -965,7 +1737,7 @@ bool AudioEngine::record(const juce::File& takeFolder, juce::String& error)
         {
             // Wait for the next pass, so the takes line up with the loop.
             loopRecord = LoopRecord::Waiting;
-            lastLoopPosition = getPosition();
+            armedLoopOffset = loopPassOffset();
             loopWatcher.startTimer(1);
             return true;
         }
@@ -989,6 +1761,14 @@ bool AudioEngine::record(const juce::File& takeFolder, juce::String& error)
     return true;
 }
 
+juce::int64 AudioEngine::loopPassOffset() const
+{
+    if (auto* context = edit->getCurrentPlaybackContext())
+        if (auto point = context->getSyncPoint())
+            return toSamples(point->unloopedTime - point->time);
+    return 0;
+}
+
 void AudioEngine::checkLoopWrap()
 {
     if (edit == nullptr || loopRecord == LoopRecord::Off || loopRecord == LoopRecord::Recording)
@@ -1004,11 +1784,9 @@ void AudioEngine::checkLoopWrap()
         return;
     }
 
-    // The playhead jumping back means a new pass has begun.
-    const auto pos = getPosition();
-    const bool wrapped = pos < lastLoopPosition - (juce::int64) (getSampleRate() * 0.1);
-    lastLoopPosition = pos;
-    if (!wrapped)
+    // Both positions come from one audio block. A busy message thread can
+    // observe the crossing even after playback has passed its previous position.
+    if (loopPassOffset() <= armedLoopOffset)
         return;
 
     loopWatcher.stopTimer();
@@ -1033,6 +1811,20 @@ void AudioEngine::recordingFinished(te::InputDeviceInstance&, te::EditItemID, co
             keepLastFullPass(*wave);
 }
 
+void AudioEngine::storeTakes(te::WaveAudioClip& clip, const juce::Array<juce::File>& passes)
+{
+    if (passes.size() < 2)
+        return;
+    juce::ValueTree alternatives(takeListID);
+    for (const auto& file : passes)
+    {
+        juce::ValueTree take(te::IDs::TAKE);
+        te::SourceFileReference(*edit, take, takePathID).setToFile(file, te::SourceFileReference::PathStyle::chooseBest, false);
+        alternatives.appendChild(take, nullptr);
+    }
+    clip.state.appendChild(alternatives, &edit->getUndoManager());
+}
+
 void AudioEngine::keepLastFullPass(te::WaveAudioClip& clip)
 {
     auto takes = clip.state.getChildWithName(te::IDs::TAKES);
@@ -1051,10 +1843,16 @@ void AudioEngine::keepLastFullPass(te::WaveAudioClip& clip)
     const double loopLength = edit->getTransport().getLoopRange().getLength().inSeconds();
     juce::File keep = passes.isEmpty() ? juce::File() : passes.getFirst();
     for (auto& file : passes)
-        if (te::AudioFile(engine, file).getLength() >= loopLength - 0.05)
+    {
+        const te::AudioFile recording(engine, file);
+        const double rate = recording.getSampleRate();
+        // Rounding the two loop boundaries to file samples can cost one frame.
+        if (rate > 0 && recording.getLengthInSamples() + 1 >= std::llround(loopLength * rate))
             keep = file;
+    }
 
     auto* um = &edit->getUndoManager();
+    storeTakes(clip, passes);
     clip.state.removeChild(takes, um);
     if (keep != juce::File() && keep != clip.getSourceFileReference().getFile())
         clip.getSourceFileReference().setToFile(keep, te::SourceFileReference::PathStyle::chooseBest, false);

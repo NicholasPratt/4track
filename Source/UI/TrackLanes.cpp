@@ -1,4 +1,5 @@
 #include "TrackLanes.h"
+#include "Ruler.h"
 
 TrackLanes::TrackLanes(AudioEngine& e, Project& p, TimelineView& v) : engine(e), project(p), view(v)
 {
@@ -120,11 +121,34 @@ void TrackLanes::paint(juce::Graphics& g)
 
     paintLiveTakes(g);
 
+    if (marquee)
+    {
+        g.setColour(Theme::accent.withAlpha(0.12f));
+        g.fillRect(*marquee);
+        g.setColour(Theme::accent.withAlpha(0.8f));
+        g.drawRect(*marquee, 1.0f);
+    }
+
     for (int t = 0; t < kNumTracks; ++t)
         if (auto* param = automationFor(t))
             paintAutomation(g, t, *param);
 
-    if (arr.isEmpty() && engine.getState() != AudioEngine::State::Recording)
+    if (chordDropPreview)
+    {
+        Clip shape;
+        shape.start = engine.toSamples(chordDropPreview->range.getStart());
+        shape.length = engine.toSamples(chordDropPreview->range.getEnd()) - shape.start;
+        const auto bounds = clipRect(shape, chordDropPreview->track);
+        g.setColour(Theme::accent.withAlpha(0.3f));
+        g.fillRoundedRectangle(bounds, 4);
+        g.setColour(Theme::accent);
+        g.drawRoundedRectangle(bounds, 4, 1);
+        g.setColour(Theme::text);
+        g.setFont(Theme::font(13, true));
+        g.drawText(chordDropPreview->symbol, bounds.reduced(6, 2), juce::Justification::centredLeft, true);
+    }
+
+    if (arr.isEmpty() && !chordDropPreview && engine.getState() != AudioEngine::State::Recording)
     {
         g.setColour(Theme::textDim);
         g.setFont(Theme::font(14.0f));
@@ -167,6 +191,16 @@ te::SmartThumbnail& TrackLanes::thumbnailFor(const juce::File& file)
     return *thumb;
 }
 
+juce::Rectangle<float> TrackLanes::takeControl(const Clip& c, int track) const
+{
+    if (c.takes.size() < 2 || !selection.count(c.id))
+        return {};
+    auto header = clipRect(c, track).withHeight(14).getIntersection(getLocalBounds().toFloat());
+    if (header.getWidth() < 110)
+        return {};
+    return header.withTrimmedRight(8).removeFromRight(92);
+}
+
 void TrackLanes::paintClip(juce::Graphics& g, const Clip& c, int track, bool selected, bool hovered)
 {
     auto r = clipRect(c, track);
@@ -184,11 +218,21 @@ void TrackLanes::paintClip(juce::Graphics& g, const Clip& c, int track, bool sel
     {
         g.setColour(juce::Colours::black.withAlpha(0.75f));
         g.setFont(Theme::font(10.0f, true));
-        g.drawText(c.midi ? juce::String("MIDI") : c.file.getFileNameWithoutExtension(),
+        g.drawText(c.midi ? (c.midiState.hasProperty(te::IDs::name) ? c.midiState[te::IDs::name].toString() : juce::String("MIDI"))
+                          : c.file.getFileNameWithoutExtension(),
                    header.reduced(5.0f, 0.0f).withX(juce::jmax(header.getX() + 5.0f, 2.0f)),
                    juce::Justification::centredLeft, true);
     }
 
+    auto control = takeControl(c, track);
+    if (!control.isEmpty())
+    {
+        g.setColour(Theme::panel);
+        g.fillRoundedRectangle(control, 3);
+        g.setColour(Theme::text);
+        g.drawText("<  Take " + juce::String(c.activeTake + 1) + " of " + juce::String(c.takes.size()) + "  >",
+                   control, juce::Justification::centred);
+    }
     auto waveArea = r.withTrimmedTop(15.0f).reduced(0.0f, 2.0f);
     if (c.midi)
     {
@@ -296,15 +340,39 @@ void TrackLanes::paintLiveTakes(juce::Graphics& g)
         return;
     }
 
-    const auto now = engine.getPosition();
+    const double rate = engine.getSampleRate();
     for (auto& take : takes)
     {
-        if (now <= take.start)
+        if (take.file == juce::File())
             continue;
+        auto& thumb = recordingThumbs[take.file.getFullPathName()];
+        if (thumb == nullptr)
+            thumb = engine.getTracktion().getRecordingThumbnailManager().getThumbnailFor(take.file);
+
+        const auto written = thumb->thumb->getNumSamplesFinished();
+        if (written <= 0)
+            continue;
+        auto sourceStart = take.start;
+        auto end = take.start + written;
+        const auto in = engine.punchIn.load(), out = engine.punchOut.load();
+        if (engine.loopOn.load() && out > in && end > out)
+        {
+            // The file is continuous across passes. At the exact wrap show the completed pass.
+            const auto pass = 1 + (end - out - 1) / (out - in);
+            sourceStart -= pass * (out - in);
+            end -= pass * (out - in);
+        }
 
         Clip shape;
-        shape.start = take.start;
-        shape.length = now - take.start;
+        shape.start = sourceStart;
+        if ((engine.loopOn.load() || engine.punchOn.load()) && out > in)
+        {
+            shape.start = juce::jmax(shape.start, in);
+            end = juce::jmin(end, out);
+        }
+        shape.length = end - shape.start;
+        if (shape.length <= 0)
+            continue;
         auto r = clipRect(shape, take.track);
 
         g.setColour(Theme::record.withAlpha(0.25f));
@@ -315,14 +383,17 @@ void TrackLanes::paintLiveTakes(juce::Graphics& g)
         g.setFont(Theme::font(10.0f, true));
         g.drawText("Recording", r.withHeight(14.0f).reduced(5.0f, 0.0f), juce::Justification::centredLeft, true);
 
-        auto& thumb = recordingThumbs[take.file.getFullPathName()];
-        if (thumb == nullptr && take.file != juce::File())
-            thumb = engine.getTracktion().getRecordingThumbnailManager().getThumbnailFor(take.file);
-        if (thumb != nullptr)
+        const auto visible = r.withTrimmedTop(15.0f).reduced(0.0f, 2.0f)
+                              .getIntersection(getLocalBounds().toFloat());
+        if (visible.getWidth() >= 1.0f)
         {
+            auto fileTime = [&](float x)
+            {
+                return (double) (juce::jlimit(shape.start, end, view.sampleAt(x)) - sourceStart) / rate;
+            };
             g.setColour(Theme::record.brighter(0.6f));
-            const double seconds = (double) shape.length / engine.getSampleRate();
-            thumb->thumb->drawChannels(g, r.withTrimmedTop(15.0f).reduced(0.0f, 2.0f).toNearestInt(), 0.0, seconds, 1.0f);
+            thumb->thumb->drawChannels(g, visible.toNearestInt(), fileTime(visible.getX()),
+                                       fileTime(visible.getRight()), 1.0f);
         }
 
         g.setColour(Theme::record);
@@ -393,6 +464,7 @@ void TrackLanes::mouseDown(const juce::MouseEvent& e)
     {
         if (!e.mods.isShiftDown())
             selection.clear();
+        marqueeBase = selection;
         if (!e.mods.isPopupMenu())
             engine.setPosition(juce::jmax<juce::int64>(0, snapped(dragDownSample, e.mods)));
         repaint();
@@ -402,6 +474,19 @@ void TrackLanes::mouseDown(const juce::MouseEvent& e)
         return;
     }
 
+    if (!e.mods.isPopupMenu())
+        if (auto* clip = project.getArrangement().findClip(dragHit.clipId))
+        {
+            auto control = takeControl(*clip, dragDownTrack);
+            if (control.contains(e.position))
+            {
+                const int n = clip->takes.size();
+                project.chooseTake(clip->id, (clip->activeTake + (e.position.x < control.getCentreX() ? n - 1 : 1)) % n);
+                dragHit = {};
+                repaint();
+                return;
+            }
+        }
     if (e.mods.isShiftDown())
     {
         if (selection.count(dragHit.clipId)) selection.erase(dragHit.clipId);
@@ -527,10 +612,10 @@ void TrackLanes::mouseDrag(const juce::MouseEvent& e)
 
     if (dragHit.clipId == 0)
     {
-        // Dragging on empty space scrubs the playhead.
-        engine.setPosition(juce::jmax<juce::int64>(0, snapped(view.sampleAt(e.position.x), e.mods)));
-        repaint();
-        if (onViewChanged) onViewChanged();
+        // Dragging on empty space draws a selection rectangle.
+        if (e.mods.isPopupMenu() || (!marquee && e.getDistanceFromDragStart() < 4))
+            return;
+        updateMarquee(e);
         return;
     }
 
@@ -554,6 +639,14 @@ void TrackLanes::mouseUp(const juce::MouseEvent& e)
         return;
     }
 
+    if (marquee)
+    {
+        marquee.reset();
+        dragHit = {};
+        repaint();
+        return;
+    }
+
     if (dragActive && dragHit.clipId != 0)
     {
         if (auto edit = editForDrag(e))
@@ -564,6 +657,66 @@ void TrackLanes::mouseUp(const juce::MouseEvent& e)
     preview.reset();
     pruneSelection();
     repaint();
+}
+
+void TrackLanes::updateMarquee(const juce::MouseEvent& e)
+{
+    marquee = juce::Rectangle<float>(e.mouseDownPosition, e.position);
+    selection = marqueeBase;
+    const auto& arr = project.getArrangement();
+    for (int t = 0; t < kNumTracks; ++t)
+        for (auto& c : arr.tracks[(size_t) t])
+            if (clipRect(c, t).intersects(*marquee))
+                selection.insert(c.id);
+    repaint();
+}
+
+namespace
+{
+    enum SelectionAction { kJoin = 20, kNormalise, kTransposeUp, kTransposeDown, kOctaveUp, kOctaveDown };
+}
+
+void TrackLanes::addSelectionActions(juce::PopupMenu& menu) const
+{
+    bool anyAudio = false, anyMidi = false;
+    for (auto id : selection)
+        if (auto* c = project.getArrangement().findClip(id))
+            (c->midi ? anyMidi : anyAudio) = true;
+
+    menu.addItem(kJoin, "Join Clips", project.canJoin(selection));
+    menu.addItem(kNormalise, "Normalise", anyAudio);
+    juce::PopupMenu transpose;
+    transpose.addItem(kTransposeUp, "+1 Semitone", anyMidi);
+    transpose.addItem(kTransposeDown, "-1 Semitone", anyMidi);
+    transpose.addItem(kOctaveUp, "+1 Octave", anyMidi);
+    transpose.addItem(kOctaveDown, "-1 Octave", anyMidi);
+    menu.addSubMenu("Transpose", transpose, anyMidi);
+}
+
+bool TrackLanes::performSelectionAction(int result)
+{
+    switch (result)
+    {
+        case kJoin:
+        {
+            juce::String error;
+            auto joined = project.joinClips(selection, error);
+            if (joined.empty())
+                juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::WarningIcon, "Join Clips", error);
+            else
+                selection = std::move(joined);
+            break;
+        }
+        case kNormalise:     project.normaliseClips(selection); break;
+        case kTransposeUp:   project.transposeClips(selection, 1); break;
+        case kTransposeDown: project.transposeClips(selection, -1); break;
+        case kOctaveUp:      project.transposeClips(selection, 12); break;
+        case kOctaveDown:    project.transposeClips(selection, -12); break;
+        default: return false;
+    }
+    pruneSelection();
+    repaint();
+    return true;
 }
 
 void TrackLanes::showEmptyMenu(int track, juce::int64 position)
@@ -588,6 +741,13 @@ void TrackLanes::showClipMenu(juce::int64 clipId, int track, juce::int64 positio
 
     const bool several = selection.size() > 1;
     juce::PopupMenu menu;
+    if (!several && c->takes.size() > 1)
+    {
+        juce::PopupMenu takes;
+        for (int i = 0; i < c->takes.size(); ++i)
+            takes.addItem(1000 + i, "Take " + juce::String(i + 1), true, i == c->activeTake);
+        menu.addSubMenu("Choose take", takes);
+    }
     if (c->midi && !several)
     {
         menu.addItem(7, "Edit Notes...");
@@ -596,7 +756,9 @@ void TrackLanes::showClipMenu(juce::int64 clipId, int track, juce::int64 positio
     menu.addItem(10, several ? "Cut Clips" : "Cut");
     menu.addItem(11, several ? "Copy Clips" : "Copy");
     menu.addItem(12, "Paste Here", canPaste != nullptr && canPaste());
-    menu.addItem(13, several ? "Duplicate Clips" : "Duplicate");
+    menu.addItem(13, several ? "Duplicate Clips..." : "Duplicate...");
+    menu.addSeparator();
+    addSelectionActions(menu);
     menu.addSeparator();
     menu.addItem(1, "Split at Playhead", canSplit);
     menu.addItem(2, several ? "Delete Clips" : "Delete");
@@ -612,8 +774,14 @@ void TrackLanes::showClipMenu(juce::int64 clipId, int track, juce::int64 positio
     juce::Component::SafePointer<TrackLanes> safe(this);
     menu.showMenuAsync(juce::PopupMenu::Options(), [safe, clipId, playhead, track, position](int result)
     {
-        if (safe == nullptr || result == 0)
+        if (safe == nullptr || result == 0 || safe->performSelectionAction(result))
             return;
+
+        if (result >= 1000)
+        {
+            safe->project.chooseTake(clipId, result - 1000);
+            return;
+        }
 
         // These act on the whole selection.
         auto call = [](const std::function<void()>& f) { if (f) f(); };
@@ -875,6 +1043,89 @@ void TrackLanes::showAutomationMenu(int track, te::AutomatableParameter& param)
         }
         safe->repaint();
     });
+}
+
+bool TrackLanes::isInterestedInDragSource(const SourceDetails& source)
+{
+    const auto* payload = source.description.getArray();
+    return dynamic_cast<Ruler*>(source.sourceComponent.get()) != nullptr
+        && payload != nullptr && payload->size() == 2 && (*payload)[0].isString() && (*payload)[1].isDouble();
+}
+
+std::optional<TrackLanes::ChordDrop> TrackLanes::chordDropAt(const SourceDetails& source)
+{
+    if (!isInterestedInDragSource(source) || !getLocalBounds().contains(source.localPosition)
+        || source.localPosition.y + scrollY >= getContentHeight())
+        return {};
+
+    const auto& payload = *source.description.getArray();
+    const auto originalBeat = te::BeatPosition::fromBeats(static_cast<double>(payload[1]));
+    const auto mods = juce::ModifierKeys::getCurrentModifiers();
+    const auto position = juce::jmax<juce::int64>(0, snapped(view.sampleAt(static_cast<float>(source.localPosition.x)), mods));
+    const auto& tempo = project.getEdit().tempoSequence;
+    const auto start = engine.toTime(position);
+    const auto end = tempo.toTime(tempo.toBeats(start) + project.chordDuration(originalBeat));
+    const int track = trackAtY(static_cast<float>(source.localPosition.y));
+    const te::TimeRange range(start, end);
+    if (!project.canPlaceChord(track, range))
+        return {};
+    return ChordDrop { track, range, payload[0].toString() };
+}
+
+void TrackLanes::itemDragEnter(const SourceDetails& source)
+{
+    itemDragMove(source);
+}
+
+void TrackLanes::itemDragMove(const SourceDetails& source)
+{
+    chordDropPreview = chordDropAt(source);
+    repaint();
+}
+
+void TrackLanes::itemDragExit(const SourceDetails&)
+{
+    chordDropPreview.reset();
+    repaint();
+}
+
+void TrackLanes::itemDropped(const SourceDetails& source)
+{
+    chordDropPreview.reset();
+    repaint();
+    const auto drop = chordDropAt(source);
+    if (!drop)
+        return;
+
+    if (engine.getTrack(drop->track).midi.load())
+    {
+        insertDroppedChord(*drop, false);
+        return;
+    }
+
+    const auto editState = project.getEdit().state;
+    const auto options = juce::MessageBoxOptions()
+        .withIconType(juce::MessageBoxIconType::QuestionIcon)
+        .withTitle("Convert to a MIDI track?")
+        .withMessage("Convert " + engine.getTrack(drop->track).name + " to MIDI and place " + drop->symbol + " there.")
+        .withButton("Convert and place", 1)
+        .withButton("Cancel", 0)
+        .withAssociatedComponent(this);
+    juce::AlertWindow::showAsync(options, [safe = juce::Component::SafePointer<TrackLanes>(this), drop, editState](int result)
+    {
+        if (safe && result == 1 && safe->project.getEdit().state == editState)
+            safe->insertDroppedChord(*drop, true);
+    });
+}
+
+void TrackLanes::insertDroppedChord(const ChordDrop& drop, bool allowConversion)
+{
+    if (auto* clip = project.placeChord(drop.track, drop.range, drop.symbol, allowConversion))
+    {
+        selection = { static_cast<juce::int64>(clip->itemID.getRawID()) };
+        if (onTrackClicked) onTrackClicked(drop.track);
+        repaint();
+    }
 }
 
 bool TrackLanes::isInterestedInFileDrag(const juce::StringArray& files)

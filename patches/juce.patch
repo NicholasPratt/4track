@@ -1,0 +1,14 @@
+diff --git a/modules/juce_audio_utils/gui/juce_AudioThumbnail.cpp b/modules/juce_audio_utils/gui/juce_AudioThumbnail.cpp
+index b421f9588e..4f553b2974 100644
+--- a/modules/juce_audio_utils/gui/juce_AudioThumbnail.cpp
++++ b/modules/juce_audio_utils/gui/juce_AudioThumbnail.cpp
+@@ -577,7 +577,8 @@ private:
+                 {
+                     auto nextSample = roundToInt ((startTime + timePerPixel) * timeToThumbSampleFactor);
+ 
+-                    channelData->getMinMax (sample, nextSample, *cacheData);
++                    // getMinMax includes both endpoints. The next bucket belongs to the next pixel.
++                    channelData->getMinMax (sample, jmax (sample, nextSample - 1), *cacheData);
+ 
+                     ++cacheData;
+                     startTime += timePerPixel;

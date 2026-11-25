@@ -1,4 +1,6 @@
 #include "TrackHeader.h"
+#include "../Audio/Effects.h"
+#include "Busy.h"
 #include "PluginWindows.h"
 #include <map>
 
@@ -163,12 +165,7 @@ void TrackHeader::setMidi(bool midi)
 {
     if (params.midi.load() == midi || !project.getArrangement().tracks[(size_t) index].empty())
         return;
-    if (!midi)
-        engine.removeInstrument(index);   // an instrument would replace an audio track's sound
-    params.armed = false;
-    params.midi = midi;
-    params.monitor = (int) (midi ? MonitorMode::Auto : MonitorMode::Off);   // hear the keyboard while armed
-    engine.syncNow();
+    engine.setTrackMidi(index, midi);
     updateKind();
     edited();
 }
@@ -176,17 +173,32 @@ void TrackHeader::setMidi(bool midi)
 void TrackHeader::showInstrumentMenu()
 {
     juce::Array<juce::PluginDescription> instruments;
-    for (auto& type : engine.getKnownPlugins().getTypes())
-        if (type.isInstrument)
-            instruments.add(type);
+    const bool thirdParty = showsThirdPartyPlugins(engine);
+    if (thirdParty)
+        for (auto& type : engine.getKnownPlugins().getTypes())
+            if (type.isInstrument)
+                instruments.add(type);
 
     auto* current = engine.getInstrument(index);
+    std::vector<EffectPlugin::Type> builtIn;   // 8track's own instruments
+    for (auto& type : EffectPlugin::getTypes())
+        if (type.kind == EffectPlugin::Kind::Instrument)
+            builtIn.push_back(type);
     juce::PopupMenu choose;
-    if (instruments.isEmpty())
-        choose.addItem(-1, "No instruments found yet", false);
-    else
-        juce::KnownPluginList::addToMenu(choose, instruments, juce::KnownPluginList::sortByManufacturer,
-                                         current != nullptr ? current->getIdentifierString() : juce::String());
+    choose.addSectionHeader("8track");
+    for (size_t i = 0; i < builtIn.size(); ++i)
+        choose.addItem(juce::PopupMenu::Item(builtIn[i].name)
+                           .setID(kFirstBuiltIn + (int) i)
+                           .setTicked(current != nullptr && current->getPluginType() == builtIn[i].xmlType));
+    if (thirdParty)
+    {
+        choose.addSectionHeader("Plugins");
+        if (instruments.isEmpty())
+            choose.addItem(-1, "No instruments found yet", false);
+        else
+            juce::KnownPluginList::addToMenu(choose, instruments, juce::KnownPluginList::sortByManufacturer,
+                                             current != nullptr ? current->getIdentifierString() : juce::String());
+    }
 
     juce::PopupMenu menu;
     if (current != nullptr)
@@ -201,15 +213,92 @@ void TrackHeader::showInstrumentMenu()
         menu = choose;
     }
     menu.addSeparator();
-    menu.addItem(-2, "Scan for Plugins...");
+    menu.addItem(-5, "Show Third-Party Plugins", true, thirdParty);
+    if (thirdParty)
+        menu.addItem(-2, "Scan for Plugins...");
+
+    // Where the track's MIDI comes from and goes to.
+    const auto routing = engine.getMidiRouting(index);
+    const auto midiIns = engine.getMidiInputs();
+    const auto midiOuts = engine.getMidiOutputs();
+    juce::PopupMenu inputMenu, channelMenu, outputMenu;
+    inputMenu.addItem(kAllInputs, "All MIDI Inputs", true, routing.input.isEmpty());
+    inputMenu.addSeparator();
+    bool inputFound = routing.input.isEmpty();
+    for (int i = 0; i < (int) midiIns.size(); ++i)
+    {
+        inputFound = inputFound || midiIns[(size_t) i].name == routing.input;
+        inputMenu.addItem(kFirstInput + i, midiIns[(size_t) i].name + (midiIns[(size_t) i].enabled ? "" : " (off)"),
+                          true, midiIns[(size_t) i].name == routing.input);
+    }
+    if (!inputFound)
+        inputMenu.addItem(kMissingInput, routing.input + " (not connected)", false, true);
+    channelMenu.addItem(kAnyChannel, "Any Channel", true, routing.channel == 0);
+    channelMenu.addSeparator();
+    for (int ch = 1; ch <= 16; ++ch)
+        channelMenu.addItem(kAnyChannel + ch, "Channel " + juce::String(ch), true, routing.channel == ch);
+    outputMenu.addItem(kNoOutput, "None (the instrument only)", true, routing.output.isEmpty());
+    outputMenu.addSeparator();
+    bool outputFound = routing.output.isEmpty();
+    for (int i = 0; i < (int) midiOuts.size(); ++i)
+    {
+        outputFound = outputFound || midiOuts[(size_t) i].name == routing.output;
+        outputMenu.addItem(kFirstOutput + i, midiOuts[(size_t) i].name, true, midiOuts[(size_t) i].name == routing.output);
+    }
+    if (!outputFound)
+        outputMenu.addItem(kMissingOutput, routing.output + " (not connected)", false, true);
+    if (midiOuts.empty())
+        outputMenu.addItem(kMissingOutput, "No MIDI outputs found", false);
+    outputMenu.addSeparator();
+    outputMenu.addItem(kBothPlay, "Instrument Plays Too", routing.output.isNotEmpty(),
+                       routing.output.isNotEmpty() && !routing.replaceInstrument);
+
+    menu.addSeparator();
+    menu.addSubMenu("MIDI Input: " + (routing.input.isEmpty() ? juce::String("All") : routing.input), inputMenu);
+    menu.addSubMenu("MIDI Channel: " + (routing.channel == 0 ? juce::String("Any") : juce::String(routing.channel)), channelMenu);
+    menu.addSubMenu("MIDI Output: " + (routing.output.isEmpty() ? juce::String("None") : routing.output), outputMenu);
+    menu.addItem(kMidiSettings, "MIDI Settings...");
 
     menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&instrument),
-                       [safe = SafePointer<TrackHeader>(this), instruments](int result)
+                       [safe = SafePointer<TrackHeader>(this), instruments, builtIn, routing, midiIns, midiOuts](int result)
     {
         if (safe == nullptr || result == 0)
             return;
         auto& eng = safe->engine;
         const int track = safe->index;
+
+        auto next = routing;
+        if (result == kAllInputs)                                                   next.input = {};
+        else if (result >= kFirstInput && result < kFirstInput + (int) midiIns.size()) next.input = midiIns[(size_t) (result - kFirstInput)].name;
+        else if (result >= kAnyChannel && result <= kAnyChannel + 16)                next.channel = result - kAnyChannel;
+        else if (result == kNoOutput)                                               next.output = {};
+        else if (result >= kFirstOutput && result < kFirstOutput + (int) midiOuts.size())
+        {
+            next.output = midiOuts[(size_t) (result - kFirstOutput)].name;
+            if (!midiOuts[(size_t) (result - kFirstOutput)].enabled)
+                eng.setMidiOutputEnabled(result - kFirstOutput, true);
+        }
+        else if (result == kBothPlay)                                               next.replaceInstrument = !next.replaceInstrument;
+        if (!(next == routing))
+        {
+            eng.setMidiRouting(track, next);
+            safe->edited();
+            safe->updateKind();
+            return;
+        }
+        if (result == kMidiSettings)
+        {
+            if (safe->onShowMidiSettings)
+                safe->onShowMidiSettings();
+            return;
+        }
+
+        if (result == -5)
+        {
+            setShowsThirdPartyPlugins(eng, !showsThirdPartyPlugins(eng));
+            safe->showInstrumentMenu();   // open it again, so the change shows straight away
+            return;
+        }
         if (result == -2)
             showPluginManager(eng);
         else if (result == -3)
@@ -222,10 +311,24 @@ void TrackHeader::showInstrumentMenu()
             eng.removeInstrument(track);
             safe->edited();
         }
+        else if (juce::isPositiveAndBelow(result - kFirstBuiltIn, (int) builtIn.size()))
+        {
+            juce::String error;
+            if (auto* p = eng.setInstrument(track, builtIn[(size_t) (result - kFirstBuiltIn)].xmlType, error))
+            {
+                p->showWindowExplicitly();
+                safe->edited();
+            }
+            else if (error.isNotEmpty())
+                juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::WarningIcon, "Couldn't add the instrument", error);
+        }
         else if (const int chosen = juce::KnownPluginList::getIndexChosenByMenu(instruments, result); chosen >= 0)
         {
             juce::String error;
-            if (auto* p = eng.setInstrument(track, instruments.getReference(chosen), error))
+            te::Plugin* p = nullptr;
+            const auto& description = instruments.getReference(chosen);
+            Busy::runHere("Loading " + description.name + "...", [&] { p = eng.setInstrument(track, description, error); });
+            if (p != nullptr)
             {
                 p->showWindowExplicitly();
                 safe->edited();
@@ -305,15 +408,26 @@ void TrackHeader::updateKind()
     const bool midi = params.midi.load();
     auto* inst = engine.getInstrument(index);
     const auto instName = inst != nullptr ? inst->getName() : juce::String();
-    if (midi == shownAsMidi && instName == shownInstrument)
+    const auto routing = engine.getMidiRouting(index);
+    juce::String route = "In: " + (routing.input.isEmpty() ? juce::String("all MIDI inputs") : routing.input)
+                       + ", " + (routing.channel == 0 ? juce::String("any channel") : "channel " + juce::String(routing.channel));
+    if (routing.output.isNotEmpty())
+        route << "\nOut: " << routing.output << (routing.replaceInstrument ? " (instead of the instrument)" : " and the instrument");
+    if (midi == shownAsMidi && instName == shownInstrument && route == shownRouting)
         return;
     shownAsMidi = midi;
     shownInstrument = instName;
+    shownRouting = route;
+    instrument.setTooltip(route);
 
     input.setVisible(!midi);
     instrument.setVisible(midi);
-    instrument.setButtonText(instName.isNotEmpty() ? instName : juce::String("Choose instrument..."));
-    instrument.setColour(juce::TextButton::textColourOffId, instName.isNotEmpty() ? Theme::text : Theme::textDim);
+    // A track that only plays hardware shows where it goes.
+    const auto shown = routing.output.isNotEmpty() && (routing.replaceInstrument || instName.isEmpty())
+                           ? juce::String::fromUTF8("\xe2\x86\x92 ") + routing.output
+                           : instName.isNotEmpty() ? instName : juce::String("Choose instrument...");
+    instrument.setButtonText(shown);
+    instrument.setColour(juce::TextButton::textColourOffId, instName.isNotEmpty() || routing.output.isNotEmpty() ? Theme::text : Theme::textDim);
     repaint();
 }
 

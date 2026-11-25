@@ -1,8 +1,27 @@
 #include "MainComponent.h"
+#include "Busy.h"
 #include "AudioSettingsDialog.h"
+#include "MidiSettingsDialog.h"
+#include "ShortcutHelp.h"
+#include "../Audio/Mp3Encoder.h"
+
+using namespace Shortcuts;
 
 namespace
 {
+    juce::TextEditor* textEditorAt(juce::Component* component)
+    {
+        for (; component != nullptr; component = component->getParentComponent())
+            if (auto* editor = dynamic_cast<juce::TextEditor*>(component))
+                return editor;
+        return nullptr;
+    }
+
+    juce::TextEditor* focusedTextEditor()
+    {
+        return textEditorAt(juce::Component::getCurrentlyFocusedComponent());
+    }
+
     juce::File projectsRoot()
     {
         return juce::File::getSpecialLocation(juce::File::userDocumentsDirectory).getChildFile("8track-projects");
@@ -25,25 +44,33 @@ namespace
 
 MainComponent::MainComponent()
 {
+    Busy::setHost(this);
+    PluginWindowBehaviour::setEngine(&engine);
+    project.runInBackground = [](const juce::String& message, const std::function<void()>& work) { Busy::run(message, work); };
     arrange = std::make_unique<ArrangeView>(engine, project);
     transport = std::make_unique<TransportBar>(engine, project, arrange->getView());
     mixer = std::make_unique<MixerPanel>(engine, project);
 
     addAndMakeVisible(*transport);
     addAndMakeVisible(*arrange);
+    arrange->addMouseListener(this, true);
     addChildComponent(*mixer);
+    mixer->addMouseListener(this, true);
     pianoRoll = std::make_unique<PianoRoll>(engine, project);
+    pianoRoll->addMouseListener(this, true);
     pianoRoll->onClose = [this] { closePianoRoll(); };
     addChildComponent(*pianoRoll);
     arrange->getLanes().onEditMidiClip = [this](juce::int64 id) { openPianoRoll(id); };
-    arrange->getLanes().onCut = [this] { perform(cmdCut); };
-    arrange->getLanes().onCopy = [this] { perform(cmdCopy); };
-    arrange->getLanes().onDuplicate = [this] { perform(cmdDuplicate); };
+    arrange->getLanes().onCut = [this] { perform(cmdCut, Context::Arrangement); };
+    arrange->getLanes().onCopy = [this] { perform(cmdCopy, Context::Arrangement); };
+    arrange->getLanes().onDuplicate = [this] { askToDuplicate(); };
+    arrange->onShowMidiSettings = [this] { perform(cmdMidiSettings); };
     arrange->getLanes().onPaste = [this](int track, juce::int64 position) { pasteClips(clipboard, track, position, false); };
     arrange->getLanes().canPaste = [this] { return !clipboard.empty(); };
 
     transport->onPlay = [this] { if (engine.getState() == AudioEngine::State::Stopped) engine.play(); };
     transport->onStop = [this] { engine.stop(); };
+    transport->onRecall = [this] { perform(cmdRecall); };
     transport->onRecord = [this] { toggleRecord(); };
     transport->onToStart = [this] { perform(cmdToStart); };
     transport->onRangeMode = [this] { perform(cmdPunch); };
@@ -64,7 +91,10 @@ MainComponent::MainComponent()
 
     disableFocus(*this);
     setWantsKeyboardFocus(true);
-    pianoRoll->setWantsKeyboardFocus(true);   // Delete removes the selected note while it has focus
+    pianoRoll->setWantsKeyboardFocus(true);
+    arrange->getRuler().setWantsKeyboardFocus(true);
+    mixer->setWantsKeyboardFocus(true);
+    juce::Desktop::getInstance().addFocusChangeListener(this);
 
     arrange->setInputs(engine.getInputs());
     setSize(1320, 820);
@@ -74,11 +104,15 @@ MainComponent::MainComponent()
 MainComponent::~MainComponent()
 {
     stopTimer();
+    juce::Desktop::getInstance().removeFocusChangeListener(this);
+    if (shortcutHost != nullptr)
+        shortcutHost->removeKeyListener(this);
+    arrange->removeMouseListener(this);
+    mixer->removeMouseListener(this);
+    pianoRoll->removeMouseListener(this);
 #if JUCE_MAC
     juce::MenuBarModel::setMacMainMenu(nullptr);
 #endif
-    if (auto* top = getTopLevelComponent())
-        top->removeKeyListener(this);
     engine.removeChangeListener(this);
     if (engine.getState() != AudioEngine::State::Stopped)
         engine.stop();
@@ -86,13 +120,31 @@ MainComponent::~MainComponent()
 
 void MainComponent::parentHierarchyChanged()
 {
-    if (auto* top = getTopLevelComponent())
-        top->addKeyListener(this);
+    auto* top = getTopLevelComponent();
+    if (shortcutHost.getComponent() == top)
+        return;
+    if (shortcutHost != nullptr)
+        shortcutHost->removeKeyListener(this);
+    shortcutHost = top;
+    shortcutHost->addKeyListener(this);
 }
 
 void MainComponent::paint(juce::Graphics& g)
 {
     g.fillAll(Theme::bg);
+}
+
+void MainComponent::mouseDown(const juce::MouseEvent& e)
+{
+    auto* clicked = e.eventComponent;
+    if (textEditorAt(clicked) != nullptr)
+        return;
+    if (pianoRollVisible && (clicked == pianoRoll.get() || pianoRoll->isParentOf(clicked)))
+        pianoRoll->grabKeyboardFocus();
+    else if (mixerVisible && (clicked == mixer.get() || mixer->isParentOf(clicked)))
+        mixer->grabKeyboardFocus();
+    else if (clicked != &arrange->getRuler() || !arrange->getRuler().isSongwritingArea(e.position))
+        grabKeyboardFocus();
 }
 
 void MainComponent::resized()
@@ -123,13 +175,21 @@ void MainComponent::timerCallback()
     auto& m = engine.getMaster();
     const float ml = m.peakL.exchange(0.0f), mr = m.peakR.exchange(0.0f);
     transport->setMasterPeaks(ml, mr);
+    for (int bus = 0; bus < AudioEngine::kStereoBusCount; ++bus)
+    {
+        auto& output = engine.getBus(bus);
+        const auto left = output.peakL.exchange(0.0f);
+        const auto right = output.peakR.exchange(0.0f);
+        if (mixerVisible)
+            mixer->setBusMeter(bus, left, right);
+    }
     if (mixerVisible)
     {
         mixer->setMasterMeter(ml, mr);
         mixer->refresh();
     }
 
-    transport->tick();
+    transport->tick(project.canRecall(arrange->getSelectedTrack()));
     arrange->tick();
     if (pianoRollVisible && engine.getState() != AudioEngine::State::Stopped)
         pianoRoll->repaint();   // playhead
@@ -234,7 +294,36 @@ void MainComponent::paste()
     pasteClips(clipboard, arrange->getSelectedTrack(), engine.getPosition(), true);
 }
 
-void MainComponent::duplicateSelection()
+void MainComponent::askToDuplicate()
+{
+    if (arrange->getLanes().getSelection().empty())
+        return;
+
+    auto* window = new juce::AlertWindow("Duplicate", "How many copies? They go end to end after the selection.",
+                                         juce::MessageBoxIconType::NoIcon, this);
+    window->addTextEditor("count", juce::String(lastDuplicateCount), "Copies:");
+    if (auto* editor = window->getTextEditor("count"))
+    {
+        editor->setInputRestrictions(3, "0123456789");
+        editor->selectAll();
+    }
+    window->addButton("Duplicate", 1, juce::KeyPress(juce::KeyPress::returnKey));
+    window->addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey));
+
+    juce::Component::SafePointer<MainComponent> safe(this);
+    window->enterModalState(true, juce::ModalCallbackFunction::create([safe, window](int result)
+    {
+        if (safe == nullptr || result != 1)
+            return;
+        const int count = window->getTextEditorContents("count").getIntValue();
+        if (count < 1)
+            return;
+        safe->lastDuplicateCount = juce::jmin(count, 100);
+        safe->duplicateSelection(safe->lastDuplicateCount);
+    }), true);
+}
+
+void MainComponent::duplicateSelection(int times)
 {
     // A copy straight after the selection, on the same tracks. Repeating it repeats the copy.
     const auto& arr = project.getArrangement();
@@ -252,13 +341,14 @@ void MainComponent::duplicateSelection()
                 end = std::max(end, c.end());
                 top = std::min(top, t);
             }
-    pasteClips(copied, top, end, false);
+    pasteClips(copied, top, end, false, times);
 }
 
-void MainComponent::pasteClips(const std::vector<ClipboardClip>& clips, int track, juce::int64 position, bool movePlayhead)
+void MainComponent::pasteClips(const std::vector<ClipboardClip>& clips, int track, juce::int64 position, bool movePlayhead, int times)
 {
-    if (clips.empty())
+    if (clips.empty() || times < 1)
         return;
+    const auto length = Arrangement::lengthOf(clips);
 
     std::array<bool, kNumTracks> midiTracks {};
     for (int t = 0; t < kNumTracks; ++t)
@@ -269,7 +359,12 @@ void MainComponent::pasteClips(const std::vector<ClipboardClip>& clips, int trac
     std::vector<std::pair<int, juce::int64>> placed;
     if (!project.perform([&](Arrangement& a)
         {
-            const auto ids = a.pasteClips(clips, track, position, midiTracks);
+            std::vector<juce::int64> ids;
+            for (int copy = 0; copy < times; ++copy)
+            {
+                const auto pasted = a.pasteClips(clips, track, position + copy * length, midiTracks);
+                ids.insert(ids.end(), pasted.begin(), pasted.end());
+            }
             for (auto id : ids)
             {
                 int t = -1;
@@ -289,7 +384,7 @@ void MainComponent::pasteClips(const std::vector<ClipboardClip>& clips, int trac
 
     // Move the playhead past the paste, so pasting again carries on from there.
     if (movePlayhead && engine.getState() == AudioEngine::State::Stopped)
-        engine.setPosition(std::max<juce::int64>(0, position) + Arrangement::lengthOf(clips));
+        engine.setPosition(std::max<juce::int64>(0, position) + times * length);
     arrange->viewChanged();
 }
 
@@ -360,19 +455,87 @@ void MainComponent::toggleMixer()
 }
 
 //==============================================================================
+Shortcuts::Context MainComponent::shortcutContext() const
+{
+    if (focusedTextEditor() != nullptr)
+        return Context::Text;
+    if (pianoRollVisible && pianoRoll->hasKeyboardFocus(true))
+        return Context::PianoRoll;
+    if (arrange->getRuler().hasSongwritingCursor() && arrange->getRuler().hasKeyboardFocus(true))
+        return Context::Songwriting;
+    if (mixerVisible && mixer->hasKeyboardFocus(true))
+        return Context::Mixer;
+    return Context::Arrangement;
+}
+
 void MainComponent::perform(int command)
 {
-    const bool stopped = engine.getState() == AudioEngine::State::Stopped;
+    perform(command, shortcutContext());
+}
+
+void MainComponent::perform(int command, Context context)
+{
+    if (Busy::isBusy())
+        return;
+
+    if (context == Context::Text)
+        if (auto* editor = focusedTextEditor())
+        {
+            switch (command)
+            {
+                case cmdUndo: editor->undo(); return;
+                case cmdRedo: editor->redo(); return;
+                case cmdCut: editor->cutToClipboard(); return;
+                case cmdCopy: editor->copyToClipboard(); return;
+                case cmdPaste: editor->pasteFromClipboard(); return;
+                case cmdDelete: editor->deleteForwards(false); return;
+                case cmdSelectAll: editor->selectAll(); return;
+                default: break;
+            }
+        }
+
+    if (isCurrentlyBlockedByAnotherModalComponent())
+        return;
 
     switch (command)
     {
-        case cmdNew:      confirmDiscard([this] { project.newProject(); arrange->zoomToFit(); }); break;
-        case cmdOpen:     confirmDiscard([this] { openProject(); }); break;
-        case cmdSave:     saveProject(project.isUntitled()); break;
-        case cmdSaveAs:   saveProject(true); break;
-        case cmdImport:   importAudio(); break;
+        case cmdCut: case cmdCopy: case cmdPaste: case cmdDelete: case cmdSelectAll:
+        case cmdDuplicate: case cmdSplit: case cmdPrevious: case cmdNext: case cmdPreviousBar: case cmdNextBar:
+        case cmdQuantize: case cmdPitchUp: case cmdPitchDown: case cmdOctaveUp: case cmdOctaveDown:
+        case cmdCloseEditor: case cmdEditSongNote:
+            if (context == Context::PianoRoll)
+                pianoRoll->performShortcut(static_cast<Command>(command));
+            else if (context == Context::Songwriting)
+            {
+                if (command == cmdCloseEditor)
+                    grabKeyboardFocus();
+                else
+                    arrange->getRuler().performSongShortcut(static_cast<Command>(command));
+            }
+            else if (context == Context::Arrangement)
+                break;
+            menuItemsChanged();
+            return;
+        default: break;
+    }
+
+    const auto state = engine.getState();
+    const bool stopped = state == AudioEngine::State::Stopped;
+    if (state == AudioEngine::State::Recording &&
+        (command == cmdCut || command == cmdPaste || command == cmdDelete || command == cmdDuplicate || command == cmdSplit
+         || command == cmdPrevious || command == cmdNext || command == cmdPreviousBar || command == cmdNextBar))
+        return;
+
+    switch (command)
+    {
+        case cmdNew:      if (stopped) confirmDiscard([this] { project.newProject(); arrange->zoomToFit(); }); break;
+        case cmdOpen:     if (stopped) confirmDiscard([this] { openProject(); }); break;
+        case cmdSave:     if (stopped) saveProject(project.isUntitled()); break;
+        case cmdSaveAs:   if (stopped) saveProject(true); break;
+        case cmdImport:   if (stopped) importAudio(); break;
         case cmdExport:   exportMix(); break;
         case cmdAudioSettings: showAudioSettings(); break;
+        case cmdMidiSettings: showMidiSettings(); break;
         case cmdPlugins: showPluginManager(engine); break;
 
         case cmdUndo:     if (stopped) project.undo(); break;
@@ -386,6 +549,13 @@ void MainComponent::perform(int command)
         case cmdSelectAll: arrange->getLanes().selectAll(); break;
 
         case cmdPlayStop: togglePlay(); break;
+        case cmdRecall:
+        {
+            juce::String error;
+            if (!project.recall(arrange->getSelectedTrack(), error))
+                showError("Keep what I just played", error);
+            break;
+        }
         case cmdRecord:   toggleRecord(); break;
         case cmdToStart:
             if (engine.getState() == AudioEngine::State::Recording) break;
@@ -406,150 +576,146 @@ void MainComponent::perform(int command)
         case cmdZoomOut:  arrange->zoom(1.0 / 0.6); break;
         case cmdZoomFit:  arrange->zoomToFit(); break;
         case cmdMixer:    toggleMixer(); break;
+        case cmdShowShortcuts: showShortcutHelp(); break;
+        case cmdShowTuner: transport->showTuner(); break;
+        case cmdPrevious:    movePlayhead(-1, false); break;
+        case cmdNext:        movePlayhead(1, false); break;
+        case cmdPreviousBar: movePlayhead(-1, true); break;
+        case cmdNextBar:     movePlayhead(1, true); break;
         default: break;
     }
     menuItemsChanged();
 }
 
-bool MainComponent::keyPressed(const juce::KeyPress& key, juce::Component* origin)
+bool MainComponent::keyPressed(const juce::KeyPress& key, juce::Component*)
 {
-    // Let text fields have their keys.
-    if (dynamic_cast<juce::TextEditor*>(origin) != nullptr)
-        return false;
-
-    // The note editor handles Delete and Escape itself.
-    if (pianoRollVisible && pianoRoll->hasKeyboardFocus(true)
-        && (key == juce::KeyPress::deleteKey || key == juce::KeyPress::backspaceKey || key == juce::KeyPress::escapeKey))
-        return pianoRoll->keyPressed(key);
-
-    const auto mods = key.getModifiers();
-    const bool cmd = mods.isCommandDown();
-    const bool shift = mods.isShiftDown();
-    const int code = key.getKeyCode();
-    const auto ch = juce::CharacterFunctions::toLowerCase(key.getTextCharacter());
-
-    if (cmd)
+    const auto context = shortcutContext();
+    if (const auto* binding = Shortcuts::find(context, key))
     {
-        switch (ch)
-        {
-            case 'z': perform(shift ? cmdRedo : cmdUndo); return true;
-            case 'y': perform(cmdRedo); return true;
-            case 's': perform(shift ? cmdSaveAs : cmdSave); return true;
-            case 'o': perform(cmdOpen); return true;
-            case 'n': perform(cmdNew); return true;
-            case 'a': perform(cmdSelectAll); return true;
-            case 'x': perform(cmdCut); return true;
-            case 'c': perform(cmdCopy); return true;
-            case 'v': perform(cmdPaste); return true;
-            case 'd': perform(cmdDuplicate); return true;
-            case 'i': perform(cmdImport); return true;
-            case 'e': perform(cmdExport); return true;
-            case ',': perform(cmdAudioSettings); return true;
-            default: break;
-        }
-        return false;
-    }
-
-    if (code == juce::KeyPress::spaceKey)                 { perform(cmdPlayStop); return true; }
-    if (code == juce::KeyPress::returnKey || code == juce::KeyPress::homeKey) { perform(cmdToStart); return true; }
-    if (code == juce::KeyPress::deleteKey || code == juce::KeyPress::backspaceKey) { perform(cmdDelete); return true; }
-
-    if (code == juce::KeyPress::leftKey || code == juce::KeyPress::rightKey)
-    {
-        const auto grid = Grid::make(engine, arrange->getView());
-        const auto step = (juce::int64) (shift ? grid.samplesPerBar() : grid.step);
-        const auto pos = grid.snap(engine.getPosition()) + (code == juce::KeyPress::leftKey ? -step : step);
-        engine.setPosition(juce::jmax<juce::int64>(0, pos));
-        arrange->viewChanged();
+        perform(binding->command, context);
         return true;
     }
-
-    switch (ch)
-    {
-        case 'r': perform(cmdRecord); return true;
-        case 's': perform(cmdSplit); return true;
-        case 'p': perform(cmdPunch); return true;
-        case 'l': perform(cmdLoop); return true;
-        case 'i': perform(cmdPunchIn); return true;
-        case 'o': perform(cmdPunchOut); return true;
-        case 'c': perform(cmdClick); return true;
-        case 'x': perform(cmdMixer); return true;
-        case 'z': perform(cmdZoomFit); return true;
-        case '=': case '+': perform(cmdZoomIn); return true;
-        case '-': perform(cmdZoomOut); return true;
-        default: break;
-    }
     return false;
+}
+
+void MainComponent::movePlayhead(int direction, bool byBar)
+{
+    const auto grid = Grid::make(engine, arrange->getView());
+    const auto step = static_cast<juce::int64>(byBar ? grid.samplesPerBar() : grid.step);
+    const auto pos = grid.snap(engine.getPosition()) + direction * step;
+    engine.setPosition(juce::jmax<juce::int64>(0, pos));
+    arrange->viewChanged();
 }
 
 //==============================================================================
 juce::StringArray MainComponent::getMenuBarNames()
 {
-    return { "File", "Edit", "Transport", "View" };
+    return { "File", "Edit", "Transport", "View", "Help" };
 }
 
 juce::PopupMenu MainComponent::getMenuForIndex(int index, const juce::String&)
 {
-    auto item = [](int id, const juce::String& text, const juce::String& shortcut, bool enabled = true, bool ticked = false)
+    const auto context = shortcutContext();
+    auto item = [context](int id, const juce::String& text, bool enabled = true, bool ticked = false)
     {
         juce::PopupMenu::Item i(text);
         i.itemID = id;
-        i.shortcutKeyDescription = shortcut;
+        i.shortcutKeyDescription = Shortcuts::keysFor(context, id);
         i.isEnabled = enabled;
         i.isTicked = ticked;
         return i;
     };
 
+    const auto* editor = focusedTextEditor();
+    const bool editingText = editor != nullptr;
+    const bool editingNotes = context == Context::PianoRoll;
+    const bool editingSong = context == Context::Songwriting;
+    const bool editingClips = context == Context::Arrangement;
+    auto& ruler = arrange->getRuler();
+    const bool hasSelection = editingText ? !editor->getHighlightedRegion().isEmpty()
+        : editingNotes ? pianoRoll->hasSelectedNotes()
+        : editingSong ? ruler.hasSelectedSongNote()
+        : editingClips && !arrange->getLanes().getSelection().empty();
+    const bool canWriteText = editingText && !editor->isReadOnly();
+    const bool canWriteProject = !editingText && engine.getState() != AudioEngine::State::Recording;
     const bool stopped = engine.getState() == AudioEngine::State::Stopped;
     juce::PopupMenu m;
     switch (index)
     {
         case 0:
-            m.addItem(item(cmdNew, "New Project", "Cmd+N", stopped));
-            m.addItem(item(cmdOpen, "Open Project...", "Cmd+O", stopped));
+            m.addItem(item(cmdNew, "New Project", stopped));
+            m.addItem(item(cmdOpen, "Open Project...", stopped));
             m.addSeparator();
-            m.addItem(item(cmdSave, "Save", "Cmd+S", stopped));
-            m.addItem(item(cmdSaveAs, "Save As...", "Shift+Cmd+S", stopped));
+            m.addItem(item(cmdSave, "Save", stopped));
+            m.addItem(item(cmdSaveAs, "Save As...", stopped));
             m.addSeparator();
-            m.addItem(item(cmdImport, "Import Audio...", "Cmd+I", stopped));
-            m.addItem(item(cmdExport, "Export Mix...", "Cmd+E", stopped));
+            m.addItem(item(cmdImport, "Import Audio...", stopped));
+            m.addItem(item(cmdExport, "Export Audio...", stopped));
             m.addSeparator();
-            m.addItem(item(cmdAudioSettings, "Audio Settings...", "Cmd+,"));
-            m.addItem(item(cmdPlugins, "Plugins...", ""));
+            m.addItem(item(cmdAudioSettings, "Audio Settings..."));
+            m.addItem(item(cmdMidiSettings, "MIDI Settings..."));
+            m.addItem(item(cmdPlugins, "Plugins..."));
             break;
         case 1:
-            m.addItem(item(cmdUndo, "Undo", "Cmd+Z", stopped && project.canUndo()));
-            m.addItem(item(cmdRedo, "Redo", "Shift+Cmd+Z", stopped && project.canRedo()));
+        {
+            m.addItem(item(cmdUndo, "Undo", canWriteText || (stopped && !editingText && project.canUndo())));
+            m.addItem(item(cmdRedo, "Redo", canWriteText || (stopped && !editingText && project.canRedo())));
             m.addSeparator();
-            m.addItem(item(cmdCut, "Cut", "Cmd+X", !arrange->getLanes().getSelection().empty()));
-            m.addItem(item(cmdCopy, "Copy", "Cmd+C", !arrange->getLanes().getSelection().empty()));
-            m.addItem(item(cmdPaste, "Paste at Playhead", "Cmd+V", !clipboard.empty()));
-            m.addItem(item(cmdDuplicate, "Duplicate", "Cmd+D", !arrange->getLanes().getSelection().empty()));
+            m.addItem(item(cmdCut, editingNotes ? "Cut Notes" : editingSong ? "Cut Chord or Lyric" : "Cut",
+                           hasSelection && (canWriteText || canWriteProject)));
+            m.addItem(item(cmdCopy, editingNotes ? "Copy Notes" : editingSong ? "Copy Chord or Lyric" : "Copy", hasSelection));
+            const bool canPaste = editingText ? canWriteText
+                : editingNotes ? pianoRoll->canPasteNotesAtCursor()
+                : editingSong ? ruler.canPasteSongText()
+                : editingClips && !clipboard.empty();
+            m.addItem(item(cmdPaste, editingNotes ? "Paste Notes" : editingSong ? "Paste at Lane Cursor"
+                                      : editingClips ? "Paste at Playhead" : "Paste",
+                           canPaste && (canWriteText || canWriteProject)));
+            if (editingClips)
+            {
+                m.addItem(item(cmdDuplicate, "Duplicate Clips", hasSelection && canWriteProject));
+                m.addItem(item(cmdSplit, "Split Clips at Playhead", canWriteProject));
+            }
+            else if (editingNotes)
+            {
+                m.addItem(item(cmdDuplicate, "Duplicate Notes", canWriteProject && pianoRoll->canDuplicateNotes()));
+                m.addItem(item(cmdQuantize, "Quantize Notes", hasSelection && canWriteProject));
+            }
+            else if (editingSong)
+            {
+                m.addItem(item(cmdEditSongNote, "Add or Edit Chord or Lyric…", canWriteProject));
+            }
             m.addSeparator();
-            m.addItem(item(cmdSplit, "Split at Playhead", "S"));
-            m.addItem(item(cmdDelete, "Delete", "Delete", !arrange->getLanes().getSelection().empty()));
-            m.addItem(item(cmdSelectAll, "Select All", "Cmd+A"));
+            m.addItem(item(cmdDelete, editingNotes ? "Delete Notes" : editingSong ? "Delete Chord or Lyric" : "Delete",
+                           (canWriteProject && hasSelection) || canWriteText));
+            m.addItem(item(cmdSelectAll, editingNotes ? "Select All Notes" : "Select All", editingNotes || editingClips || editingText));
             break;
+        }
         case 2:
-            m.addItem(item(cmdPlayStop, stopped ? "Play" : "Stop", "Space"));
-            m.addItem(item(cmdRecord, engine.getState() == AudioEngine::State::Recording ? "Stop Recording" : "Record", "R"));
-            m.addItem(item(cmdToStart, "Go to Start", "Return"));
+            m.addItem(item(cmdPlayStop, stopped ? "Play" : "Stop"));
+            m.addItem(item(cmdRecord, engine.getState() == AudioEngine::State::Recording ? "Stop Recording" : "Record"));
+            m.addItem(item(cmdRecall, "Keep what I just played", project.canRecall(arrange->getSelectedTrack())));
+            m.addItem(item(cmdToStart, "Go to Start"));
             m.addSeparator();
-            m.addItem(item(cmdPunch, "Range: Off / Punch / Loop", "P"));
-            m.addItem(item(cmdPunchMode, "Punch In/Out", "", true, engine.getRangeMode() == AudioEngine::RangeMode::Punch));
-            m.addItem(item(cmdLoop, "Loop", "L", true, engine.getRangeMode() == AudioEngine::RangeMode::Loop));
-            m.addItem(item(cmdPunchIn, "Set Range Start at Playhead", "I"));
-            m.addItem(item(cmdPunchOut, "Set Range End at Playhead", "O"));
+            m.addItem(item(cmdPunch, "Range: Off / Punch / Loop"));
+            m.addItem(item(cmdPunchMode, "Punch In/Out", true, engine.getRangeMode() == AudioEngine::RangeMode::Punch));
+            m.addItem(item(cmdLoop, "Loop", true, engine.getRangeMode() == AudioEngine::RangeMode::Loop));
+            m.addItem(item(cmdPunchIn, "Set Range Start at Playhead"));
+            m.addItem(item(cmdPunchOut, "Set Range End at Playhead"));
             m.addSeparator();
-            m.addItem(item(cmdClick, "Metronome", "C", true, engine.metronomeOn.load()));
-            m.addItem(item(cmdCountIn, "Count-in", "", true, engine.countInOn.load()));
+            m.addItem(item(cmdClick, "Metronome", true, engine.metronomeOn.load()));
+            m.addItem(item(cmdCountIn, "Recording Count-in", true, engine.countInOn.load()));
             break;
         case 3:
-            m.addItem(item(cmdZoomIn, "Zoom In", "="));
-            m.addItem(item(cmdZoomOut, "Zoom Out", "-"));
-            m.addItem(item(cmdZoomFit, "Zoom to Fit", "Z"));
+            m.addItem(item(cmdZoomIn, "Zoom In"));
+            m.addItem(item(cmdZoomOut, "Zoom Out"));
+            m.addItem(item(cmdZoomFit, "Zoom to Fit"));
             m.addSeparator();
-            m.addItem(item(cmdMixer, "Mixer", "X", true, mixerVisible));
+            m.addItem(item(cmdMixer, "Mixer", true, mixerVisible));
+            m.addItem(item(cmdShowTuner, "Tuner"));
+            break;
+        case 4:
+            m.addItem(item(cmdShowShortcuts, "Keyboard Shortcuts…"));
             break;
         default: break;
     }
@@ -561,10 +727,24 @@ void MainComponent::menuItemSelected(int itemId, int)
     perform(itemId);
 }
 
+void MainComponent::showShortcutHelp()
+{
+    juce::DialogWindow::LaunchOptions options;
+    options.content.setOwned(new ShortcutHelp());
+    options.componentToCentreAround = this;
+    options.dialogTitle = "Keyboard Shortcuts";
+    options.dialogBackgroundColour = Theme::panel;
+    options.escapeKeyTriggersCloseButton = true;
+    options.useNativeTitleBar = true;
+    options.resizable = true;
+    if (auto* window = options.launchAsync())
+        window->setResizeLimits(490, 360, 1100, 1000);
+}
+
 //==============================================================================
 void MainComponent::confirmDiscard(std::function<void()> proceed)
 {
-    if (!project.isDirty() || project.getArrangement().isEmpty())
+    if (!project.isDirty())
     {
         proceed();
         return;
@@ -590,6 +770,8 @@ void MainComponent::confirmDiscard(std::function<void()> proceed)
 
 void MainComponent::requestQuit(std::function<void()> quit)
 {
+    if (Busy::isBusy())
+        return;
     if (engine.getState() != AudioEngine::State::Stopped)
         engine.stop();
     confirmDiscard(std::move(quit));
@@ -649,7 +831,10 @@ void MainComponent::openProject()
             return;
 
         juce::String error;
-        if (!project.load(result, error))
+        bool loaded = false;
+        Busy::runHere("Opening " + (result.isDirectory() ? result : result.getParentDirectory()).getFileName() + "...",
+                      [&] { loaded = project.load(result, error); });
+        if (!loaded)
         {
             showError("Couldn't open project", error);
             return;
@@ -684,25 +869,116 @@ void MainComponent::importAudio()
 
 void MainComponent::exportMix()
 {
-    chooser = std::make_shared<juce::FileChooser>("Export mix",
+    if (engine.getState() != AudioEngine::State::Stopped)
+        return;
+    if (project.getArrangement().getEnd() <= 0)
+    {
+        showError("Export Audio", "There's nothing to export yet.");
+        return;
+    }
+
+    using Settings = Project::ExportSettings;
+    auto* dialog = new juce::AlertWindow("Export Audio", {}, juce::MessageBoxIconType::NoIcon, this);
+    juce::StringArray formats { "WAV" };
+    if (Mp3Encoder::isAvailable())
+        formats.add("MP3");
+    dialog->addComboBox("format", formats, "Format");
+    dialog->addComboBox("quality", {}, "Bit depth / bitrate");
+
+    auto* format = dialog->getComboBoxComponent("format");
+    auto* quality = dialog->getComboBoxComponent("quality");
+    const auto updateQuality = [format, quality]
+    {
+        quality->clear(juce::dontSendNotification);
+        if (format->getSelectedId() == 2)
+        {
+            for (auto bitrate : Settings::mp3Bitrates)
+                quality->addItem(juce::String(bitrate) + " kbps", bitrate);
+            quality->setSelectedId(Settings{}.mp3BitrateKbps, juce::dontSendNotification);
+        }
+        else
+        {
+            for (auto depth : Settings::wavBitDepths)
+                quality->addItem(juce::String(depth) + (depth == 32 ? "-bit float" : "-bit PCM"), depth);
+            quality->setSelectedId(Settings{}.wavBitDepth, juce::dontSendNotification);
+        }
+    };
+    format->setSelectedId(1, juce::dontSendNotification);
+    format->onChange = updateQuality;
+    updateQuality();
+    dialog->addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey));
+    dialog->addButton("Choose Location...", 1, juce::KeyPress(juce::KeyPress::returnKey));
+    dialog->enterModalState(true, juce::ModalCallbackFunction::create(
+        [safe = juce::Component::SafePointer<MainComponent>(this), format, quality](int result)
+        {
+            if (safe == nullptr || result != 1)
+                return;
+            Settings settings;
+            if (format->getSelectedId() == 2)
+            {
+                settings.format = Settings::Format::mp3;
+                settings.mp3BitrateKbps = quality->getSelectedId();
+            }
+            else
+            {
+                settings.wavBitDepth = quality->getSelectedId();
+            }
+            safe->chooseExportFile(settings);
+        }), true);
+}
+
+void MainComponent::chooseExportFile(Project::ExportSettings settings)
+{
+    const auto extension = "." + juce::String(settings.extension());
+    chooser = std::make_shared<juce::FileChooser>("Save audio export",
                                                   juce::File::getSpecialLocation(juce::File::userDocumentsDirectory)
-                                                      .getChildFile(project.getName() + ".wav"),
-                                                  "*.wav");
+                                                      .getChildFile(project.getName() + extension),
+                                                  "*" + extension);
     chooser->launchAsync(juce::FileBrowserComponent::saveMode | juce::FileBrowserComponent::canSelectFiles
                              | juce::FileBrowserComponent::warnAboutOverwriting,
-                         [this](const juce::FileChooser& fc)
+                         [safe = juce::Component::SafePointer<MainComponent>(this), settings, extension](const juce::FileChooser& fc)
     {
-        auto file = fc.getResult();
-        if (file == juce::File())
+        const auto chosen = fc.getResult();
+        if (safe == nullptr || chosen == juce::File())
             return;
-        file = file.withFileExtension(".wav");
 
-        juce::String error;
-        if (!project.exportMix(file, error))
-            showError("Export failed", error);
+        const auto file = chosen.hasFileExtension(extension) ? chosen : chosen.withFileExtension(extension);
+        const auto render = [safe, settings, file]
+        {
+            if (safe == nullptr)
+                return;
+            juce::String error;
+            if (!safe->project.exportMix(file, settings, error))
+                safe->showError("Export failed", error);
+            else
+                file.revealToUser();
+        };
+
+        // The chooser only confirms overwriting the path it returns.
+        if (file != chosen && file.existsAsFile())
+        {
+            juce::AlertWindow::showAsync(juce::MessageBoxOptions()
+                .withIconType(juce::MessageBoxIconType::WarningIcon)
+                .withTitle("Replace existing audio file?")
+                .withMessage(file.getFileName() + " already exists in this folder.")
+                .withButton("Replace", 1).withButton("Cancel", 0).withAssociatedComponent(safe.getComponent()),
+                [render](int result) { if (result == 1) render(); });
+        }
         else
-            file.revealToUser();
+            render();
     });
+}
+
+void MainComponent::showMidiSettings()
+{
+    juce::DialogWindow::LaunchOptions options;
+    options.content.setOwned(new MidiSettingsDialog(engine));
+    options.dialogTitle = "MIDI Settings";
+    options.dialogBackgroundColour = Theme::panel;
+    options.escapeKeyTriggersCloseButton = true;
+    options.useNativeTitleBar = true;
+    options.resizable = false;
+    options.launchAsync();
 }
 
 void MainComponent::showAudioSettings()
@@ -781,10 +1057,26 @@ void MainComponent::runDebugSnapshot(const juce::StringArray& args)
                     engine.getTrack(t).automationShown = target.key;
                 }
         }
-        else if (args[i] == "--insert" && i + 2 < args.size())   // --insert <track | master> <AU id, e.g. aufx,dely,appl>
+        else if (args[i] == "--instrument" && i + 2 < args.size())   // --instrument <track> <8track instrument, e.g. eightTrackAnalogSynth>
+        {
+            const int t = args[++i].getIntValue();
+            engine.setTrackMidi(t, true);
+            engine.syncNow();
+            juce::String error;
+            if (engine.setInstrument(t, args[++i], error) == nullptr)
+                DBG("instrument failed: " + error);
+        }
+        else if (args[i] == "--insert" && i + 2 < args.size())   // --insert <track | master> <AU id, e.g. aufx,dely,appl, or an 8track effect, e.g. eightTrackFilter>
         {
             const int t = args[i + 1] == "master" ? AudioEngine::kMasterBus : args[i + 1].getIntValue();
             ++i;
+            if (args[i + 1].startsWith("eightTrack"))
+            {
+                juce::String error;
+                if (engine.addEffect(t, args[++i], error) == nullptr)
+                    DBG("insert failed: " + error);
+                continue;
+            }
             juce::OwnedArray<juce::PluginDescription> found;
             for (auto* format : engine.getTracktion().getPluginManager().pluginFormatManager.getFormats())
                 if (format->getName() == "AudioUnit")
@@ -806,14 +1098,53 @@ void MainComponent::runDebugSnapshot(const juce::StringArray& args)
         arrange->getLanes().clearSelection();
     }
 
-    const bool settings = args.contains("--settings");
-    juce::Timer::callAfterDelay(1200, [this, output, settings]
+    const bool settings = args.contains("--settings"), midiSettings = args.contains("--midi-settings");
+    juce::Timer::callAfterDelay(1200, [this, output, settings, midiSettings, args]
     {
-        std::unique_ptr<AudioSettingsDialog> dialog;
+        std::unique_ptr<juce::Component> dialog;
         if (settings)
-        {
             dialog = std::make_unique<AudioSettingsDialog>(engine);
+        else if (midiSettings)
+            dialog = std::make_unique<MidiSettingsDialog>(engine);
+        if (dialog != nullptr)
             dialog->setVisible(true);
+
+        // --plugin-window: the first plugin on track 1 (or the master), in its window.
+        juce::Component* window = nullptr;
+        if (args.contains("--plugin-window"))
+        {
+            auto inserts = engine.getInserts(0);
+            if (inserts.empty())
+                if (auto* instrument = engine.getInstrument(0))
+                    inserts.push_back(instrument);
+            if (inserts.empty())
+                inserts = engine.getInserts(AudioEngine::kMasterBus);
+            if (!inserts.empty())
+            {
+                inserts.front()->showWindowExplicitly();
+                window = inserts.front()->windowState->pluginWindow.get();
+            }
+        }
+        if (auto* doc = dynamic_cast<juce::DocumentWindow*>(window); doc != nullptr && doc->getContentComponent() != nullptr)
+        {
+            // The window swaps its "Opening..." placeholder for the editor, so find the content when the time comes.
+            juce::Timer::callAfterDelay(800, [output, safeWindow = juce::Component::SafePointer<juce::DocumentWindow>(doc)]
+            {
+                auto* safe = safeWindow != nullptr ? safeWindow->getContentComponent() : nullptr;
+                if (safe == nullptr)
+                {
+                    juce::JUCEApplication::getInstance()->quit();
+                    return;
+                }
+                // The plugin's own view is native and doesn't draw into a snapshot; the 8track parts do.
+                auto image = safe->createComponentSnapshot(safe->getLocalBounds(), true, 2.0f);
+                output.deleteFile();
+                juce::FileOutputStream stream(output);
+                juce::PNGImageFormat().writeImageToStream(image, stream);
+                stream.flush();
+                juce::JUCEApplication::getInstance()->quit();
+            });
+            return;
         }
         auto image = dialog != nullptr ? dialog->createComponentSnapshot(dialog->getLocalBounds(), true, 2.0f)
                                        : createComponentSnapshot(getLocalBounds(), true, 2.0f);
