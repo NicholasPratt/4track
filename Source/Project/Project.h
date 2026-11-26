@@ -2,8 +2,10 @@
 
 #include "../Audio/AudioEngine.h"
 #include "../Model/Arrangement.h"
+#include "../Model/DrumPattern.h"
 #include <functional>
 #include <map>
+#include <optional>
 #include <set>
 
 /**
@@ -53,6 +55,12 @@ public:
 
     /** The Tracktion MIDI clip for an Arrangement clip id, for editing its notes. */
     te::MidiClip* getMidiClip(juce::int64 clipId) const;
+
+    DrumPattern getDrumPattern(int slot) const;
+    void setDrumPattern(int slot, DrumPattern);
+    std::optional<te::TimeRange> drumPatternDropRange(int track, int slot, te::BeatPosition start) const;
+    te::MidiClip* placeDrumPattern(int track, int slot, te::BeatPosition start);
+    static juce::String drumPatternName(int slot) { return "Drum Pattern " + juce::String(slot + 1); }
 
     // Clip operations on a selection, each one undo step.
     /** True if some track has two or more of these clips, so joinClips would do something. */
@@ -141,6 +149,7 @@ public:
     static constexpr const char* kLegacyProjectFileName = "project.4track";
 
 private:
+    bool canPlaceMidiRegion(int track, te::TimeRange, bool allowEmptyAudioTrack) const;
     void setEdit(std::unique_ptr<te::Edit> newEdit, bool fresh);
     void rebuild();
     void writeToEdit(const Arrangement& target);

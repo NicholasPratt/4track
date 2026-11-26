@@ -1,4 +1,5 @@
 #include "Drive.h"
+#include <NaveCabinetIRs.h>
 
 namespace
 {
@@ -6,6 +7,25 @@ namespace
     juce::String percentText(float v) { return juce::String(juce::roundToInt(v * 100.0f)) + "%"; }
 
     using Coefs = juce::dsp::IIR::Coefficients<float>;
+
+    struct FactoryCab
+    {
+        const char* name;
+        const char* wav;
+        int size;
+    };
+
+    const FactoryCab factoryCabData[] {
+        { "Nave 1x12 Combo",        NaveCabinetIRs::modelled_1x12_combo_cone_wav,   NaveCabinetIRs::modelled_1x12_combo_cone_wavSize },
+        { "Nave 2x12 Alnico",       NaveCabinetIRs::modelled_2x12_alnico_cone_wav,  NaveCabinetIRs::modelled_2x12_alnico_cone_wavSize },
+        { "Nave 4x12 Ceramic Cone", NaveCabinetIRs::modelled_4x12_ceramic_cone_wav, NaveCabinetIRs::modelled_4x12_ceramic_cone_wavSize },
+        { "Nave 4x12 Ceramic Edge", NaveCabinetIRs::modelled_4x12_ceramic_edge_wav, NaveCabinetIRs::modelled_4x12_ceramic_edge_wavSize },
+        { "Nave 4x12 Room 1m",      NaveCabinetIRs::modelled_4x12_ceramic_room_wav, NaveCabinetIRs::modelled_4x12_ceramic_room_wavSize },
+        { "Nave 1x15 Vintage Bass", NaveCabinetIRs::modelled_1x15_vintage_wav,      NaveCabinetIRs::modelled_1x15_vintage_wavSize },
+        { "Nave 4x10 Horn Bass",    NaveCabinetIRs::modelled_4x10_horn_wav,         NaveCabinetIRs::modelled_4x10_horn_wavSize },
+        { "Nave 8x10 Cone Bass",    NaveCabinetIRs::modelled_8x10_cone_wav,         NaveCabinetIRs::modelled_8x10_cone_wavSize },
+        { "Nave 8x10 Edge Bass",    NaveCabinetIRs::modelled_8x10_edge_wav,         NaveCabinetIRs::modelled_8x10_edge_wavSize },
+    };
 
     /** One cabinet: a few filters that give its low thump, scoop, presence and top roll-off. */
     struct CabStage { enum Kind { HighPass, LowPass, Peak } kind; float hz, q, db; };
@@ -35,13 +55,21 @@ namespace
 
 const char* DriveEffect::xmlTypeName = "eightTrackDrive";
 
+juce::StringArray DriveEffect::cabNames()
+{
+    juce::StringArray names { "Off", "1x12 Open", "2x12", "4x12", "1x15 Bass", "IR File" };
+    for (const auto& factoryCab : factoryCabData)
+        names.add(factoryCab.name);
+    return names;
+}
+
 DriveEffect::DriveEffect(te::PluginCreationInfo info) : EffectPlugin(info)
 {
     model = addChoice("model", "Model", modelNames(), Overdrive, "Drive");
     drive = addKnob("drive", "Drive", { 0.0f, 48.0f, 0.1f }, 18.0f, dbText, "Drive");
     bias  = addKnob("bias", "Bias", { -1.0f, 1.0f, 0.01f }, 0.2f, [](float v) { return juce::String(v, 2); }, "Drive");
     tone  = addKnob("tone", "Tone", { 0.0f, 1.0f, 0.01f }, 0.5f, percentText, "Drive");
-    cab   = addChoice("cab", "Cabinet", cabNames(), ClosedStack, "Cabinet");
+    cab   = addChoice("cab", "Cabinet", cabNames(), ClosedStack, "Cabinet", 2);
     level = addKnob("level", "Level", { -36.0f, 12.0f, 0.1f }, -12.0f, dbText, "Output");
     mix   = addKnob("mix", "Mix", { 0.0f, 1.0f, 0.01f }, 1.0f, percentText, "Output");
     applyImpulseResponse();
@@ -93,7 +121,20 @@ void DriveEffect::initialise(const te::PluginInitialisationInfo& info)
     dry.setSize(2, latencySamples + maxBlock + 1);
     work.setSize(2, maxBlock);
     lows.setSize(2, maxBlock);
-    convolution.prepare({ info.sampleRate, (juce::uint32) maxBlock, 2 });
+    const juce::dsp::ProcessSpec spec { info.sampleRate, (juce::uint32) maxBlock, 2 };
+    convolution.prepare(spec);
+    // Prepare every factory response up front so cabinet automation can switch immediately.
+    factoryCabs.clear();
+    factoryCabs.reserve(std::size(factoryCabData));
+    for (const auto& factoryCab : factoryCabData)
+    {
+        auto engine = std::make_unique<juce::dsp::Convolution>(juce::dsp::Convolution::NonUniform { 256 }, factoryCabQueue);
+        engine->loadImpulseResponse(factoryCab.wav, (size_t) factoryCab.size,
+                                    juce::dsp::Convolution::Stereo::no, juce::dsp::Convolution::Trim::no,
+                                    0, juce::dsp::Convolution::Normalise::no);
+        engine->prepare(spec);
+        factoryCabs.push_back(std::move(engine));
+    }
     preparedRate = info.sampleRate;
     convolutionReady = true;
     cabNow = -1;
@@ -105,6 +146,8 @@ void DriveEffect::reset()
     if (oversampling != nullptr)
         oversampling->reset();
     convolution.reset();
+    if (cabNow >= FirstFactoryCab)
+        factoryCabs[(size_t) (cabNow - FirstFactoryCab)]->reset();
     dry.clear();
     for (int ch = 0; ch < 2; ++ch)
     {
@@ -122,6 +165,14 @@ void DriveEffect::updateCab(int cabType)
     if (cabType == cabNow)
         return;
     cabNow = cabType;
+    if (cabType >= FirstFactoryCab)
+    {
+        factoryCabs[(size_t) (cabType - FirstFactoryCab)]->reset();
+        return;
+    }
+    if (cabType == NoCab || cabType == ImpulseResponse)
+        return;
+
     const auto stages = cabStages(cabType);
     for (int i = 0; i < kCabStages; ++i)
     {
@@ -158,8 +209,13 @@ void DriveEffect::applyToBuffer(const te::PluginRenderContext& fc)
     const float bi = bias->getCurrentValue();
     const float out = juce::Decibels::decibelsToGain(level->getCurrentValue());
     const float wet = mix->getCurrentValue(), dryGain = 1.0f - wet;
-    const int cabType = choiceOf(*cab);
+    const int cabType = juce::jlimit((int) NoCab, (int) ImpulseResponse + (int) factoryCabs.size(), choiceOf(*cab));
     updateCab(cabType);
+    juce::dsp::Convolution* ir = nullptr;
+    if (cabType >= FirstFactoryCab)
+        ir = factoryCabs[(size_t) (cabType - FirstFactoryCab)].get();
+    else if (cabType == ImpulseResponse && convolutionReady && convolution.getCurrentIRSize() > 0)
+        ir = &convolution;
     // Tone: a 12 dB low pass from 1.2 kHz (dark) to 12 kHz (bright), after the clipping.
     const double toneHz = 1200.0 * std::pow(10.0, (double) tone->getCurrentValue());
     // Overdrive and distortion clip mostly the mids, as their pedals do; fuzz and tube take it all.
@@ -214,15 +270,11 @@ void DriveEffect::applyToBuffer(const te::PluginRenderContext& fc)
             }
         }
 
-        if (cabType == ImpulseResponse)
+        if (ir != nullptr)
         {
-            if (convolutionReady && convolution.getCurrentIRSize() > 0)
-            {
-                auto cabBlock = juce::dsp::AudioBlock<float>(work).getSubBlock(0, (size_t) n);
-                convolution.process(juce::dsp::ProcessContextReplacing<float>(cabBlock));
-            }
+            ir->process(juce::dsp::ProcessContextReplacing<float>(block));
         }
-        else if (cabType != NoCab)
+        else if (cabType > NoCab && cabType < ImpulseResponse)
         {
             for (int ch = 0; ch < 2; ++ch)
             {

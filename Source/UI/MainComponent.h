@@ -67,6 +67,8 @@ private:
     void setPunchPoint(bool in);
     void setRangeMode(AudioEngine::RangeMode);
     void toggleMixer();
+    DrumSampler* selectedDrumSampler() const;
+    void openDrumPatterns();
     void openPianoRoll(juce::int64 clipId);
     void closePianoRoll();
 

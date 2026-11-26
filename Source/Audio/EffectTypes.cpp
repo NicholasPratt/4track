@@ -1,6 +1,7 @@
 // The list of 8track's own effects and instruments. A new one is added here, once.
 #include "Effects.h"
 #include "Dynamics.h"
+#include "EqDeEsser.h"
 #include "Drive.h"
 #include "ChorusEffect.h"
 #include "ReverbEffect.h"
@@ -23,9 +24,11 @@ namespace
 std::vector<EffectPlugin::Type> EffectPlugin::getTypes()
 {
     return {
-        type<GateEffect>("Silences the track between notes"),
+        type<GateEffect>("Opens above the threshold, keyed from this track or another track or bus"),
         type<CompressorEffect>("Evens out the level, keyed from any track or bus"),
         type<LimiterEffect>("Stops peaks going over a ceiling: for the master"),
+        type<EqEffect>("Five bands of parametric EQ, over a spectrum analyser"),
+        type<DeEsserEffect>("Tames sibilance: the S and T sounds of a voice"),
         type<DriveEffect>("Overdrive, distortion, fuzz and tube, into a cabinet or an impulse response"),
         type<DelayEffect>("Echoes, free or in time with the song"),
         type<ChorusEffect>("CE-2, Juno and Dimension-style bucket-brigade chorus"),
@@ -45,6 +48,8 @@ void EffectPlugin::registerTypes(te::PluginManager& pm)
     pm.createBuiltInType<GateEffect>();
     pm.createBuiltInType<CompressorEffect>();
     pm.createBuiltInType<LimiterEffect>();
+    pm.createBuiltInType<EqEffect>();
+    pm.createBuiltInType<DeEsserEffect>();
     pm.createBuiltInType<DriveEffect>();
     pm.createBuiltInType<DelayEffect>();
     pm.createBuiltInType<ChorusEffect>();

@@ -4,9 +4,8 @@
 #include <juce_dsp/juce_dsp.h>
 
 /**
-    Overdrive, distortion, fuzz and tube drive, then a guitar or bass cabinet: one of four
-    built-in cabinets (filter models, so there are no files to license) or any impulse
-    response WAV. The clipping runs at 4x the sample rate so loud highs don't alias.
+    Overdrive, distortion, fuzz and tube drive, followed by a filter model, a Nave
+    cabinet IR or a user IR. The clipping runs at 4x the sample rate so loud highs don't alias.
 */
 class DriveEffect : public EffectPlugin
 {
@@ -33,9 +32,10 @@ public:
     void restorePluginStateFromValueTree(const juce::ValueTree&) override;
 
     enum Model { Overdrive, Distortion, Fuzz, Tube };
-    enum Cab { NoCab, OpenCombo, TwinCombo, ClosedStack, BassCab, ImpulseResponse };
+    // Cabinet values are stored in projects and automation. Append new choices.
+    enum Cab { NoCab, OpenCombo, TwinCombo, ClosedStack, BassCab, ImpulseResponse, FirstFactoryCab };
     static juce::StringArray modelNames() { return { "Overdrive", "Distortion", "Fuzz", "Tube" }; }
-    static juce::StringArray cabNames() { return { "Off", "1x12 Open", "2x12", "4x12", "1x15 Bass", "IR File" }; }
+    static juce::StringArray cabNames();
 
     /** The shaping curve of each model, at drive gain g (for tests and the curious). */
     static float shape(Model, float x, float bias);
@@ -54,6 +54,8 @@ private:
 
     std::unique_ptr<juce::dsp::Oversampling<float>> oversampling;
     juce::dsp::Convolution convolution { juce::dsp::Convolution::NonUniform { 256 } };
+    juce::dsp::ConvolutionMessageQueue factoryCabQueue;
+    std::vector<std::unique_ptr<juce::dsp::Convolution>> factoryCabs;
     juce::AudioBuffer<float> dry, work, lows;   // allocated in initialise, never on the audio thread
     int latencySamples = 0, maxBlock = 512, dryPos = 0;
     EffectSvf preHigh[2], toneLow[2][2], dcBlock[2];

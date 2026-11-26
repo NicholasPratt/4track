@@ -3,6 +3,7 @@
 #include "AudioSettingsDialog.h"
 #include "MidiSettingsDialog.h"
 #include "ShortcutHelp.h"
+#include "../Audio/DrumSampler.h"
 #include "../Audio/Mp3Encoder.h"
 
 using namespace Shortcuts;
@@ -45,7 +46,7 @@ namespace
 MainComponent::MainComponent()
 {
     Busy::setHost(this);
-    PluginWindowBehaviour::setEngine(&engine);
+    PluginWindowBehaviour::setEngine(&engine, &project);
     project.runInBackground = [](const juce::String& message, const std::function<void()>& work) { Busy::run(message, work); };
     arrange = std::make_unique<ArrangeView>(engine, project);
     transport = std::make_unique<TransportBar>(engine, project, arrange->getView());
@@ -77,6 +78,7 @@ MainComponent::MainComponent()
     transport->onZoomIn = [this] { arrange->zoom(0.6); };
     transport->onZoomOut = [this] { arrange->zoom(1.0 / 0.6); };
     transport->onToggleMixer = [this] { toggleMixer(); };
+    transport->onOpenDrumPatterns = [this] { openDrumPatterns(); };
     transport->onGridChanged = [this] { arrange->viewChanged(); };
 
     project.onChanged = [this] { projectChanged(); };
@@ -190,6 +192,7 @@ void MainComponent::timerCallback()
     }
 
     transport->tick(project.canRecall(arrange->getSelectedTrack()));
+    transport->setDrumPatternsAvailable(selectedDrumSampler() != nullptr);
     arrange->tick();
     if (pianoRollVisible && engine.getState() != AudioEngine::State::Stopped)
         pianoRoll->repaint();   // playhead
@@ -454,6 +457,17 @@ void MainComponent::toggleMixer()
     resized();
 }
 
+DrumSampler* MainComponent::selectedDrumSampler() const
+{
+    return dynamic_cast<DrumSampler*>(engine.getInstrument(arrange->getSelectedTrack()));
+}
+
+void MainComponent::openDrumPatterns()
+{
+    if (auto* sampler = selectedDrumSampler())
+        PluginWindowBehaviour::showDrumPatterns(*sampler);
+}
+
 //==============================================================================
 Shortcuts::Context MainComponent::shortcutContext() const
 {
@@ -576,6 +590,7 @@ void MainComponent::perform(int command, Context context)
         case cmdZoomOut:  arrange->zoom(1.0 / 0.6); break;
         case cmdZoomFit:  arrange->zoomToFit(); break;
         case cmdMixer:    toggleMixer(); break;
+        case cmdDrumSequencer: openDrumPatterns(); break;
         case cmdShowShortcuts: showShortcutHelp(); break;
         case cmdShowTuner: transport->showTuner(); break;
         case cmdPrevious:    movePlayhead(-1, false); break;
@@ -711,7 +726,8 @@ juce::PopupMenu MainComponent::getMenuForIndex(int index, const juce::String&)
             m.addItem(item(cmdZoomOut, "Zoom Out"));
             m.addItem(item(cmdZoomFit, "Zoom to Fit"));
             m.addSeparator();
-            m.addItem(item(cmdMixer, "Mixer", true, mixerVisible));
+            m.addItem(item(cmdMixer, "Mixer", true, mixer->isVisible()));
+            m.addItem(item(cmdDrumSequencer, "Drum Patterns", selectedDrumSampler() != nullptr));
             m.addItem(item(cmdShowTuner, "Tuner"));
             break;
         case 4:

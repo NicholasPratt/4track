@@ -13,7 +13,8 @@ namespace Shortcuts
         cmdPlayStop, cmdRecord, cmdRecall, cmdToStart, cmdPunch, cmdPunchMode, cmdLoop, cmdPunchIn, cmdPunchOut, cmdClick, cmdCountIn,
         cmdZoomIn, cmdZoomOut, cmdZoomFit, cmdMixer, cmdShowShortcuts, cmdShowTuner,
         cmdPrevious, cmdNext, cmdPreviousBar, cmdNextBar,
-        cmdQuantize, cmdPitchUp, cmdPitchDown, cmdOctaveUp, cmdOctaveDown, cmdCloseEditor, cmdEditSongNote
+        cmdQuantize, cmdPitchUp, cmdPitchDown, cmdOctaveUp, cmdOctaveDown, cmdCloseEditor, cmdEditSongNote,
+        cmdDrumSequencer
     };
 
     struct Binding

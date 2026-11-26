@@ -119,15 +119,17 @@ private:
     std::set<juce::int64> selection;
     Hit hover;
 
-    struct ChordDrop
+    struct MidiDrop
     {
         int track;
         te::TimeRange range;
-        juce::String symbol;
+        juce::String name;
+        int patternSlot = -1;
+        te::BeatPosition patternStart;
     };
-    std::optional<ChordDrop> chordDropAt(const SourceDetails&);
-    void insertDroppedChord(const ChordDrop&, bool allowConversion);
-    std::optional<ChordDrop> chordDropPreview;
+    std::optional<MidiDrop> midiDropAt(const SourceDetails&);
+    void selectDroppedClip(te::MidiClip*, int track);
+    std::optional<MidiDrop> midiDropPreview;
 
     // Drag state
     Hit dragHit;

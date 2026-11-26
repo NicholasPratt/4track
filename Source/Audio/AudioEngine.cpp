@@ -2,6 +2,7 @@
 #include "RecordingThumbnail.h"
 #include "Effects.h"
 #include "Dynamics.h"
+#include "DrumSampler.h"
 
 // The direct output sits after both sends. Fading this path leaves the sends and meters intact.
 class MainOutputGate final : public te::Plugin
@@ -692,7 +693,7 @@ void AudioEngine::setTrackRoute(int track, Route route, bool enabled)
         strip.mainGate->setOpen(enabled);
     else
         strip.sends[(size_t) route - 1]->setEnabled(enabled);
-    CompressorEffect::removeLoopingKeys(*edit);
+    KeyedEffect::removeLoopingKeys(*edit);
     undo.beginNewTransaction();
 }
 
@@ -712,7 +713,7 @@ void AudioEngine::setBus1FeedsBus2(bool toBus2)
         output.setOutputToTrack(buses[1].track);
     else
         output.setOutputToDefaultDevice(false);
-    CompressorEffect::removeLoopingKeys(*edit);
+    KeyedEffect::removeLoopingKeys(*edit);
     undo.beginNewTransaction();
 }
 
@@ -946,6 +947,8 @@ te::Plugin* AudioEngine::setInstrument(int track, const juce::String& instrument
     auto plugin = edit->getPluginCache().createNewPlugin(instrumentType, {});
     if (auto* effect = dynamic_cast<EffectPlugin*>(plugin.get()))
         effect->setTempo(bpm.load());
+    if (auto* drums = dynamic_cast<DrumSampler*>(plugin.get()))
+        drums->loadFactoryKit(DrumSampler::FactoryKit::acoustic);
     return placeInstrument(track, plugin);
 }
 

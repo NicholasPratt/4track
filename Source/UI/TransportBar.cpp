@@ -44,13 +44,16 @@ TransportBar::TransportBar(AudioEngine& e, Project& p, TimelineView& v) : engine
     punch.onClick   = [this] { if (onRangeMode) onRangeMode(); };
     snap.onClick    = [this] { view.snapOn = snap.getToggleState(); };
     mixer.onClick   = [this] { if (onToggleMixer) onToggleMixer(); };
+    drums.onClick   = [this] { if (onOpenDrumPatterns) onOpenDrumPatterns(); };
+    drums.setTooltip("Open Patterns for the selected Drum Sampler track");
+    drums.setEnabled(false);
     zoomIn.onClick  = [this] { if (onZoomIn) onZoomIn(); };
     zoomOut.onClick = [this] { if (onZoomOut) onZoomOut(); };
     zoomIn.setTooltip("Zoom in (=)");
     zoomOut.setTooltip("Zoom out (-)");
 
     for (auto* b : { (juce::Component*) &click, (juce::Component*) &countIn, (juce::Component*) &tuner, (juce::Component*) &punch,
-                     (juce::Component*) &snap, (juce::Component*) &mixer, (juce::Component*) &zoomIn,
+                     (juce::Component*) &snap, (juce::Component*) &mixer, (juce::Component*) &drums, (juce::Component*) &zoomIn,
                      (juce::Component*) &zoomOut })
         addAndMakeVisible(b);
 
@@ -200,7 +203,7 @@ void TransportBar::resized()
     }
     r.removeFromLeft(8);
 
-    displayArea = r.removeFromLeft(150);
+    displayArea = r.removeFromLeft(138);
     r.removeFromLeft(10);
 
     tempo.setBounds(r.removeFromLeft(110).reduced(0, 3));
@@ -212,10 +215,12 @@ void TransportBar::resized()
         r.removeFromLeft(4);
     }
 
-    masterMeter.setBounds(r.removeFromRight(110).withSizeKeepingCentre(110, 10));
+    masterMeter.setBounds(r.removeFromRight(96).withSizeKeepingCentre(96, 10));
     r.removeFromRight(10);
     mixer.setBounds(r.removeFromRight(60).reduced(0, 3));
     r.removeFromRight(10);
+    drums.setBounds(r.removeFromRight(64).reduced(0, 3));
+    r.removeFromRight(8);
     zoomIn.setBounds(r.removeFromRight(28).reduced(0, 3));
     r.removeFromRight(2);
     zoomOut.setBounds(r.removeFromRight(28).reduced(0, 3));

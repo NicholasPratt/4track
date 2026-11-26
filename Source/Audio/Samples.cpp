@@ -29,29 +29,41 @@ namespace
         }
         std::vector<Sample::Ptr> dead;
     };
+
+    Sample::Ptr readSample(std::unique_ptr<juce::AudioFormatReader> reader, const juce::String& name,
+                           const juce::String& label, juce::String& error, double maxSeconds)
+    {
+        if (reader == nullptr)
+        {
+            error = label + " isn't an audio file 8track can read.";
+            return nullptr;
+        }
+        if (reader->lengthInSamples > (juce::int64) (reader->sampleRate * maxSeconds))
+        {
+            error = label + " is longer than " + juce::String(juce::roundToInt(maxSeconds)) + " seconds.";
+            return nullptr;
+        }
+        juce::AudioBuffer<float> audio(juce::jlimit(1, 2, (int) reader->numChannels), (int) reader->lengthInSamples);
+        reader->read(&audio, 0, audio.getNumSamples(), 0, true, audio.getNumChannels() > 1);
+        return Sample::fromBuffer(std::move(audio), reader->sampleRate, name);
+    }
 }
 
 Sample::Ptr Sample::load(const juce::File& file, juce::String& error, double maxSeconds)
 {
     juce::AudioFormatManager formats;
     formats.registerBasicFormats();
-    std::unique_ptr<juce::AudioFormatReader> reader(formats.createReaderFor(file));
-    if (reader == nullptr)
-    {
-        error = file.getFileName() + " isn't an audio file 8track can read.";
-        return nullptr;
-    }
-    if (reader->lengthInSamples > (juce::int64) (reader->sampleRate * maxSeconds))
-    {
-        error = file.getFileName() + " is longer than " + juce::String(juce::roundToInt(maxSeconds)) + " seconds.";
-        return nullptr;
-    }
-    Ptr s = new Sample();
-    s->rate = reader->sampleRate;
-    s->name = file.getFileNameWithoutExtension();
-    s->audio.setSize(juce::jlimit(1, 2, (int) reader->numChannels), (int) reader->lengthInSamples);
-    reader->read(&s->audio, 0, (int) reader->lengthInSamples, 0, true, s->audio.getNumChannels() > 1);
-    return s;
+    return readSample(std::unique_ptr<juce::AudioFormatReader>(formats.createReaderFor(file)),
+                      file.getFileNameWithoutExtension(), file.getFileName(), error, maxSeconds);
+}
+
+Sample::Ptr Sample::load(std::unique_ptr<juce::InputStream> stream, const juce::String& name,
+                         juce::String& error, double maxSeconds)
+{
+    juce::AudioFormatManager formats;
+    formats.registerBasicFormats();
+    return readSample(std::unique_ptr<juce::AudioFormatReader>(formats.createReaderFor(std::move(stream))),
+                      name, name, error, maxSeconds);
 }
 
 Sample::Ptr Sample::fromBuffer(juce::AudioBuffer<float>&& b, double rate, const juce::String& name)

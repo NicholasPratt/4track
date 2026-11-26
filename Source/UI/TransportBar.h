@@ -22,9 +22,11 @@ public:
 
     std::function<void()> onRecall, onPlay, onStop, onRecord, onToStart, onRangeMode;
     std::function<void()> onZoomIn, onZoomOut, onToggleMixer, onGridChanged;
+    std::function<void()> onOpenDrumPatterns;
 
     void setMasterPeaks(float l, float r) { masterMeter.setPeaks(l, r); }
     void setMixerVisible(bool visible) { mixer.setToggleState(visible, juce::dontSendNotification); }
+    void setDrumPatternsAvailable(bool available) { drums.setEnabled(available); }
 
 private:
     AudioEngine& engine;
@@ -55,7 +57,7 @@ private:
                                                  "and recording in a loop works like a looper. Drag on the lower strip of the ruler to set the range." },
                snap    { "Snap", Theme::accent, "Snap edits to the grid (hold Cmd while dragging to bypass)" },
                mixer   { "Mixer", Theme::accent, "Show the mixer (X)" };
-    juce::TextButton zoomOut { "-" }, zoomIn { "+" };
+    juce::TextButton drums { "Drums" }, zoomOut { "-" }, zoomIn { "+" };
 
     LevelMeter masterMeter { false };
 };

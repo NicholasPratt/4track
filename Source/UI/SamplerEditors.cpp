@@ -1,4 +1,5 @@
 #include "SamplerEditors.h"
+#include "DrumSequencer.h"
 #include "Theme.h"
 #include "../Audio/AudioEngine.h"
 
@@ -47,6 +48,14 @@ public:
         setTooltip("Click to play; drop a sound here, or right-click to load one");
     }
 
+    void refresh()
+    {
+        const float activity = owner.sampler.getActivity(pad);
+        if (activity > 0.01f || lastActivity > 0.01f || owner.sampler.getPadSample(pad) != shownSample)
+            repaint();
+        lastActivity = activity;
+    }
+
     void paint(juce::Graphics& g) override
     {
         auto r = getLocalBounds().toFloat().reduced(1.0f);
@@ -60,18 +69,18 @@ public:
             g.drawRoundedRectangle(r.reduced(1.0f), 6.0f, 2.0f);
         }
         auto sample = owner.sampler.getPadSample(pad);
+        if (sample != shownSample)
+        {
+            shownSample = sample;
+            peaks = sample != nullptr ? sample->peaks(40) : std::vector<float>();
+        }
         auto text = r.reduced(8.0f, 5.0f);
         g.setColour(Theme::textDim);
         g.setFont(Theme::font(10.5f, true));
-        g.drawText(juce::String(pad + 1) + "  " + juce::MidiMessage::getMidiNoteName(DrumSampler::kFirstNote + pad, true, true, 3),
+        g.drawText(juce::String(pad + 1) + "  " + DrumSampler::noteNameForPad(pad),
                    text.removeFromTop(13.0f), juce::Justification::topLeft);
         if (sample != nullptr)
         {
-            if (sample != shownSample)
-            {
-                shownSample = sample;
-                peaks = sample->peaks(40);
-            }
             drawWave(g, text.removeFromBottom(16.0f), peaks, Theme::textDim.withAlpha(0.5f));
             g.setColour(Theme::text);
             g.setFont(Theme::font(11.5f));
@@ -138,26 +147,90 @@ private:
     DrumSamplerEditor& owner;
     const int pad;
     bool dragging = false;
+    float lastActivity = 0.0f;
     std::unique_ptr<juce::FileChooser> chooser;
     Sample::Ptr shownSample;
     std::vector<float> peaks;
 };
 
-DrumSamplerEditor::DrumSamplerEditor(DrumSampler& s)
+DrumSamplerEditor::DrumSamplerEditor(DrumSampler& s, AudioEngine* engine, Project* project)
     : sampler(s), kitControls(s, [](const juce::String& row) { return row == "Kit"; })
 {
+    kitChooser.setTooltip("Load a factory kit or clear all pad sounds. Kit changes can be undone.");
+    kitChooser.onClick = [this] { showKitMenu(); };
+    addAndMakeVisible(kitChooser);
     for (int i = 0; i < DrumSampler::kPads; ++i)
         addAndMakeVisible(padButtons.add(new PadButton(*this, i)));
     addAndMakeVisible(kitControls);
-    hint.setText("Drop sounds on the pads. MIDI notes C1 to D#2 play them.", juce::dontSendNotification);
+    hint.setText("Drop sounds on the pads. MIDI notes " + DrumSampler::noteNameForPad(0) + " to "
+                 + DrumSampler::noteNameForPad(DrumSampler::kPads - 1) + " play them.", juce::dontSendNotification);
     hint.setFont(Theme::font(11.0f));
     hint.setColour(juce::Label::textColourId, Theme::textDim);
     addAndMakeVisible(hint);
+    if (engine != nullptr && project != nullptr)
+    {
+        patterns = std::make_unique<DrumSequencer>(*engine, *project, sampler);
+        patterns->setComponentID("drum-patterns");
+        addChildComponent(*patterns);
+        for (auto* tab : { &padsTab, &patternsTab })
+        {
+            tab->setColour(juce::TextButton::buttonOnColourId, Theme::accent);
+            tab->setColour(juce::TextButton::textColourOnId, Theme::bg);
+            addAndMakeVisible(*tab);
+        }
+        padsTab.setToggleState(true, juce::dontSendNotification);
+        padsTab.onClick = [this] { showPatterns(false); };
+        patternsTab.onClick = [this] { showPatterns(true); };
+        stopPreview.setTooltip("Stop the pattern preview while editing pads.");
+        stopPreview.onClick = [this]
+        {
+            patterns->stopPreview();
+            stopPreview.setVisible(false);
+        };
+        addChildComponent(stopPreview);
+    }
     select(0);
+    timerCallback();
     startTimerHz(30);
 }
 
 DrumSamplerEditor::~DrumSamplerEditor() { stopTimer(); }
+
+void DrumSamplerEditor::showPatterns(bool visible)
+{
+    if (patterns == nullptr || patternsVisible == visible)
+        return;
+    patternsVisible = visible;
+    padsTab.setToggleState(!visible, juce::dontSendNotification);
+    patternsTab.setToggleState(visible, juce::dontSendNotification);
+    for (auto* pad : padButtons)
+        pad->setVisible(!visible);
+    for (auto* component : { static_cast<juce::Component*>(&kitChooser), static_cast<juce::Component*>(&hint),
+                             static_cast<juce::Component*>(&kitControls), static_cast<juce::Component*>(padControls.get()) })
+        component->setVisible(!visible);
+    patterns->setVisible(visible);
+    if (visible)
+        patterns->refresh();
+    stopPreview.setVisible(!visible && patterns->isPreviewing());
+    layout();
+}
+
+void DrumSamplerEditor::showKitMenu()
+{
+    using Kit = DrumSampler::FactoryKit;
+    juce::PopupMenu menu;
+    for (auto kit : { Kit::acoustic, Kit::electronic, Kit::empty })
+        menu.addItem(static_cast<int>(kit) + 1, DrumSampler::kitName(kit), true, sampler.getFactoryKit() == kit);
+    menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&kitChooser),
+                       [safe = SafePointer<DrumSamplerEditor>(this)](int result)
+    {
+        if (safe != nullptr && result > 0)
+        {
+            safe->sampler.loadFactoryKit(static_cast<Kit>(result - 1));
+            safe->timerCallback();
+        }
+    });
+}
 
 void DrumSamplerEditor::load(int pad, const juce::File& file)
 {
@@ -180,8 +253,14 @@ void DrumSamplerEditor::select(int pad)
 
 void DrumSamplerEditor::layout()
 {
-    const int width = juce::jmax(padControls->naturalWidth(), kitControls.naturalWidth(), 560);
-    const int height = kMargin + 4 * kPadHeight + 3 * kGridGap + 8 + 18 + 8 + padControls->heightForWidth(width)
+    if (patternsVisible)
+    {
+        setSize(1040, kMargin + 34 + DrumSequencer::kHeight);
+        return;
+    }
+    const int width = juce::jmax(padControls->naturalWidth(), kitControls.naturalWidth(),
+                                (7 + DrumSampler::kSendCount) * EffectControls::kCellWidth);
+    const int height = kMargin + 34 + 4 * kPadHeight + 3 * kGridGap + 8 + 18 + 8 + padControls->heightForWidth(width)
                        + kitControls.heightForWidth(width) + kMargin;
     if (getWidth() != width + 2 * kMargin || getHeight() != height)
         setSize(width + 2 * kMargin, height);
@@ -193,6 +272,22 @@ void DrumSamplerEditor::resized()
 {
     auto r = getLocalBounds().reduced(kMargin, 0);
     r.removeFromTop(kMargin);
+    auto toolbar = r.removeFromTop(26);
+    if (patterns != nullptr)
+    {
+        patternsTab.setBounds(toolbar.removeFromRight(96));
+        toolbar.removeFromRight(4);
+        padsTab.setBounds(toolbar.removeFromRight(72));
+    }
+    kitChooser.setBounds(toolbar.removeFromLeft(160));
+    toolbar.removeFromLeft(8);
+    stopPreview.setBounds(toolbar.removeFromLeft(104));
+    r.removeFromTop(8);
+    if (patternsVisible)
+    {
+        patterns->setBounds(r);
+        return;
+    }
     auto grid = r.removeFromTop(4 * kPadHeight + 3 * kGridGap);
     const int padWidth = (grid.getWidth() - 3 * kGridGap) / 4;
     for (int i = 0; i < DrumSampler::kPads; ++i)
@@ -215,9 +310,12 @@ void DrumSamplerEditor::paint(juce::Graphics& g) { g.fillAll(Theme::panel); }
 
 void DrumSamplerEditor::timerCallback()
 {
-    for (int i = 0; i < DrumSampler::kPads; ++i)
-        if (sampler.getActivity(i) > 0.01f)
-            padButtons[i]->repaint();
+    const auto kit = sampler.getFactoryKit();
+    kitChooser.setButtonText(kit == DrumSampler::FactoryKit::empty ? juce::String("Load Kit...")
+                                                                  : "Kit: " + juce::String(DrumSampler::kitName(kit)));
+    stopPreview.setVisible(!patternsVisible && patterns != nullptr && patterns->isPreviewing());
+    for (auto* pad : padButtons)
+        pad->refresh();
 }
 
 //==============================================================================
@@ -413,10 +511,10 @@ void KeySamplerEditor::timerCallback()
 }
 
 //==============================================================================
-std::unique_ptr<te::Plugin::EditorComponent> createSamplerEditor(EffectPlugin& e, AudioEngine* engine)
+std::unique_ptr<te::Plugin::EditorComponent> createSamplerEditor(EffectPlugin& e, AudioEngine* engine, Project* project)
 {
     if (auto* drums = dynamic_cast<DrumSampler*>(&e))
-        return std::make_unique<DrumSamplerEditor>(*drums);
+        return std::make_unique<DrumSamplerEditor>(*drums, engine, project);
     if (auto* keys = dynamic_cast<KeySampler*>(&e))
         return std::make_unique<KeySamplerEditor>(*keys, engine);
     return nullptr;

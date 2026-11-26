@@ -7,7 +7,7 @@
     kick ducking a bass. Tracktion routes the key track's output (after its fader) into
     two extra inputs; without a key, the compressor listens to what it compresses.
 */
-class CompressorEffect : public EffectPlugin
+class CompressorEffect : public KeyedEffect
 {
 public:
     explicit CompressorEffect(te::PluginCreationInfo);
@@ -20,26 +20,13 @@ public:
     juce::String getSelectableDescription() override { return getPluginName(); }
     BusLayout getBusses() const override { return BusLayout::singleStereoInOut(); }
     int getNumOutputChannelsGivenInputs(int numInputs) override { return juce::jmin(numInputs, 2); }
-    void getChannelNames(juce::StringArray* ins, juce::StringArray* outs) override;
 
     void initialise(const te::PluginInitialisationInfo&) override;
     void deinitialise() override {}
     void reset() override;
     void applyToBuffer(const te::PluginRenderContext&) override;
     Display getDisplay() const override { return { "Reduction", reductionNow.load(std::memory_order_relaxed) / 24.0f }; }
-    std::vector<Selector> getSelectors() override;
     bool isControlActive(const te::AutomatableParameter&) const override;
-
-    /** Tracks that can key this compressor without feeding back into it. Message thread. */
-    std::vector<te::AudioTrack*> getKeySources();
-    te::AudioTrack* getKeySource();
-    /** nullptr: listen to the input. As one undo step. */
-    void setKeySource(te::AudioTrack*);
-    /** True if audio from `from` reaches `to` through sends and buses. */
-    static bool feeds(te::Track& from, te::Track& to);
-    /** Disconnects keys that a routing change has turned into a loop. Call inside the
-        routing change's undo transaction. */
-    static void removeLoopingKeys(te::Edit&);
 
     te::AutomatableParameter *threshold, *ratio, *knee, *attack, *release, *makeup, *mix;
     te::AutomatableParameter *detect, *keyFilter, *listen;

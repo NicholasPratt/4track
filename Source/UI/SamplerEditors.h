@@ -6,12 +6,14 @@
 #include <juce_audio_utils/juce_audio_utils.h>
 
 class AudioEngine;
+class Project;
+class DrumSequencer;
 
 /** The Drum Sampler's window: a 4x4 grid of pads above the chosen pad's controls. */
 class DrumSamplerEditor : public te::Plugin::EditorComponent, private juce::Timer
 {
 public:
-    explicit DrumSamplerEditor(DrumSampler&);
+    DrumSamplerEditor(DrumSampler&, AudioEngine*, Project*);
     ~DrumSamplerEditor() override;
 
     bool allowWindowResizing() override { return false; }
@@ -21,9 +23,11 @@ public:
 
     void select(int pad);
     void load(int pad, const juce::File&);
+    void showPatterns(bool);
 
 private:
     class PadButton;
+    void showKitMenu();
     void timerCallback() override;
     void layout();
 
@@ -31,6 +35,11 @@ private:
     juce::OwnedArray<PadButton> padButtons;
     std::unique_ptr<EffectControls> padControls;
     EffectControls kitControls;
+    juce::TextButton kitChooser { "Load Kit..." };
+    juce::TextButton padsTab { "Pads" }, patternsTab { "Patterns" };
+    juce::TextButton stopPreview { "Stop Preview" };
+    std::unique_ptr<DrumSequencer> patterns;
+    bool patternsVisible = false;
     juce::Label hint;
     int selected = 0;
     static constexpr int kPadHeight = 62, kGridGap = 8;
@@ -82,4 +91,4 @@ private:
 };
 
 /** Gives the samplers their own windows (EffectEditor::install calls this). */
-std::unique_ptr<te::Plugin::EditorComponent> createSamplerEditor(EffectPlugin&, AudioEngine*);
+std::unique_ptr<te::Plugin::EditorComponent> createSamplerEditor(EffectPlugin&, AudioEngine*, Project*);

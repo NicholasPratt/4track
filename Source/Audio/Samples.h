@@ -19,6 +19,8 @@ struct Sample : juce::ReferenceCountedObject
 
     /** Reads an audio file (up to maxSeconds long). */
     static Ptr load(const juce::File&, juce::String& error, double maxSeconds = 120.0);
+    static Ptr load(std::unique_ptr<juce::InputStream>, const juce::String& name,
+                    juce::String& error, double maxSeconds = 120.0);
     static Ptr fromBuffer(juce::AudioBuffer<float>&&, double rate, const juce::String& name);
 
     /** A sample between samples (cubic), 0 outside the sample. */

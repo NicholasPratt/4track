@@ -1,4 +1,5 @@
 #include "TrackLanes.h"
+#include "DrumSequencer.h"
 #include "Ruler.h"
 
 TrackLanes::TrackLanes(AudioEngine& e, Project& p, TimelineView& v) : engine(e), project(p), view(v)
@@ -133,22 +134,22 @@ void TrackLanes::paint(juce::Graphics& g)
         if (auto* param = automationFor(t))
             paintAutomation(g, t, *param);
 
-    if (chordDropPreview)
+    if (midiDropPreview)
     {
         Clip shape;
-        shape.start = engine.toSamples(chordDropPreview->range.getStart());
-        shape.length = engine.toSamples(chordDropPreview->range.getEnd()) - shape.start;
-        const auto bounds = clipRect(shape, chordDropPreview->track);
+        shape.start = engine.toSamples(midiDropPreview->range.getStart());
+        shape.length = engine.toSamples(midiDropPreview->range.getEnd()) - shape.start;
+        const auto bounds = clipRect(shape, midiDropPreview->track);
         g.setColour(Theme::accent.withAlpha(0.3f));
         g.fillRoundedRectangle(bounds, 4);
         g.setColour(Theme::accent);
         g.drawRoundedRectangle(bounds, 4, 1);
         g.setColour(Theme::text);
         g.setFont(Theme::font(13, true));
-        g.drawText(chordDropPreview->symbol, bounds.reduced(6, 2), juce::Justification::centredLeft, true);
+        g.drawText(midiDropPreview->name, bounds.reduced(6, 2), juce::Justification::centredLeft, true);
     }
 
-    if (arr.isEmpty() && !chordDropPreview && engine.getState() != AudioEngine::State::Recording)
+    if (arr.isEmpty() && !midiDropPreview && engine.getState() != AudioEngine::State::Recording)
     {
         g.setColour(Theme::textDim);
         g.setFont(Theme::font(14.0f));
@@ -312,14 +313,18 @@ void TrackLanes::paintNotes(juce::Graphics& g, const Clip& c, juce::Rectangle<fl
     hi = juce::jmax(hi, mid + 6);
     const float rowH = area.getHeight() / (float) (hi - lo + 1);
 
-    // Positions come from the Edit's clip; the arrangement clip may be mid-drag elsewhere.
-    const auto teStart = mc->getPosition().getStart();
+    // Notes come from the Edit's clip; the arrangement clip may be mid-drag elsewhere. Place
+    // them from where the content starts (start - offset), not the clip's left edge, so
+    // trimming the start uncovers or hides notes instead of sliding them along with it.
+    const auto pos = mc->getPosition();
+    const auto teContentStart = pos.getStart() - pos.getOffset();
+    const auto contentStart = c.start - c.sourceOffset;
     g.setColour(colour);
     for (auto* n : notes)
     {
         const auto range = n->getEditTimeRange(*mc);
-        const auto from = c.start + engine.toSamples(range.getStart() - teStart);
-        const auto to = c.start + engine.toSamples(range.getEnd() - teStart);
+        const auto from = contentStart + engine.toSamples(range.getStart() - teContentStart);
+        const auto to = contentStart + engine.toSamples(range.getEnd() - teContentStart);
         if (to <= c.start || from >= c.end())
             continue;
         const float x0 = view.xFor(juce::jmax(from, c.start));
@@ -1047,29 +1052,46 @@ void TrackLanes::showAutomationMenu(int track, te::AutomatableParameter& param)
 
 bool TrackLanes::isInterestedInDragSource(const SourceDetails& source)
 {
+    if (DrumSequencer::draggedSlot(source))
+        return true;
     const auto* payload = source.description.getArray();
     return dynamic_cast<Ruler*>(source.sourceComponent.get()) != nullptr
         && payload != nullptr && payload->size() == 2 && (*payload)[0].isString() && (*payload)[1].isDouble();
 }
 
-std::optional<TrackLanes::ChordDrop> TrackLanes::chordDropAt(const SourceDetails& source)
+std::optional<TrackLanes::MidiDrop> TrackLanes::midiDropAt(const SourceDetails& source)
 {
     if (!isInterestedInDragSource(source) || !getLocalBounds().contains(source.localPosition)
         || source.localPosition.y + scrollY >= getContentHeight())
         return {};
 
+    const auto mods = juce::ModifierKeys::getCurrentModifiers();
+    const auto position = view.sampleAt(static_cast<float>(source.localPosition.x));
+    const auto& tempo = project.getEdit().tempoSequence;
+    const int track = trackAtY(static_cast<float>(source.localPosition.y));
+
+    if (const auto slot = DrumSequencer::draggedSlot(source))
+    {
+        double beat = tempo.toBeats(engine.toTime(juce::jmax<juce::int64>(0, position))).inBeats();
+        if (view.snapOn && !mods.isCommandDown())
+        {
+            const double step = project.getDrumPattern(*slot).stepBeats();   // on the pattern's own grid
+            beat = std::round(beat / step) * step;
+        }
+        const auto start = te::BeatPosition::fromBeats(beat);
+        if (const auto range = project.drumPatternDropRange(track, *slot, start))
+            return MidiDrop { track, *range, Project::drumPatternName(*slot), *slot, start };
+        return {};
+    }
+
     const auto& payload = *source.description.getArray();
     const auto originalBeat = te::BeatPosition::fromBeats(static_cast<double>(payload[1]));
-    const auto mods = juce::ModifierKeys::getCurrentModifiers();
-    const auto position = juce::jmax<juce::int64>(0, snapped(view.sampleAt(static_cast<float>(source.localPosition.x)), mods));
-    const auto& tempo = project.getEdit().tempoSequence;
-    const auto start = engine.toTime(position);
+    const auto start = engine.toTime(juce::jmax<juce::int64>(0, snapped(position, mods)));
     const auto end = tempo.toTime(tempo.toBeats(start) + project.chordDuration(originalBeat));
-    const int track = trackAtY(static_cast<float>(source.localPosition.y));
     const te::TimeRange range(start, end);
     if (!project.canPlaceChord(track, range))
         return {};
-    return ChordDrop { track, range, payload[0].toString() };
+    return MidiDrop { track, range, payload[0].toString(), -1, {} };
 }
 
 void TrackLanes::itemDragEnter(const SourceDetails& source)
@@ -1079,27 +1101,32 @@ void TrackLanes::itemDragEnter(const SourceDetails& source)
 
 void TrackLanes::itemDragMove(const SourceDetails& source)
 {
-    chordDropPreview = chordDropAt(source);
+    midiDropPreview = midiDropAt(source);
     repaint();
 }
 
 void TrackLanes::itemDragExit(const SourceDetails&)
 {
-    chordDropPreview.reset();
+    midiDropPreview.reset();
     repaint();
 }
 
 void TrackLanes::itemDropped(const SourceDetails& source)
 {
-    chordDropPreview.reset();
+    midiDropPreview.reset();
     repaint();
-    const auto drop = chordDropAt(source);
+    const auto drop = midiDropAt(source);
     if (!drop)
         return;
 
-    if (engine.getTrack(drop->track).midi.load())
+    if (drop->patternSlot >= 0)
     {
-        insertDroppedChord(*drop, false);
+        selectDroppedClip(project.placeDrumPattern(drop->track, drop->patternSlot, drop->patternStart), drop->track);
+        return;
+    }
+    if (engine.isTrackMidi(drop->track))
+    {
+        selectDroppedClip(project.placeChord(drop->track, drop->range, drop->name, false), drop->track);
         return;
     }
 
@@ -1107,23 +1134,23 @@ void TrackLanes::itemDropped(const SourceDetails& source)
     const auto options = juce::MessageBoxOptions()
         .withIconType(juce::MessageBoxIconType::QuestionIcon)
         .withTitle("Convert to a MIDI track?")
-        .withMessage("Convert " + engine.getTrack(drop->track).name + " to MIDI and place " + drop->symbol + " there.")
+        .withMessage("Convert " + engine.getTrack(drop->track).name + " to MIDI and place " + drop->name + " there.")
         .withButton("Convert and place", 1)
         .withButton("Cancel", 0)
         .withAssociatedComponent(this);
     juce::AlertWindow::showAsync(options, [safe = juce::Component::SafePointer<TrackLanes>(this), drop, editState](int result)
     {
         if (safe && result == 1 && safe->project.getEdit().state == editState)
-            safe->insertDroppedChord(*drop, true);
+            safe->selectDroppedClip(safe->project.placeChord(drop->track, drop->range, drop->name, true), drop->track);
     });
 }
 
-void TrackLanes::insertDroppedChord(const ChordDrop& drop, bool allowConversion)
+void TrackLanes::selectDroppedClip(te::MidiClip* clip, int track)
 {
-    if (auto* clip = project.placeChord(drop.track, drop.range, drop.symbol, allowConversion))
+    if (clip != nullptr)
     {
         selection = { static_cast<juce::int64>(clip->itemID.getRawID()) };
-        if (onTrackClicked) onTrackClicked(drop.track);
+        if (onTrackClicked) onTrackClicked(track);
         repaint();
     }
 }

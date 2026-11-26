@@ -49,6 +49,20 @@ file(GLOB_RECURSE APP_SOURCES CONFIGURE_DEPENDS
     ${CMAKE_CURRENT_SOURCE_DIR}/Source/*.h)
 target_sources(8Track PRIVATE ${APP_SOURCES})
 
+file(GLOB NAVE_CABINET_IRS CONFIGURE_DEPENDS
+    ${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/nave-cabinet-irs/modelled_*.wav)
+juce_add_binary_data(NaveCabinetIRs
+    HEADER_NAME NaveCabinetIRs.h
+    NAMESPACE NaveCabinetIRs
+    SOURCES ${NAVE_CABINET_IRS})
+
+file(GLOB FACTORY_DRUM_SAMPLES CONFIGURE_DEPENDS
+    ${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/factory-drum-kits/*.flac)
+juce_add_binary_data(FactoryDrumSamples
+    HEADER_NAME FactoryDrumSamples.h
+    NAMESPACE FactoryDrumSamples
+    SOURCES ${FACTORY_DRUM_SAMPLES})
+
 # Settings shared by the app and the tests (both build Tracktion Engine).
 function(configure_8track_target target)
     target_compile_definitions(${target} PRIVATE
@@ -61,6 +75,8 @@ function(configure_8track_target target)
 
     target_link_libraries(${target}
         PRIVATE
+            NaveCabinetIRs
+            FactoryDrumSamples
             tracktion::tracktion_core
             tracktion::tracktion_engine
             tracktion::tracktion_graph
@@ -118,6 +134,7 @@ target_sources(8TrackTests PRIVATE
     Source/Audio/Effects.cpp
     Source/Audio/EffectTypes.cpp
     Source/Audio/Dynamics.cpp
+    Source/Audio/EqDeEsser.cpp
     Source/Audio/Drive.cpp
     Source/Audio/ChorusEffect.cpp
     Source/Audio/ReverbEffect.cpp
@@ -132,9 +149,14 @@ target_sources(8TrackTests PRIVATE
     Source/Audio/TunerCapture.cpp
     Source/Audio/Mp3Encoder.cpp
     Source/Project/Project.cpp
+    Source/UI/DrumSequencer.cpp
+    Source/UI/EffectEditor.cpp
+    Source/UI/EqEditor.cpp
     Source/UI/PianoRoll.cpp
     Source/UI/Ruler.cpp
-    Source/UI/ShortcutHelp.cpp)
+    Source/UI/SamplerEditors.cpp
+    Source/UI/ShortcutHelp.cpp
+    Source/UI/TrackLanes.cpp)
 
 configure_8track_target(8TrackTests)
 target_compile_definitions(8TrackTests PRIVATE JUCE_UNIT_TESTS=1)

@@ -1,6 +1,8 @@
 #include "Project.h"
+#include "../Audio/DrumSampler.h"
 #include "../Audio/Effects.h"
 #include "../Audio/Mp3Encoder.h"
+#include <cstdint>
 #include <filesystem>
 #include <map>
 #include <set>
@@ -22,6 +24,50 @@ namespace
     const juce::Identifier songBeatID { "songBeat" };
     const juce::Identifier songTextID { "songText" };
     const juce::Identifier lyricDraftID { "lyricDraft" };
+    const juce::Identifier drumPatternsID { "eightTrackDrumPatterns" };
+    const juce::Identifier drumPatternID { "drumPattern" };
+    const juce::Identifier drumSlotID { "slot" };
+    const juce::Identifier drumStepsID { "steps" };
+    const juce::Identifier drumStepsPerBarID { "stepsPerBar" };   // missing: 16, as before there was a choice
+
+    juce::Identifier drumRowID(int pad) { return "pad" + juce::String(pad + 1); }
+    juce::Identifier drumDetailID(int pad) { return "pad" + juce::String(pad + 1) + "Hits"; }
+
+    // Hit types and rolls, for the steps that have any: "4:1 12:9" (step:code). Patterns
+    // from before hit types have none, and load as plain hits.
+    juce::String writeDrumDetail(const DrumPattern::Detail& detail, const DrumPattern::Row& row)
+    {
+        juce::StringArray parts;
+        for (int step = 0; step < DrumPattern::kMaxSteps; ++step)
+            if (row[static_cast<size_t>(step)] && detail[static_cast<size_t>(step)] != 0)
+                parts.add(juce::String(step) + ":" + juce::String(static_cast<int>(detail[static_cast<size_t>(step)])));
+        return parts.joinIntoString(" ");
+    }
+
+    DrumPattern::Detail readDrumDetail(const juce::var& value, const DrumPattern::Row& row)
+    {
+        DrumPattern::Detail detail {};
+        for (const auto& part : juce::StringArray::fromTokens(value.toString(), " ", ""))
+        {
+            const int step = part.upToFirstOccurrenceOf(":", false, false).getIntValue();
+            const int code = part.fromFirstOccurrenceOf(":", false, false).getIntValue();
+            if (juce::isPositiveAndBelow(step, DrumPattern::kMaxSteps) && row[static_cast<size_t>(step)])
+                detail[static_cast<size_t>(step)] = DrumPattern::pack(DrumPattern::unpack(static_cast<std::uint8_t>(code & 0xff), true));
+        }
+        return detail;
+    }
+
+    DrumPattern::Row readDrumRow(const juce::var& value)
+    {
+        const auto text = value.toString();
+        if (!text.startsWithChar('b'))
+            return DrumPattern::Row(static_cast<std::uint32_t>(static_cast<int>(value))); // old integer mask
+        DrumPattern::Row row;
+        const int count = juce::jmin(DrumPattern::kMaxSteps, text.length() - 1);
+        for (int step = 0; step < count; ++step)
+            row.set(static_cast<size_t>(step), text[text.length() - 1 - step] == '1');
+        return row;
+    }
 
     juce::Identifier songEntryID(Project::SongEntry kind)
     {
@@ -338,6 +384,122 @@ te::MidiClip* Project::createMidiClip(int track, juce::int64 start, juce::int64 
         if (c.midi && std::abs(c.start - juce::jmax<juce::int64>(0, start)) <= 1)
             return getMidiClip(c.id);
     return nullptr;
+}
+
+DrumPattern Project::getDrumPattern(int slot) const
+{
+    DrumPattern pattern;
+    if (!juce::isPositiveAndBelow(slot, DrumPattern::kSlots))
+        return pattern;
+
+    const auto entry = edit->state.getChildWithName(drumPatternsID).getChildWithProperty(drumSlotID, slot);
+    if (entry.isValid())
+    {
+        pattern.steps = juce::jlimit(DrumPattern::kMinSteps, DrumPattern::kMaxSteps,
+                                    static_cast<int>(entry.getProperty(drumStepsID, DrumPattern::kMinSteps)));
+        if (const int perBar = entry.getProperty(drumStepsPerBarID, DrumPattern::kDefaultStepsPerBar); DrumPattern::isStepsPerBar(perBar))
+            pattern.stepsPerBar = perBar;
+        for (int pad = 0; pad < DrumPattern::kPads; ++pad)
+        {
+            const auto row = static_cast<size_t>(pad);
+            pattern.rows[row] = readDrumRow(entry[drumRowID(pad)]);
+            pattern.detail[row] = readDrumDetail(entry[drumDetailID(pad)], pattern.rows[row]);
+        }
+    }
+    return pattern;
+}
+
+void Project::setDrumPattern(int slot, DrumPattern pattern)
+{
+    if (!juce::isPositiveAndBelow(slot, DrumPattern::kSlots) || engine.getState() == AudioEngine::State::Recording)
+        return;
+
+    pattern.steps = juce::jlimit(DrumPattern::kMinSteps, DrumPattern::kMaxSteps, pattern.steps);
+    if (!DrumPattern::isStepsPerBar(pattern.stepsPerBar))
+        pattern.stepsPerBar = DrumPattern::kDefaultStepsPerBar;
+    const auto previous = getDrumPattern(slot);
+    if (pattern == previous)
+        return;
+
+    auto& undo = edit->getUndoManager();
+    undo.beginNewTransaction("Edit " + drumPatternName(slot));
+    auto root = edit->state.getOrCreateChildWithName(drumPatternsID, &undo);
+    auto entry = root.getChildWithProperty(drumSlotID, slot);
+    if (!entry.isValid())
+    {
+        entry = juce::ValueTree(drumPatternID);
+        entry.setProperty(drumSlotID, slot, nullptr);
+        root.appendChild(entry, &undo);
+    }
+    if (pattern.steps != previous.steps)
+        entry.setProperty(drumStepsID, pattern.steps, &undo);
+    if (pattern.stepsPerBar != previous.stepsPerBar)
+        entry.setProperty(drumStepsPerBarID, pattern.stepsPerBar, &undo);
+    for (int pad = 0; pad < DrumPattern::kPads; ++pad)
+    {
+        const auto row = static_cast<size_t>(pad);
+        if (pattern.rows[row] == previous.rows[row] && pattern.detail[row] == previous.detail[row])
+            continue;
+        if (pattern.rows[row].none())
+            entry.removeProperty(drumRowID(pad), &undo);
+        else
+        {
+            const auto bits = pattern.rows[row].to_string();
+            entry.setProperty(drumRowID(pad), "b" + juce::String(bits.substr(bits.find('1'))), &undo);
+        }
+        const auto detail = writeDrumDetail(pattern.detail[row], pattern.rows[row]);
+        if (detail.isEmpty())
+            entry.removeProperty(drumDetailID(pad), &undo);
+        else
+            entry.setProperty(drumDetailID(pad), detail, &undo);
+    }
+    undo.beginNewTransaction();
+}
+
+std::optional<te::TimeRange> Project::drumPatternDropRange(int track, int slot, te::BeatPosition start) const
+{
+    if (start < te::BeatPosition())
+        return {};
+
+    const auto pattern = getDrumPattern(slot);
+    if (!pattern.hasHits())
+        return {};
+
+    const auto end = start + te::BeatDuration::fromBeats(pattern.lengthBeats());
+    const auto& tempo = edit->tempoSequence;
+    const te::TimeRange range(tempo.toTime(start), tempo.toTime(end));
+    if (!canPlaceMidiRegion(track, range, false))
+        return {};
+    return range;
+}
+
+te::MidiClip* Project::placeDrumPattern(int track, int slot, te::BeatPosition start)
+{
+    const auto range = drumPatternDropRange(track, slot, start);
+    if (!range)
+        return nullptr;
+
+    static_assert(DrumPattern::kPads == DrumSampler::kPads);
+    const auto pattern = getDrumPattern(slot);
+    const auto name = drumPatternName(slot);
+    auto& undo = edit->getUndoManager();
+    undo.beginNewTransaction("Place " + name);
+    auto clip = engine.getAudioTrack(track)->insertMIDIClip(name, *range, nullptr);
+    if (clip != nullptr)
+    {
+        for (int step = 0; step < pattern.steps; ++step)
+            for (int pad = 0; pad < DrumPattern::kPads; ++pad)
+                pattern.forEachNote(pad, step, [&](double offset, double length, int velocity)
+                {
+                    clip->getSequence().addNote(DrumSampler::kFirstNote + pad,
+                                                te::BeatPosition::fromBeats((step + offset) * pattern.stepBeats()),
+                                                te::BeatDuration::fromBeats(length * pattern.stepBeats()),
+                                                velocity, 0, &undo);
+                });
+        rebuild();
+    }
+    undo.beginNewTransaction();
+    return clip.get();
 }
 
 te::MidiClip* Project::getMidiClip(juce::int64 clipId) const
@@ -949,13 +1111,18 @@ te::BeatDuration Project::chordDuration(te::BeatPosition source) const
 
 bool Project::canPlaceChord(int track, te::TimeRange range) const
 {
+    return canPlaceMidiRegion(track, range, true);
+}
+
+bool Project::canPlaceMidiRegion(int track, te::TimeRange range, bool allowEmptyAudioTrack) const
+{
     if (!juce::isPositiveAndBelow(track, kNumTracks) || range.isEmpty()
         || range.getStart() < te::TimePosition() || engine.getState() == AudioEngine::State::Recording)
         return false;
 
     auto* lane = engine.getAudioTrack(track);
     if (!engine.getTrack(track).midi.load())
-        return lane->getClips().isEmpty();
+        return allowEmptyAudioTrack && lane->getClips().isEmpty();
 
     for (auto* clip : lane->getClips())
         if (clip->getPosition().time.overlaps(range))

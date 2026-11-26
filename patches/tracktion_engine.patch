@@ -334,10 +334,93 @@ index 48805df96cc..0806f6b70cb 100644
  }
  
 diff --git a/modules/tracktion_engine/playback/graph/tracktion_EditNodeBuilder.cpp b/modules/tracktion_engine/playback/graph/tracktion_EditNodeBuilder.cpp
-index e46f6c79169..31bc39f3792 100644
+index e46f6c79169..782179ce31f 100644
 --- a/modules/tracktion_engine/playback/graph/tracktion_EditNodeBuilder.cpp
 +++ b/modules/tracktion_engine/playback/graph/tracktion_EditNodeBuilder.cpp
-@@ -1989,6 +1989,65 @@ std::unique_ptr<tracktion::graph::Node> createMasterFadeInOutNode (Edit& edit,
+@@ -1297,6 +1297,40 @@ std::unique_ptr<tracktion::graph::Node> createSidechainInputNodeForPlugin (Plugi
+     return sumNode;
+ }
+
++/** Borrows a plugin node owned by the main branch and emits only the aux audio. */
++class PluginAuxOutputNode final : public Node
++{
++public:
++    PluginAuxOutputNode (Node& source, int first, int size)
++        : input (source), firstChannel (first), numChannels (size) {}
++
++    NodeProperties getNodeProperties() override
++    {
++        auto props = input.getNodeProperties();
++        props.hasAudio = true;
++        props.hasMidi = false;
++        props.numberOfChannels = numChannels;
++        hash_combine (props.nodeID, static_cast<size_t> (0x6175786f7574));
++        hash_combine (props.nodeID, firstChannel);
++        return props;
++    }
++
++    std::vector<Node*> getDirectInputNodes() override { return { &input }; }
++    bool isReadyToProcess() override { return input.hasProcessed(); }
++
++    void process (ProcessContext& pc) override
++    {
++        const auto audio = input.getProcessedOutput().audio;
++        if (firstChannel + numChannels <= static_cast<int> (audio.getNumChannels()))
++            copy (pc.buffers.audio, audio.getChannelRange ({ static_cast<choc::buffer::ChannelCount> (firstChannel),
++                                                            static_cast<choc::buffer::ChannelCount> (firstChannel + numChannels) }));
++    }
++
++private:
++    Node& input;
++    const int firstChannel, numChannels;
++};
++
+ std::unique_ptr<tracktion::graph::Node> createNodeForPlugin (Plugin& plugin, const TrackMuteState* trackMuteState, std::unique_ptr<Node> node,
+                                                              const CreateNodeParams& params)
+ {
+@@ -1360,6 +1394,41 @@ std::unique_ptr<tracktion::graph::Node> createNodeForPlugin (Plugin& plugin, con
+                                                               params.forRendering, params.includeBypassedPlugins,
+                                                               maxNumChannels);
+
++    if (busses.outputs.size() > 1)
++    {
++        const int mainChannels = busses.outputs.front().getNumChannels();
++        int firstChannel = mainChannels;
++        bool routesAux = false;
++        std::vector<std::unique_ptr<Node>> branches;
++        for (size_t i = 1; i < busses.outputs.size(); ++i)
++        {
++            const int channels = busses.outputs[i].getNumChannels();
++            if (const auto route = plugin.getAuxOutputRoute (static_cast<int> (i)))
++            {
++                routesAux = true;
++                if (route->enabled && channels > 0)
++                {
++                    auto output = makeNode<PluginAuxOutputNode> (*pluginNode, firstChannel, channels);
++                    auto send = makeNode<SendNode> (std::move (output), route->busNumber, [trackMuteState]
++                    {
++                        return trackMuteState == nullptr || trackMuteState->shouldTrackBeAudible() ? 1.0f : 0.0f;
++                    });
++                    branches.push_back (makeNode<SinkNode> (std::move (send)));
++                }
++            }
++            firstChannel += channels;
++        }
++
++        if (routesAux)
++        {
++            auto main = makeNode<ChannelRemappingNode> (std::move (pluginNode), ChannelMap::identity (mainChannels));
++            if (branches.empty())
++                return main;
++            branches.push_back (std::move (main));
++            return makeNode<SummingNode> (std::move (branches));
++        }
++    }
++
+     // If input has more channels than the plugin handles, wrap output in passthrough mode
+     // so extra channels pass through unprocessed
+     if (incomingChannels > effectivePluginChannels
+@@ -1989,6 +2058,65 @@ std::unique_ptr<tracktion::graph::Node> createMasterFadeInOutNode (Edit& edit,
  }
  
  //==============================================================================
@@ -403,7 +486,7 @@ index e46f6c79169..31bc39f3792 100644
  std::unique_ptr<tracktion::graph::Node> createNodeForEdit (EditPlaybackContext& epc, std::atomic<double>& audibleTimeToUpdate, const CreateNodeParams& params)
  {
      Edit& edit = epc.edit;
-@@ -2174,6 +2233,8 @@ std::unique_ptr<tracktion::graph::Node> createNodeForEdit (EditPlaybackContext&
+@@ -2174,6 +2302,8 @@ std::unique_ptr<tracktion::graph::Node> createNodeForEdit (EditPlaybackContext&
                                                                           ChannelMap::conversion (incomingChannels, deviceChannels));
          }
  
@@ -768,3 +851,19 @@ index 1fa9b3e318f..431613f5582 100644
      void deleteWindow();
  
      JUCE_DECLARE_WEAK_REFERENCEABLE (PluginWindowState)
+diff --git a/modules/tracktion_engine/plugins/tracktion_Plugin.h b/modules/tracktion_engine/plugins/tracktion_Plugin.h
+index 3712e3e6e85..11253984817 100644
+--- a/modules/tracktion_engine/plugins/tracktion_Plugin.h
++++ b/modules/tracktion_engine/plugins/tracktion_Plugin.h
+@@ -346,6 +346,11 @@ public:
+     */
+     virtual BusLayout getBusses() const = 0;
+
++    /** Optionally routes an output bus directly to an aux return. The main bus
++        stays in the plugin chain. A disabled route still reserves its channels. */
++    struct AuxOutputRoute { int busNumber; bool enabled = true; };
++    virtual std::optional<AuxOutputRoute> getAuxOutputRoute (int) const { return {}; }
++
+     /** Returns true if this plugin should be fed audio from upstream in the chain.
+         The default derives from the bus layout: a non-synth that declares at least
+         one audio input bus takes audio. Synths that also accept audio input (e.g.

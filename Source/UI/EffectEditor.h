@@ -4,6 +4,7 @@
 #include <juce_gui_basics/juce_gui_basics.h>
 
 class AudioEngine;
+class Project;
 
 /**
     An effect's controls, in titled rows: knobs, menus and switches for its parameters, plus
@@ -63,7 +64,7 @@ public:
 
     /** Gives every EffectPlugin its window. Call once at start-up; the engine is for the
         instruments that record from an input. */
-    static void install(AudioEngine*);
+    static void install(AudioEngine*, Project*);
 
     static constexpr int kMargin = 14, kDisplayHeight = 34;
 

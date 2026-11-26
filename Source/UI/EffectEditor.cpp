@@ -1,5 +1,6 @@
 #include "EffectEditor.h"
 #include "SamplerEditors.h"
+#include "EqEditor.h"
 #include "Theme.h"
 
 namespace
@@ -10,6 +11,7 @@ class ControlView : public EffectControls::Item
 public:
     ControlView(EffectPlugin& e, const EffectPlugin::Control& c) : effect(e), param(*c.param), kind(c.kind)
     {
+        cells = c.cells;
         using Kind = EffectPlugin::Control::Kind;
         name.setText(c.label.isNotEmpty() ? c.label : param.getParameterName(), juce::dontSendNotification);
         name.setFont(Theme::font(11.0f, true));
@@ -422,12 +424,14 @@ EffectEditor::EffectEditor(EffectPlugin& e) : effect(e), controls(e)
 
 EffectEditor::~EffectEditor() { stopTimer(); }
 
-void EffectEditor::install(AudioEngine* engine)
+void EffectEditor::install(AudioEngine* engine, Project* project)
 {
-    EffectPlugin::editorFactory = [engine](EffectPlugin& e) -> std::unique_ptr<te::Plugin::EditorComponent>
+    EffectPlugin::editorFactory = [engine, project](EffectPlugin& e) -> std::unique_ptr<te::Plugin::EditorComponent>
     {
-        if (auto custom = createSamplerEditor(e, engine))
+        if (auto custom = createSamplerEditor(e, engine, project))
             return custom;
+        if (auto* eq = dynamic_cast<EqEffect*>(&e))
+            return std::make_unique<EqEditor>(*eq);
         return std::make_unique<EffectEditor>(e);
     };
 }

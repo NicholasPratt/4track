@@ -35,6 +35,7 @@ public:
         juce::String row;            // controls are laid out in rows, in the order added
         juce::String label;          // its name in the window, if shorter than the parameter's
         std::unique_ptr<juce::CachedValue<float>> value;
+        int cells = 1;
     };
     const std::vector<Control>& getControls() const { return controls; }
 
@@ -106,7 +107,7 @@ protected:
     te::AutomatableParameter* addKnob(const juce::String& id, const juce::String& name, juce::NormalisableRange<float>,
                                       float defaultValue, std::function<juce::String(float)> text, const juce::String& row);
     te::AutomatableParameter* addChoice(const juce::String& id, const juce::String& name, const juce::StringArray& choices,
-                                        int defaultIndex, const juce::String& row);
+                                        int defaultIndex, const juce::String& row, int cells = 1);
     te::AutomatableParameter* addToggle(const juce::String& id, const juce::String& name, bool defaultOn, const juce::String& row);
 
     /** A shorter name for a control in its window (the parameter keeps its full name, for
@@ -180,8 +181,30 @@ struct EffectSvf
     float ic1 = 0, ic2 = 0;
 };
 
+/** Two main inputs plus a stereo detector fed by a track or bus. */
+class KeyedEffect : public EffectPlugin
+{
+public:
+    explicit KeyedEffect(te::PluginCreationInfo info) : EffectPlugin(info) {}
+
+    void getChannelNames(juce::StringArray* ins, juce::StringArray* outs) override;
+    std::vector<Selector> getSelectors() override;
+    std::vector<te::AudioTrack*> getKeySources();
+    te::AudioTrack* getKeySource();
+    void setKeySource(te::AudioTrack*); // nullptr selects the main input
+
+    /** Call inside the routing change's undo transaction. */
+    static void removeLoopingKeys(te::Edit&);
+
+protected:
+    bool hasExternalKey(int channels) const { return channels >= 4 && getSidechainSourceID().isValid(); }
+
+private:
+    static bool feeds(te::Track& from, te::Track& to);
+};
+
 //==============================================================================
-class GateEffect : public EffectPlugin
+class GateEffect : public KeyedEffect
 {
 public:
     explicit GateEffect(te::PluginCreationInfo);
@@ -192,8 +215,14 @@ public:
     juce::String getName() const override { return getPluginName(); }
     juce::String getPluginType() override { return xmlTypeName; }
     juce::String getSelectableDescription() override { return getPluginName(); }
-    BusLayout getBusses() const override { return BusLayout::singlePassThrough(); }
-    int getNumOutputChannelsGivenInputs(int numInputs) override { return numInputs; }
+    BusLayout getBusses() const override
+    {
+        return getSidechainSourceID().isValid() ? BusLayout::singleStereoInOut() : BusLayout::singlePassThrough();
+    }
+    int getNumOutputChannelsGivenInputs(int numInputs) override
+    {
+        return getSidechainSourceID().isValid() ? juce::jmin(2, numInputs) : numInputs;
+    }
 
     void initialise(const te::PluginInitialisationInfo&) override;
     void deinitialise() override {}

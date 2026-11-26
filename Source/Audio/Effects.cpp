@@ -86,13 +86,14 @@ te::AutomatableParameter* EffectPlugin::addKnob(const juce::String& id, const ju
 }
 
 te::AutomatableParameter* EffectPlugin::addChoice(const juce::String& id, const juce::String& name,
-                                                  const juce::StringArray& choices, int defaultIndex, const juce::String& row)
+                                                  const juce::StringArray& choices, int defaultIndex, const juce::String& row, int cells)
 {
     auto* p = addKnob(id, name, { 0.0f, (float) (choices.size() - 1), 1.0f }, (float) defaultIndex,
                       [choices](float v) { return choices[juce::jlimit(0, choices.size() - 1, juce::roundToInt(v))]; }, row);
     p->stringToValueFunction = [choices](const juce::String& s) { return (float) juce::jmax(0, choices.indexOf(s)); };
     controls.back().kind = Control::Kind::Choice;
     controls.back().choices = choices;
+    controls.back().cells = cells;
     return p;
 }
 
@@ -130,7 +131,9 @@ juce::File EffectPlugin::getFileProperty(const juce::Identifier& id) const
 
 void EffectPlugin::setFileProperty(const juce::Identifier& id, const juce::File& file)
 {
-    state.setProperty(id, file == juce::File() ? juce::String() : te::SourceFileReference::findPathFromFile(edit, file, true),
+    // An unsaved edit has no on-disk path for Tracktion to resolve relative references against.
+    const bool useRelative = edit.editFileRetriever && edit.editFileRetriever().existsAsFile();
+    state.setProperty(id, file == juce::File() ? juce::String() : te::SourceFileReference::findPathFromFile(edit, file, useRelative),
                       getUndoManager());
 }
 
@@ -249,7 +252,7 @@ float EffectSvf::process(float x, Mode mode)
 // Noise Gate
 const char* GateEffect::xmlTypeName = "eightTrackGate";
 
-GateEffect::GateEffect(te::PluginCreationInfo info) : EffectPlugin(info)
+GateEffect::GateEffect(te::PluginCreationInfo info) : KeyedEffect(info)
 {
     threshold  = addKnob("threshold", "Threshold", { -80.0f, 0.0f, 0.5f }, -40.0f, dbText, "Detect");
     hysteresis = addKnob("hysteresis", "Hysteresis", { 0.0f, 12.0f, 0.5f }, 4.0f, dbText, "Detect");
@@ -283,7 +286,10 @@ void GateEffect::applyToBuffer(const te::PluginRenderContext& fc)
     juce::ScopedNoDenormals noDenormals;
 
     auto& b = *fc.destBuffer;
-    const int channels = juce::jmin(2, b.getNumChannels());
+    const bool keyed = hasExternalKey(b.getNumChannels());
+    const int detectorStart = keyed ? 2 : 0;
+    const int detectorChannels = juce::jmin(2, b.getNumChannels());
+    const int outputChannels = keyed ? 2 : b.getNumChannels();
     const float openLevel = juce::Decibels::decibelsToGain(threshold->getCurrentValue());
     const float closeLevel = juce::Decibels::decibelsToGain(threshold->getCurrentValue() - hysteresis->getCurrentValue());
     const float floorGain = range->getCurrentValue() <= -79.9f ? 0.0f : juce::Decibels::decibelsToGain(range->getCurrentValue());
@@ -299,9 +305,9 @@ void GateEffect::applyToBuffer(const te::PluginRenderContext& fc)
     for (int i = 0; i < fc.bufferNumSamples; ++i)
     {
         float level = 0.0f;
-        for (int ch = 0; ch < channels; ++ch)
+        for (int ch = 0; ch < detectorChannels; ++ch)
         {
-            float x = b.getSample(ch, fc.bufferStartSample + i);
+            float x = b.getSample(detectorStart + ch, fc.bufferStartSample + i);
             if (filtered)
                 x = key[ch].process(x, EffectSvf::HighPass);
             level = juce::jmax(level, std::abs(x));
@@ -325,7 +331,7 @@ void GateEffect::applyToBuffer(const te::PluginRenderContext& fc)
 
         const float target = open ? 1.0f : floorGain;
         gain = target + (gain - target) * (target > gain ? attackCoef : releaseCoef);
-        for (int ch = 0; ch < b.getNumChannels(); ++ch)
+        for (int ch = 0; ch < outputChannels; ++ch)
             b.getWritePointer(ch, fc.bufferStartSample)[i] *= gain;
     }
     gainNow.store(gain, std::memory_order_relaxed);

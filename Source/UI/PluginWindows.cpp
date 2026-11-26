@@ -1,6 +1,7 @@
 #include "PluginWindows.h"
 #include "Busy.h"
 #include "EffectEditor.h"
+#include "SamplerEditors.h"
 #include "../Audio/Effects.h"
 #include "Theme.h"
 
@@ -320,6 +321,18 @@ namespace
             startTimer(50);
         }
 
+        void showDrumPatterns()
+        {
+            if (auto* content = dynamic_cast<WindowContent*>(getContentComponent()))
+                if (auto* drums = dynamic_cast<DrumSamplerEditor*>(&content->getEditor()))
+                {
+                    drums->showPatterns(true);
+                    ensureOnScreen();
+                    return;
+                }
+            showPatternsWhenReady = true;
+        }
+
     private:
         static juce::String windowTitle(te::Plugin& p)
         {
@@ -356,6 +369,9 @@ namespace
                 }
                 if (editor == nullptr && processor != nullptr && !processor->getParameters().isEmpty())
                     editor = std::make_unique<ParameterEditor>(*processor);
+                if (std::exchange(showPatternsWhenReady, false))
+                    if (auto* drums = dynamic_cast<DrumSamplerEditor*>(editor.get()))
+                        drums->showPatterns(true);
 
                 if (editor == nullptr)
                 {
@@ -423,6 +439,7 @@ namespace
 
         te::Plugin& plugin;
         bool trackBounds = false;
+        bool showPatternsWhenReady = false;
         struct Floating : juce::Timer
         {
             std::function<void()> tick;
@@ -519,8 +536,15 @@ void PluginWindowBehaviour::runTaskWithProgressBar(te::ThreadPoolJobWithProgress
               [&task] { return task.getCurrentTaskProgress(); });
 }
 
-void PluginWindowBehaviour::setEngine(AudioEngine* e)
+void PluginWindowBehaviour::setEngine(AudioEngine* e, Project* project)
 {
     midiEngine = e;
-    EffectEditor::install(e);   // 8track's own effects open in the same windows
+    EffectEditor::install(e, project);   // 8track's own effects open in the same windows
+}
+
+void PluginWindowBehaviour::showDrumPatterns(DrumSampler& sampler)
+{
+    sampler.showWindowExplicitly();
+    if (auto* window = dynamic_cast<PluginWindow*>(sampler.windowState->pluginWindow.get()))
+        window->showDrumPatterns();
 }

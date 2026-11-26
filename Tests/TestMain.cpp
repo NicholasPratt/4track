@@ -4,6 +4,9 @@
 #include "../Source/UI/LyricRows.h"
 #include "../Source/UI/LyricEditorWindow.h"
 #include "../Source/UI/Ruler.h"
+#include "../Source/UI/DrumSequencer.h"
+#include "../Source/UI/SamplerEditors.h"
+#include "../Source/UI/TrackLanes.h"
 #include "../Source/UI/ShortcutHelp.h"
 #include <juce_core/juce_core.h>
 #include "../Source/Audio/RecordingThumbnail.h"
@@ -13,6 +16,7 @@
 #include "../Source/Audio/Dynamics.h"
 #include "../Source/Audio/Drive.h"
 #include "../Source/Audio/ChorusEffect.h"
+#include "../Source/Audio/EqDeEsser.h"
 #include "../Source/Audio/ReverbEffect.h"
 #include "../Source/Audio/Arpeggiator.h"
 #include "../Source/Audio/AnalogSynth.h"
@@ -725,6 +729,77 @@ public:
         expect(!engine.hasTrackRoute(0, Route::Bus2));
         expect(engine.bus1FeedsBus2());
         expect(engine.isBusReverbEnabled());
+
+        beginTest("Drum pads send independently to the mixer buses before the track fader");
+        project.newProject();
+        engine.setTrackMidi(0, true);
+        engine.setBusReverbEnabled(false);
+        auto* drums = dynamic_cast<DrumSampler*>(engine.setInstrument(0, DrumSampler::xmlTypeName, error));
+        expect(drums != nullptr, error);
+        if (drums != nullptr)
+        {
+            for (auto* send : drums->pads[0].sends)
+            {
+                const auto& range = send->valueRange;
+                expectWithinAbsoluteError(range.convertFrom0to1(0.5f), -12.0f, 0.001f, "useful send levels are within the first half of travel");
+                expectWithinAbsoluteError(send->getCurrentValue(), -80.0f, 0.001f, "the default stays Off");
+            }
+            expect(drums->loadPad(0, source, error), error);
+            expect(drums->loadPad(1, source, error), error);
+            DrumPattern pattern;
+            pattern.rows[0].set(0);
+            pattern.rows[1].set(8);
+            project.setDrumPattern(0, pattern);
+            expect(project.placeDrumPattern(0, 0, te::BeatPosition()) != nullptr);
+            const double secondHit = project.getEdit().tempoSequence.toTime(te::BeatPosition::fromBeats(2.0)).inSeconds();
+            const auto dry = render();
+            expect(dry[0] > 0.05f && dry[1] > 0.025f);
+
+            engine.setTrackRoute(0, Route::Main, false);
+            const auto noSend = render();
+            expect(noSend[0] < 0.0001f && noSend[1] < 0.0001f, "pad sends default to Off");
+            drums->pads[0].sends[0]->setParameter(-6.0f, juce::sendNotification);
+            drums->pads[1].sends[1]->setParameter(-12.0f, juce::sendNotification);
+            engine.getTrack(0).volumeDb = -18.0f;
+
+            engine.getBus(1).volumeDb = -100.0f;
+            const auto routed1 = render();
+            const auto otherPad1 = render(secondHit + 0.2);
+            engine.getBus(1).volumeDb = 0.0f;
+            engine.getBus(0).volumeDb = -100.0f;
+            const auto routed2 = render(secondHit + 0.2);
+            const auto otherPad2 = render();
+            for (size_t ch = 0; ch < 2; ++ch)
+            {
+                expectWithinAbsoluteError(routed1[ch], dry[ch] * juce::Decibels::decibelsToGain(-6.0f), 0.004f, "Bus 1 sends pad 1");
+                expectWithinAbsoluteError(routed2[ch], dry[ch] * juce::Decibels::decibelsToGain(-12.0f), 0.004f, "Bus 2 sends pad 2");
+                expect(otherPad1[ch] < 0.0001f && otherPad2[ch] < 0.0001f, "each bus only gets its assigned pad");
+            }
+
+            if (auto* gate = dynamic_cast<GateEffect*>(engine.addEffect(0, GateEffect::xmlTypeName, error)))
+            {
+                gate->setKeySource(engine.getAudioTrack(AudioEngine::kFirstStereoBus));
+                expect(gate->getKeySource() == engine.getAudioTrack(AudioEngine::kFirstStereoBus));
+                engine.getBus(0).volumeDb = 0.0f;
+                engine.getBus(1).volumeDb = -100.0f;
+                expectWithinAbsoluteError(render()[0], routed1[0], 0.004f, "a downstream gate can use the bus as its key");
+                engine.removeInsert(*gate);
+            }
+            else
+                expect(false, error);
+
+            const auto drumProject = directory.getChildFile("Drums");
+            expect(project.saveAs(drumProject, error), error);
+            expect(project.load(drumProject, error), error);
+            auto* reopened = dynamic_cast<DrumSampler*>(engine.getInstrument(0));
+            expect(reopened != nullptr);
+            if (reopened != nullptr)
+            {
+                expectWithinAbsoluteError(reopened->pads[0].sends[0]->getCurrentValue(), -6.0f, 0.001f);
+                expectWithinAbsoluteError(reopened->pads[0].sends[1]->getCurrentValue(), -80.0f, 0.001f);
+                expectWithinAbsoluteError(reopened->pads[1].sends[1]->getCurrentValue(), -12.0f, 0.001f);
+            }
+        }
         untitledFolder.deleteRecursively();
         directory.deleteRecursively();
     }
@@ -872,7 +947,30 @@ public:
             }
             expect(project.undo());
             expectEquals((int) project.getArrangement().tracks[(size_t) t].size(), 1, "undo joins it again");
-            expect(project.redo());
+
+            beginTest("Trimming a MIDI clip's start cuts it, and leaves the notes where they were");
+            {
+                const auto whole = project.getArrangement().tracks[(size_t) t].front();
+                expect(project.perform([&](Arrangement& a) { return a.trimStart(whole.id, bar / 2); }));
+                const auto trimmed = project.getArrangement().tracks[(size_t) t].front();
+                expect(trimmed.start == bar / 2 && trimmed.end() == whole.end(), "only the start moves");
+                if (auto* c = project.getMidiClip(trimmed.id))
+                {
+                    double e4 = -1.0;
+                    for (auto* n : c->getSequence().getNotes())
+                        if (n->getNoteNumber() == 64)
+                            e4 = n->getEditStartTime(*c).inSeconds();
+                    expectWithinAbsoluteError(e4, 2.0, 0.001, "E4 still at 2 s");
+                    expectWithinAbsoluteError(c->getPosition().getStart().inSeconds(), engine.toTime(bar / 2).inSeconds(), 0.001);
+                }
+                else
+                    expect(false, "the trimmed clip is there");
+                expect(project.undo());
+            }
+            {
+                const auto again = project.getArrangement().tracks[(size_t) t].front().id;   // the trim replaced the split's redo
+                expect(project.perform([&](Arrangement& a) { return a.splitClip(again, bar); }));
+            }
 
             beginTest("A pasted MIDI clip has its own copy of the notes");
             {
@@ -1798,6 +1896,440 @@ public:
             expectEquals((int) project.getArrangement().tracks[0].size(), 2);
             expect(project.placeChord(1, following, "unsupported", true) == nullptr);
             expect(!engine.getTrack(1).midi.load());
+        }
+
+        beginTest("Drum patterns of 16 to 64 steps edit in pages, save, and place independent MIDI clips");
+        {
+            AudioEngine engine;
+            Project project(engine);
+            const auto beat = [](double value) { return te::BeatPosition::fromBeats(value); };
+            expectEquals(project.getDrumPattern(0).steps, 16);
+            expect(!project.getDrumPattern(0).hasHits());
+            expect(project.placeDrumPattern(0, 0, beat(0)) == nullptr);
+
+            auto bank = project.getEdit().state.getOrCreateChildWithName("eightTrackDrumPatterns", nullptr);
+            juce::ValueTree legacy("drumPattern");
+            legacy.setProperty("slot", 1, nullptr);
+            legacy.setProperty("steps", 24, nullptr);
+            legacy.setProperty("pad16", 1 << 23, nullptr);
+            bank.appendChild(legacy, nullptr);
+            expectEquals(project.getDrumPattern(1).steps, 24);
+            expect(project.getDrumPattern(1).hasHit(15, 23), "old integer masks still load");
+            juce::ValueTree longer("drumPattern");   // saved when patterns went up to 256 steps
+            longer.setProperty("slot", 6, nullptr);
+            longer.setProperty("steps", 128, nullptr);
+            longer.setProperty("pad1", "b1" + juce::String::repeatedString("0", 98) + "1", nullptr);   // steps 1 and 100
+            bank.appendChild(longer, nullptr);
+            expectEquals(project.getDrumPattern(6).steps, 64, "a longer pattern loads as 64 steps");
+            expect(project.getDrumPattern(6).hasHit(0, 0), "keeping the hits in them");
+            bank.removeChild(longer, nullptr);
+
+            DrumPattern pattern;
+            pattern.steps = 64;
+            pattern.rows[0].set(0).set(4);
+            pattern.rows[15].set(63);
+            project.setDrumPattern(7, pattern);
+            expect(project.getDrumPattern(7) == pattern);
+            expect(!project.getDrumPattern(0).hasHits());
+            expect(project.undo());
+            expect(!project.getDrumPattern(7).hasHits());
+            expect(project.redo());
+            expect(project.getDrumPattern(7) == pattern);
+            expect(project.placeDrumPattern(0, 7, beat(2)) == nullptr, "audio tracks reject patterns");
+
+            engine.setTrackMidi(0, true);
+            TimelineView view;
+            view.samplesPerPixel = engine.getSamplesPerBeat() / 40.0;
+            TrackLanes lanes(engine, project, view);
+            lanes.setSize(960, 2 * TrackLanes::kTrackHeight);
+            juce::String error;
+            if (auto* drums = dynamic_cast<DrumSampler*>(engine.setInstrument(0, DrumSampler::xmlTypeName, error)))
+            {
+                DrumSamplerEditor editor(*drums, &engine, &project);
+                editor.showPatterns(true);
+                auto* panel = dynamic_cast<DrumSequencer*>(editor.findChildWithID("drum-patterns"));
+                expect(panel != nullptr && panel->isVisible());
+                if (panel != nullptr)
+                {
+                    juce::TextButton* slot = nullptr;
+                    for (auto* child : panel->getChildren())
+                        if (child->getTitle() == Project::drumPatternName(7))
+                            slot = dynamic_cast<juce::TextButton*>(child);
+                    expect(slot != nullptr);
+                    if (slot != nullptr)
+                    {
+                        slot->onClick();
+                        auto* length = dynamic_cast<juce::Slider*>(panel->findChildWithID("pattern-length"));
+                        auto* pages = dynamic_cast<juce::ComboBox*>(panel->findChildWithID("pattern-page"));
+                        expect(length != nullptr && pages != nullptr);
+                        if (length != nullptr && pages != nullptr)
+                        {
+                            expectWithinAbsoluteError(length->getValue(), 64.0, 1.0e-6);
+                            length->setValue(63.0, juce::sendNotificationSync);
+                            expectEquals(project.getDrumPattern(7).steps, 63);
+                            expectEquals(pages->getItemText(3), juce::String("Steps 49-63"));
+                            length->setValue(24.4, juce::sendNotificationSync);
+                            expectEquals(project.getDrumPattern(7).steps, 24, "whole steps only");
+                            length->setValue(200.0, juce::sendNotificationSync);
+                            expectEquals(project.getDrumPattern(7).steps, 64, "64 steps at most");
+                            length->setValue(1.0, juce::sendNotificationSync);
+                            expectEquals(project.getDrumPattern(7).steps, 16, "16 at least");
+                            if (auto* division = dynamic_cast<juce::ComboBox*>(panel->findChildWithID("pattern-division")))
+                            {
+                                expectEquals(division->getSelectedId(), 16);
+                                division->setSelectedId(32, juce::sendNotificationSync);
+                                expectEquals(project.getDrumPattern(7).stepsPerBar, 32, "the menu sets steps per bar");
+                                division->setSelectedId(16, juce::sendNotificationSync);
+                            }
+                            else
+                                expect(false, "there's a steps-per-bar menu");
+                            length->setValue(64.0, juce::sendNotificationSync);
+                            pages->setSelectedId(4, juce::sendNotificationSync);
+                            expectEquals(pages->getText(), juce::String("Steps 49-64"));
+                            const auto lastCell = juce::Point<float>(static_cast<float>(panel->getWidth() - 20),
+                                                                      static_cast<float>(panel->getHeight() - 20));
+                            const auto now = juce::Time::getCurrentTime();
+                            const auto click = juce::MouseEvent(juce::Desktop::getInstance().getMainMouseSource(),
+                                lastCell, juce::ModifierKeys(juce::ModifierKeys::leftButtonModifier),
+                                0, 0, 0, 0, 0, panel, panel, now, lastCell, now, 1, false);
+                            panel->mouseDown(click);
+                            expect(project.getDrumPattern(7).getStep(15, 63).hit == DrumPattern::Hit::Accent,
+                                   "the last cell edits step 64: a hit becomes an accent");
+                            panel->mouseDown(click);
+                            expect(project.getDrumPattern(7).getStep(15, 63).hit == DrumPattern::Hit::Flam, "then a flam");
+                            panel->mouseDown(click);
+                            expect(project.getDrumPattern(7).getStep(15, 63).hit == DrumPattern::Hit::Ghost, "then a ghost");
+                            panel->mouseDown(click);
+                            expect(!project.getDrumPattern(7).hasHit(15, 63), "then nothing");
+                            panel->mouseDown(click);
+                            expect(project.getDrumPattern(7) == pattern, "and a plain hit again");
+                        }
+                        const auto x = juce::roundToInt(view.xFor(engine.toSamples(project.getEdit().tempoSequence.toTime(beat(2)))));
+                        const juce::DragAndDropTarget::SourceDetails drag(7, slot, { x, TrackLanes::kTrackHeight / 2 });
+                        expect(lanes.isInterestedInDragSource(drag));
+                        lanes.itemDragEnter(drag);
+                        lanes.itemDropped(drag);
+                    }
+                }
+            }
+            else
+                expect(false, error);
+            const auto& selection = lanes.getSelection();
+            expectEquals(static_cast<int>(selection.size()), 1, "dropping a slot selects the new clip");
+            const auto clipId = selection.empty() ? juce::int64(0) : *selection.begin();
+            auto* clip = project.getMidiClip(clipId);
+            expect(clip != nullptr);
+            if (clip != nullptr)
+            {
+                expectEquals(clip->getName(), juce::String("Drum Pattern 8"));
+                const auto range = project.getEdit().tempoSequence.toBeats(clip->getPosition().time);
+                expectWithinAbsoluteError(range.getStart().inBeats(), 2.0, 1.0e-6);
+                expectWithinAbsoluteError(range.getLength().inBeats(), 16.0, 1.0e-6, "64 steps: 4 bars of 16ths");
+                const auto& notes = clip->getSequence().getNotes();
+                expectEquals(notes.size(), 3);
+                if (notes.size() == 3)
+                {
+                    expectEquals(notes[0]->getNoteNumber(), 48);
+                    expectEquals(notes[2]->getNoteNumber(), 63);
+                    expectWithinAbsoluteError(notes[1]->getStartBeat().inBeats(), 1.0, 1.0e-6);
+                    expectWithinAbsoluteError(notes[2]->getStartBeat().inBeats(), 15.75, 1.0e-6);
+                }
+            }
+            expect(project.placeDrumPattern(0, 7, beat(4)) == nullptr, "overlapping clips are rejected");
+            expect(project.placeDrumPattern(0, 7, beat(18)) != nullptr, "clips can touch");
+            expectEquals(static_cast<int>(project.getArrangement().tracks[0].size()), 2);
+            expect(project.undo());
+            expectEquals(static_cast<int>(project.getArrangement().tracks[0].size()), 1);
+
+            pattern.steps = 16;
+            project.setDrumPattern(7, pattern);
+            if (auto* original = project.getMidiClip(clipId))
+                expectEquals(original->getSequence().getNumNotes(), 3, "slot edits leave placed clips alone");
+            if (auto* shorter = project.placeDrumPattern(0, 7, beat(18)))
+                expectEquals(shorter->getSequence().getNumNotes(), 2, "only steps within the length are placed");
+            else
+                expect(false, "the shortened pattern can be placed");
+
+            auto destination = juce::File::createTempFile("8track-drum-patterns");
+            expect(project.saveAs(destination, error), error);
+            expect(project.load(destination, error), error);
+            expect(project.getDrumPattern(7) == pattern);
+            expect(project.getDrumPattern(1).hasHit(15, 23));
+            expectEquals(static_cast<int>(project.getArrangement().tracks[0].size()), 2);
+            destination.deleteRecursively();
+        }
+
+        beginTest("Drum hits: accent, flam, ghost and rolls play as notes, save, undo, and old patterns stay plain hits");
+        {
+            using Step = DrumPattern::Step;
+            using Hit = DrumPattern::Hit;
+            using Ramp = DrumPattern::Ramp;
+
+            // Clicking cycles none, hit, accent, flam, ghost, none, keeping the roll
+            Step s;
+            std::vector<Hit> seen;
+            for (int i = 0; i < 4; ++i)
+            {
+                s = DrumPattern::nextHit(s);
+                seen.push_back(s.hit);
+            }
+            expect(seen == std::vector<Hit> { Hit::Hit, Hit::Accent, Hit::Flam, Hit::Ghost } && s.on);
+            expect(!DrumPattern::nextHit(s).on, "after a ghost, none");
+            expect(DrumPattern::nextHit({ false, Hit::Hit, 3, Ramp::Fade }).roll == 3, "the roll stays");
+
+            DrumPattern pattern;
+            pattern.setStep(0, 0, { true, Hit::Accent, 0, Ramp::Even });
+            pattern.setStep(1, 4, { true, Hit::Flam, 0, Ramp::Even });
+            pattern.setStep(2, 8, { true, Hit::Ghost, 0, Ramp::Even });
+            pattern.setStep(3, 12, { true, Hit::Hit, 3, Ramp::Fade });   // 4 hits, fading
+            pattern.setStep(4, 12, { true, Hit::Hit, 5, Ramp::Swell });  // 8 hits, swelling
+            pattern.setStep(5, 2, { true, Hit::Hit, 0, Ramp::Even });
+
+            struct Note { double at, length; int velocity; };
+            auto notes = [&](int pad, int step)
+            {
+                std::vector<Note> out;
+                pattern.forEachNote(pad, step, [&](double at, double length, int v) { out.push_back({ at, length, v }); });
+                return out;
+            };
+            expect(notes(0, 0).size() == 1 && notes(0, 0)[0].velocity == 127, "an accent is full velocity");
+            expect(notes(5, 2).size() == 1 && notes(5, 2)[0].velocity == 100, "a hit is 100");
+            expect(notes(2, 8).size() == 1 && notes(2, 8)[0].velocity == DrumPattern::kGhostVelocity, "a ghost is quiet");
+            const auto flam = notes(1, 4);
+            expect(flam.size() == 2 && flam[0].at == 0.0 && flam[0].velocity < flam[1].velocity
+                       && std::abs(flam[1].at - DrumPattern::kFlamBeats / pattern.stepBeats()) < 1.0e-9, "a flam: a softer grace note, then the hit");
+            const auto fade = notes(3, 12);
+            expect(fade.size() == 4, "a roll of 4");
+            expect(fade.size() == 4 && fade[0].velocity == 100 && fade[3].velocity == 30 && fade[1].velocity > fade[2].velocity,
+                   "fading from the hit's velocity");
+            expect(fade.size() == 4 && std::abs(fade[2].at - 0.5) < 1.0e-9 && fade[3].at < 1.0, "spread evenly inside the step");
+            const auto swell = notes(4, 12);
+            expect(swell.size() == 8 && swell.front().velocity < swell.back().velocity && swell.back().velocity == 100, "a swell of 8");
+            expect(notes(6, 0).empty(), "an empty step plays nothing");
+
+            // Clearing a step forgets its type, so equal-sounding patterns compare equal
+            auto cleared = pattern;
+            cleared.setStep(0, 0, {});
+            cleared.setStep(0, 0, { true, Hit::Hit, 0, Ramp::Even });
+            auto plain = pattern;
+            plain.setStep(0, 0, {});
+            plain.rows[0].set(0);
+            expect(cleared == plain, "a re-entered hit is plain");
+
+            AudioEngine engine;
+            Project project(engine);
+            const auto beat = [](double value) { return te::BeatPosition::fromBeats(value); };
+            project.setDrumPattern(2, pattern);
+            expect(project.getDrumPattern(2) == pattern, "hit types and rolls are kept");
+            auto changed = pattern;
+            changed.setStep(3, 12, { true, Hit::Accent, 1, Ramp::Even });
+            project.setDrumPattern(2, changed);
+            expect(project.getDrumPattern(2) == changed, "changing only a roll is saved");
+            expect(project.undo());
+            expect(project.getDrumPattern(2) == pattern, "and undoes");
+
+            auto bank = project.getEdit().state.getOrCreateChildWithName("eightTrackDrumPatterns", nullptr);
+            juce::ValueTree old("drumPattern");
+            old.setProperty("slot", 3, nullptr);
+            old.setProperty("pad1", "b10001", nullptr);
+            bank.appendChild(old, nullptr);
+            expect(project.getDrumPattern(3).getStep(0, 4) == Step { true, Hit::Hit, 0, Ramp::Even }, "an older pattern's hits are plain");
+
+            engine.setTrackMidi(0, true);
+            if (auto* clip = project.placeDrumPattern(0, 2, beat(0)))
+            {
+                auto& seq = clip->getSequence();
+                expectEquals(seq.getNumNotes(), 1 + 2 + 1 + 4 + 8 + 1, "every hit, grace note and roll hit is a note");
+                auto velocitiesAt = [&](int noteNumber)
+                {
+                    std::vector<std::pair<double, int>> out;
+                    for (auto* n : seq.getNotes())
+                        if (n->getNoteNumber() == noteNumber)
+                            out.push_back({ n->getStartBeat().inBeats(), n->getVelocity() });
+                    std::sort(out.begin(), out.end());
+                    return out;
+                };
+                const auto kick = velocitiesAt(DrumSampler::kFirstNote);
+                expect(kick.size() == 1 && kick[0].second == 127);
+                const auto flamNotes = velocitiesAt(DrumSampler::kFirstNote + 1);
+                expect(flamNotes.size() == 2 && std::abs(flamNotes[0].first - 1.0) < 1.0e-9
+                           && std::abs(flamNotes[1].first - (1.0 + DrumPattern::kFlamBeats)) < 1.0e-9,
+                       "the flam lands on beat 2, the hit just after");
+                const auto roll = velocitiesAt(DrumSampler::kFirstNote + 3);
+                expect(roll.size() == 4 && std::abs(roll[1].first - (3.0 + 0.0625)) < 1.0e-9, "the roll is in sixteenths of the step");
+            }
+            else
+                expect(false, "the pattern places");
+
+            // Steps per bar: 8, 16 or 32. The length stays in steps, so the clip's length follows
+            auto eighths = pattern;
+            eighths.stepsPerBar = 8;
+            project.setDrumPattern(4, eighths);
+            expectEquals(project.getDrumPattern(4).stepsPerBar, 8, "8 steps a bar is kept");
+            if (auto* clip = project.placeDrumPattern(0, 4, beat(32)))
+            {
+                const auto range = project.getEdit().tempoSequence.toBeats(clip->getPosition().time);
+                expectWithinAbsoluteError(range.getLength().inBeats(), 8.0, 1.0e-6, "16 eighths: 2 bars");
+                double snare = -1.0;
+                for (auto* n : clip->getSequence().getNotes())
+                    if (n->getNoteNumber() == DrumSampler::kFirstNote + 2)
+                        snare = n->getStartBeat().inBeats();
+                expectWithinAbsoluteError(snare, 4.0, 1.0e-9, "step 9 of eighths is beat 5");
+                double grace = -1.0, hit = -1.0;
+                for (auto* n : clip->getSequence().getNotes())
+                    if (n->getNoteNumber() == DrumSampler::kFirstNote + 1)
+                        (grace < 0.0 ? grace : hit) = n->getStartBeat().inBeats();
+                expectWithinAbsoluteError(std::abs(hit - grace), DrumPattern::kFlamBeats, 1.0e-9, "a flam's gap doesn't grow with the step");
+            }
+            else
+                expect(false, "the eighths pattern places");
+            auto thirtySeconds = pattern;
+            thirtySeconds.stepsPerBar = 32;
+            thirtySeconds.steps = 64;
+            expectWithinAbsoluteError(thirtySeconds.lengthBeats(), 8.0, 1.0e-9, "64 thirty-seconds: 2 bars");
+            auto odd = pattern;
+            odd.stepsPerBar = 12;
+            project.setDrumPattern(5, odd);
+            expectEquals(project.getDrumPattern(5).stepsPerBar, 16, "only 8, 16 or 32");
+            expectEquals(project.getDrumPattern(3).stepsPerBar, 16, "older patterns are 16 a bar");
+
+            auto destination = juce::File::createTempFile("8track-drum-hits");
+            juce::String error;
+            expect(project.saveAs(destination, error), error);
+            expect(project.load(destination, error), error);
+            expect(project.getDrumPattern(2) == pattern, "hit types and rolls survive saving");
+            expectEquals(project.getDrumPattern(4).stepsPerBar, 8, "and so does the division");
+            destination.deleteRecursively();
+        }
+
+        beginTest("Factory drum kits load all pads and preview through the stopped transport");
+        {
+            AudioEngine engine;
+            auto& dm = engine.getTracktion().getDeviceManager();
+            auto& io = dm.getHostedAudioDeviceInterface();
+            te::HostedAudioDeviceInterface::Parameters settings;
+            settings.sampleRate = 48000;
+            settings.blockSize = 128;
+            io.initialise(settings);
+            io.prepareToPlay(settings.sampleRate, settings.blockSize);
+            dm.dispatchPendingUpdates();
+            Project project(engine);
+            engine.setTrackMidi(0, true);
+            juce::String error;
+            using Kit = DrumSampler::FactoryKit;
+            auto* drums = dynamic_cast<DrumSampler*>(engine.setInstrument(0, DrumSampler::xmlTypeName, error));
+            expect(drums != nullptr, error);
+            if (drums != nullptr)
+            {
+                auto checkKit = [&](Kit kit)
+                {
+                    expect(drums->getFactoryKit() == kit);
+                    for (int pad = 0; pad < DrumSampler::kPads; ++pad)
+                    {
+                        const auto sample = drums->getPadSample(pad);
+                        expect(sample != nullptr && sample->audio.getMagnitude(0, sample->audio.getNumSamples()) > 0.05f,
+                               "audible factory sound on pad " + juce::String(pad + 1));
+                        expect(drums->getPadFile(pad) == juce::File(), "factory sounds need no external files");
+                    }
+                };
+                checkKit(Kit::acoustic);
+                expect(drums->loadPad(0, {}, error), error);
+                expect(drums->getPadSample(0) == nullptr);
+                drums->loadFactoryKit(Kit::electronic);
+                checkKit(Kit::electronic);
+                expect(project.undo());
+                expect(drums->getFactoryKit() == Kit::acoustic && drums->getPadSample(0) == nullptr);
+                expect(project.undo());
+                checkKit(Kit::acoustic);
+                expect(project.redo() && project.redo());
+                checkKit(Kit::electronic);
+
+                engine.setTrackRoute(0, AudioEngine::Route::Main, false);
+                drums->pads[4].sends[1]->setParameter(0.0f, juce::sendNotification);
+                engine.syncNow();
+                dm.dispatchPendingUpdates();
+                project.getEdit().dispatchPendingUpdatesSynchronously();
+                DrumPattern pattern;
+                pattern.rows[4].set(0).set(4);
+                project.setDrumPattern(0, pattern);
+                {
+                    DrumSamplerEditor editor(*drums, &engine, &project);
+                    auto findButton = [](juce::Component& parent, const juce::String& text)
+                    {
+                        for (auto* child : parent.getChildren())
+                            if (auto* button = dynamic_cast<juce::TextButton*>(child); button != nullptr && button->getButtonText() == text)
+                                return button;
+                        return static_cast<juce::TextButton*>(nullptr);
+                    };
+                    if (auto* patternsTab = findButton(editor, "Patterns"))
+                        patternsTab->onClick();
+                    auto* panel = editor.findChildWithID("drum-patterns");
+                    expect(panel != nullptr && panel->isVisible(), "the sampler opens the pattern editor");
+                    auto* preview = panel != nullptr ? findButton(*panel, "Preview") : nullptr;
+                    expect(preview != nullptr && preview->isEnabled(), "the embedded pattern can be previewed");
+                    if (preview != nullptr)
+                        preview->onClick();
+                    const auto pos = engine.getPosition();
+                    juce::AudioBuffer<float> block(2, settings.blockSize);
+                    juce::MidiBuffer midi;
+                    float peak = 0.0f;
+                    bool wrapped = false;
+                    int previousStep = -1;
+                    for (int i = 0; i < 1000; ++i)
+                    {
+                        block.clear();
+                        io.processBlock(block, midi);
+                        peak = juce::jmax(peak, block.getMagnitude(0, settings.blockSize));
+                        const int currentStep = drums->getPreviewStep();
+                        wrapped |= currentStep >= 0 && currentStep < previousStep;
+                        previousStep = currentStep;
+                    }
+                    expect(peak > 0.02f, "the pad send carries the live preview to Bus 2 while stopped");
+                    expect(wrapped, "the preview loops at the pattern length");
+                    expect(engine.getPosition() == pos && engine.getState() == AudioEngine::State::Stopped,
+                           "the song stays stopped at the same position");
+                    expect(project.getArrangement().tracks[0].empty(), "preview creates no clips");
+
+                    const int stepBeforeSwitch = drums->getPreviewStep();
+                    if (auto* padsTab = findButton(editor, "Pads"))
+                        padsTab->onClick();
+                    auto* stopPreview = findButton(editor, "Stop Preview");
+                    expect(stopPreview != nullptr && stopPreview->isVisible(), "the Pads tab can stop the preview");
+                    const int blocksPerStep = static_cast<int>(std::ceil(engine.getSamplesPerBeat() * DrumPattern().stepBeats() / settings.blockSize));
+                    for (int i = 0; i < blocksPerStep; ++i)
+                    {
+                        block.clear();
+                        io.processBlock(block, midi);
+                    }
+                    const int stepAfterSwitch = drums->getPreviewStep();
+                    const int progress = (stepAfterSwitch - stepBeforeSwitch + pattern.steps) % pattern.steps;
+                    expect(stepAfterSwitch >= 0 && progress >= 1 && progress <= 2, "preview advances across the tab switch");
+
+                    if (stopPreview != nullptr)
+                        stopPreview->onClick();
+                    for (int i = 0; i < 32; ++i)
+                    {
+                        block.clear();
+                        io.processBlock(block, midi);
+                    }
+                    expectEquals(drums->getPreviewStep(), -1);
+                    expect(block.getMagnitude(0, settings.blockSize) < 1.0e-6f);
+                }
+
+                expect(drums->loadPad(0, {}, error), error);
+                const auto destination = juce::File::createTempFile("8track-factory-drums");
+                expect(project.saveAs(destination, error), error);
+                expect(project.load(destination, error), error);
+                if (auto* reopened = dynamic_cast<DrumSampler*>(engine.getInstrument(0)))
+                {
+                    expect(reopened->getFactoryKit() == Kit::electronic);
+                    expect(reopened->getPadSample(0) == nullptr, "an explicitly cleared pad stays empty");
+                    expect(reopened->getPadSample(1) != nullptr);
+                }
+                else
+                    expect(false, "the drum sampler reopened");
+                destination.deleteRecursively();
+            }
         }
 
         beginTest("Recover a played impulse on the selected armed track during playback");
@@ -2854,6 +3386,23 @@ public:
                     expect(comp->getKeySource() == bus2, "undo goes back to the previous key");
                     comp->setKeySource(nullptr);
                     expect(comp->getKeySource() == nullptr && comp->getSelectors().front().get() == 0, "back to this track");
+                    auto* gate = dynamic_cast<GateEffect*>(engine.addEffect(0, GateEffect::xmlTypeName, err));
+                    expect(gate != nullptr, err);
+                    if (gate != nullptr)
+                    {
+                        gate->setKeySource(own);
+                        expect(gate->getKeySource() == own);
+                        comp->setKeySource(engine.getAudioTrack(0));
+                        expect(comp->getKeySource() == nullptr, "a gate and compressor cannot key each other");
+
+                        gate->setKeySource(bus2);
+                        expect(gate->getKeySource() == bus2);
+                        engine.setTrackRoute(0, AudioEngine::Route::Bus2, true);
+                        expect(gate->getKeySource() == nullptr, "a new send disconnects a looping gate key");
+                        expect(project.undo());
+                        expect(gate->getKeySource() == bus2 && !engine.hasTrackRoute(0, AudioEngine::Route::Bus2));
+                        engine.removeInsert(*gate);
+                    }
                     engine.removeInsert(*comp);
                     engine.setTrackRoute(5, AudioEngine::Route::Bus1, false);
                 }
@@ -2944,6 +3493,48 @@ public:
                 render(*d.plugin, top);
                 const float rolloff = levelAt(top, 9000.0, 0.1, 0.5) - levelAt(mid, 1000.0, 0.1, 0.5);
                 expect(rolloff < -20.0f, "9 kHz vs 1 kHz: " + juce::String(rolloff, 1) + " dB");
+            }
+
+            beginTest("Drive: bundled Nave cabinets render immediately and save by choice");
+            {
+                Standalone<DriveEffect> d(fresh);
+                set(d->drive, 0.0f);
+                set(d->model, (float) DriveEffect::Tube);
+                set(d->tone, 1.0f);
+
+                auto renderCab = [&](int cabinet)
+                {
+                    set(d->cab, (float) cabinet);
+                    d.plugin->reset();
+                    juce::AudioBuffer<float> click(2, 16384);
+                    click.clear();
+                    click.setSample(0, 128, 0.1f);
+                    click.setSample(1, 128, 0.1f);
+                    render(*d.plugin, click);
+                    return click;
+                };
+
+                const auto names = DriveEffect::cabNames();
+                expectEquals(names.size() - (int) DriveEffect::FirstFactoryCab, 9);
+                const auto bypass = renderCab(DriveEffect::NoCab);
+                auto previous = bypass;
+                for (int i = DriveEffect::FirstFactoryCab; i < names.size(); ++i)
+                {
+                    auto response = renderCab(i);
+                    const int count = response.getNumSamples();
+                    expect(response.getMagnitude(0, 0, count) > 1.0e-5f, names[i] + " produces audio");
+                    response.addFrom(1, 0, bypass, 1, 0, count, -1.0f);
+                    expect(response.getMagnitude(1, 0, count) > 1.0e-5f, names[i] + " filters the right channel");
+                    const auto original = response;
+                    response.addFrom(0, 0, previous, 0, 0, count, -1.0f);
+                    expect(response.getMagnitude(0, 0, count) > 1.0e-5f, names[i] + " changes the response");
+                    previous = original;
+                }
+
+                Standalone<DriveEffect> restored(fresh);
+                restored.plugin->restorePluginStateFromValueTree(d.plugin->state.createCopy());
+                expectEquals(juce::roundToInt(restored->cab->getCurrentValue()), names.size() - 1);
+                expect(restored->getImpulseResponse() == juce::File(), "a factory cabinet needs no project audio file");
             }
 
             beginTest("Drive: an impulse response loads into the project and is the cabinet");
@@ -3060,6 +3651,116 @@ public:
                 for (int i = 0; i < b.getNumSamples(); ++i)
                     diff = juce::jmax(diff, std::abs(b.getSample(0, i) - in.getSample(0, i)));
                 expect(diff < 1.0e-6f, "Mix 0: dry");
+            }
+
+            beginTest("EQ: flat by default; a bell, a cut and Output do what the curve says; a band that's off does nothing");
+            {
+                Standalone<EqEffect> q(fresh);
+                auto levelDb = [&](double hz)
+                {
+                    q.plugin->reset();
+                    auto b = sine(hz, 1.0, 0.25f);
+                    render(*q.plugin, b);
+                    return juce::Decibels::gainToDecibels(rms(b, 0, 0.5, 1.0) / (0.25f / std::sqrt(2.0f)));
+                };
+                for (double hz : { 50.0, 1000.0, 12000.0 })
+                    expectWithinAbsoluteError(levelDb(hz), 0.0f, 0.01f, "flat at " + juce::String(hz) + " Hz");
+
+                auto& bell = q->bands[2];
+                set(bell.type, (float) EqEffect::Bell);
+                set(bell.freq, 1000.0f);
+                set(bell.gain, 6.0f);
+                set(bell.q, 1.0f);
+                expectWithinAbsoluteError(levelDb(1000.0), 6.0f, 0.1f, "+6 dB at the bell's frequency");
+                expectWithinAbsoluteError(levelDb(60.0), 0.0f, 0.2f, "nothing far below it");
+                expectWithinAbsoluteError((float) q->responseDb(1000.0), 6.0f, 0.01f, "the curve agrees");
+                expectWithinAbsoluteError(levelDb(2000.0), (float) q->responseDb(2000.0), 0.1f, "the curve agrees off-centre");
+
+                auto& cut = q->bands[0];
+                set(cut.on, 1.0f);
+                set(cut.type, (float) EqEffect::LowCut);
+                set(cut.freq, 400.0f);
+                expect(levelDb(50.0) < -30.0f, "the low cut removes 50 Hz");
+                set(cut.on, 0.0f);
+                expectWithinAbsoluteError(levelDb(50.0), 0.0f, 0.2f, "switched off, it doesn't");
+                expect(!q->isControlActive(*cut.freq) && q->isControlActive(*cut.on), "an off band's controls are dimmed, not its switch");
+                set(cut.on, 1.0f);
+                expect(!q->isControlActive(*cut.gain) && q->isControlActive(*bell.gain), "a cut has no gain");
+
+                set(cut.on, 0.0f);
+                set(bell.gain, 0.0f);
+                set(q->output, -6.0f);
+                q.plugin->reset();
+                auto b = sine(1000.0, 1.0, 0.25f);
+                render(*q.plugin, b);
+                render(*q.plugin, b);   // the ramp has settled by the second pass
+                expectWithinAbsoluteError(juce::Decibels::gainToDecibels(rms(b, 0, 0.5, 1.0) / (0.25f / std::sqrt(2.0f))), -12.0f, 0.05f,
+                                          "Output -6 dB, twice");
+
+                q->after.active = true;
+                q.plugin->reset();
+                b = sine(1000.0, 0.2, 0.25f);
+                render(*q.plugin, b);
+                std::vector<float> seen(1024);
+                q->after.read(seen.data(), (int) seen.size());
+                expectWithinAbsoluteError(seen.back(), b.getSample(0, b.getNumSamples() - 1), 1.0e-6f, "the analyser sees the output");
+            }
+
+            beginTest("De-Esser: turns down loud highs by up to Range, leaves the lows; Split keeps the lows under an S; Listen plays the highs");
+            {
+                Standalone<DeEsserEffect> d(fresh);
+                auto levelDb = [&](std::function<float(int)> signal)
+                {
+                    d.plugin->reset();
+                    juce::AudioBuffer<float> b(2, (int) kRate);
+                    for (int i = 0; i < b.getNumSamples(); ++i)
+                        b.setSample(0, i, signal(i)), b.setSample(1, i, signal(i));
+                    const auto in = b;
+                    render(*d.plugin, b);
+                    return juce::Decibels::gainToDecibels(rms(b, 0, 0.5, 1.0) / rms(in, 0, 0.5, 1.0));
+                };
+                auto tone = [](double hz, float level) { return [=](int i) { return level * (float) std::sin(juce::MathConstants<double>::twoPi * hz * i / kRate); }; };
+
+                set(d->threshold, -30.0f);
+                set(d->range, 10.0f);
+                set(d->mode, (float) DeEsserEffect::Wide);
+                expectWithinAbsoluteError(levelDb(tone(9000.0, 0.5f)), -10.0f, 0.5f, "Wide: a loud 9 kHz tone is down by Range");
+                set(d->mode, (float) DeEsserEffect::Split);
+                const float split = levelDb(tone(14000.0, 0.5f));
+                expect(split < -8.5f && split > -10.5f, "Split: a loud 14 kHz tone is down by about Range: " + juce::String(split, 1) + " dB");
+                expectWithinAbsoluteError(levelDb(tone(200.0, 0.5f)), 0.0f, 0.1f, "200 Hz: untouched");
+                expectWithinAbsoluteError(levelDb(tone(9000.0, 0.01f)), 0.0f, 0.2f, "a quiet 9 kHz tone: under the threshold");
+
+                // A loud S over a low note: Split turns down only the S; Wide turns down both
+                auto mixture = [](int i)
+                {
+                    const double t = i / kRate;
+                    return 0.4f * (float) std::sin(juce::MathConstants<double>::twoPi * 150.0 * t)
+                         + 0.4f * (float) std::sin(juce::MathConstants<double>::twoPi * 9000.0 * t);
+                };
+                auto lowsAfter = [&](int modeValue)
+                {
+                    set(d->mode, (float) modeValue);
+                    d.plugin->reset();
+                    juce::AudioBuffer<float> b(2, (int) kRate);
+                    for (int i = 0; i < b.getNumSamples(); ++i)
+                        b.setSample(0, i, mixture(i)), b.setSample(1, i, mixture(i));
+                    render(*d.plugin, b);
+                    juce::IIRFilter lp;
+                    lp.setCoefficients(juce::IIRCoefficients::makeLowPass(kRate, 1000.0));
+                    lp.processSamples(b.getWritePointer(0), b.getNumSamples());
+                    juce::IIRFilter lp2;
+                    lp2.setCoefficients(juce::IIRCoefficients::makeLowPass(kRate, 1000.0));
+                    lp2.processSamples(b.getWritePointer(0), b.getNumSamples());
+                    return juce::Decibels::gainToDecibels(rms(b, 0, 0.5, 1.0) / (0.4f / std::sqrt(2.0f)));
+                };
+                expectWithinAbsoluteError(lowsAfter(DeEsserEffect::Split), 0.0f, 0.5f, "Split: the low note stays");
+                expect(lowsAfter(DeEsserEffect::Wide) < -6.0f, "Wide: the low note dips with the S");
+
+                set(d->mode, (float) DeEsserEffect::Split);
+                set(d->listen, 1.0f);
+                expect(levelDb(tone(150.0, 0.5f)) < -20.0f, "Listen: the lows are gone");
+                expect(levelDb(tone(12000.0, 0.5f)) > -1.0f, "Listen: the highs are there");
             }
 
             beginTest("Reverb: the tail follows Decay, waits for Pre-delay, and Mix 0 is dry");
@@ -3411,7 +4112,7 @@ public:
                 return f;
             };
 
-            beginTest("Drum Sampler: pads play their sounds from C1 up, tuned, choked, copied into the project");
+            beginTest("Drum Sampler: pads play their sounds from C2 up, tuned, choked, copied into the project");
             {
                 Standalone<DrumSampler> d(fresh);
                 const auto hit = writeTone("hit.wav", 1000.0, 0.4);
@@ -3425,29 +4126,41 @@ public:
                 expectEquals((int) refs.size(), (int) DrumSampler::kPads, "every pad's file goes with Save As");
                 expect(!d->loadPad(1, dir.getChildFile("nothing.wav"), err) && err.isNotEmpty(), "a missing file says why");
 
-                auto b = playInto(*d.plugin, { { 36, 0.0, 0.05 } }, 0.5);
-                expectWithinAbsoluteError(frequency(b, 0.05, 0.35, 1000.0), 1000.0, 10.0, "C1 plays pad 1, all the way (note-off doesn't stop it)");
+                auto b = playInto(*d.plugin, { { 36, 0.0, 0.1 } }, 0.2);
+                expect(b.getMagnitude(0, b.getNumSamples()) < 1.0e-6f, "the previous C1 trigger is silent");
+                b = playInto(*d.plugin, { { 48, 0.0, 0.05 } }, 0.5);
+                expectWithinAbsoluteError(frequency(b, 0.05, 0.35, 1000.0), 1000.0, 10.0, "C2 plays pad 1, all the way (note-off doesn't stop it)");
                 expect(rms(b, 0, 0.42, 0.5) < 1.0e-4f, "then stops at the end of the sound");
-                b = playInto(*d.plugin, { { 37, 0.0, 0.1 } }, 0.2);
+                b = playInto(*d.plugin, { { 49, 0.0, 0.1 } }, 0.2);
                 expect(b.getMagnitude(0, b.getNumSamples()) < 1.0e-6f, "an empty pad is silent");
 
                 set(d->pads[0].tune, 12.0f);
-                b = playInto(*d.plugin, { { 36, 0.0, 0.1 } }, 0.3);
+                b = playInto(*d.plugin, { { 48, 0.0, 0.1 } }, 0.3);
                 expectWithinAbsoluteError(frequency(b, 0.02, 0.18, 2000.0), 2000.0, 20.0, "+12 is an octave up");
                 set(d->pads[0].tune, 0.0f);
 
+                d.plugin->reset();
+                d->audition(0);
+                b = juce::AudioBuffer<float>(2, (int) (0.1 * kRate));
+                b.clear();
+                render(*d.plugin, b);
+                set(d->pads[0].tune, -12.0f);
+                render(*d.plugin, b);
+                expectWithinAbsoluteError(frequency(b, 0.02, 0.09, 500.0), 500.0, 5.0, "Pitch changes the sample already playing");
+                set(d->pads[0].tune, 0.0f);
+
                 set(d->pads[0].decay, 0.25f);
-                b = playInto(*d.plugin, { { 36, 0.0, 0.1 } }, 0.4);
+                b = playInto(*d.plugin, { { 48, 0.0, 0.1 } }, 0.4);
                 expect(rms(b, 0, 0.15, 0.3) < 1.0e-3f && rms(b, 0, 0.01, 0.05) > 0.1f, "a quarter decay fades it in the first quarter");
                 set(d->pads[0].decay, 1.0f);
 
                 set(d->pads[0].choke, 1.0f);
                 set(d->pads[2].choke, 1.0f);
-                b = playInto(*d.plugin, { { 38, 0.0, 0.1 }, { 36, 0.1, 0.2 } }, 0.35);
+                b = playInto(*d.plugin, { { 50, 0.0, 0.1 }, { 48, 0.1, 0.2 } }, 0.35);
                 expect(levelAt(b, 3000.0, 0.15, 0.3) < levelAt(b, 1000.0, 0.15, 0.3) - 40.0f, "the second pad chokes the first");
 
                 set(d->pads[0].pan, -1.0f);
-                b = playInto(*d.plugin, { { 36, 0.0, 0.1 } }, 0.2);
+                b = playInto(*d.plugin, { { 48, 0.0, 0.1 } }, 0.2);
                 expect(rms(b, 1, 0.02, 0.18) < 1.0e-4f && rms(b, 0, 0.02, 0.18) > 0.1f, "panned hard left");
 
                 d->audition(0, 127);
@@ -3538,6 +4251,50 @@ public:
                 expect(project.exportMix(limited, err), err);
                 expectWithinAbsoluteError(std::abs(sampleAt(limited, 1.0)), juce::Decibels::decibelsToGain(-3.0f), 0.01f,
                                           "held at -3 dB");
+            }
+
+            beginTest("Gate keys from a muted track and saves its detector source");
+            {
+                const double sr = engine.getSampleRate();
+                const auto key = writeWav(dir.getChildFile("gate-key.wav"), sr, (int) (sr * 0.5), 0.5f);
+                const auto source = writeWav(dir.getChildFile("gate-source.wav"), sr, (int) (sr * 2), 0.08f);
+                project.newProject();
+                juce::String error;
+                expect(project.importAudio(key, 0, (juce::int64) (sr * 0.5), error), error);
+                expect(project.importAudio(source, 1, 0, error), error);
+                engine.getTrack(0).mute = true;
+                engine.syncNow();
+
+                auto* gate = dynamic_cast<GateEffect*>(engine.addEffect(1, GateEffect::xmlTypeName, error));
+                expect(gate != nullptr, error);
+                if (gate != nullptr)
+                {
+                    set(gate->threshold, -18.0f);
+                    set(gate->hold, 0.0f);
+                    set(gate->release, 20.0f);
+                    gate->setEnabled(false);
+                    const auto dry = dir.getChildFile("gate-dry.wav");
+                    expect(project.exportMix(dry, error), error);
+                    gate->setEnabled(true);
+                    gate->setKeySource(engine.getAudioTrack(0));
+                    expect(gate->getKeySource() == engine.getAudioTrack(0));
+                    expectEquals(gate->getNumWires(), 4);
+
+                    const auto destination = dir.getChildFile("gate-project");
+                    expect(project.saveAs(destination, error), error);
+                    expect(project.load(destination, error), error);
+                    const auto inserts = engine.getInserts(1);
+                    auto* restored = inserts.empty() ? nullptr : dynamic_cast<GateEffect*>(inserts.front());
+                    expect(restored != nullptr && restored->getKeySource() == engine.getAudioTrack(0));
+
+                    const auto keyed = dir.getChildFile("gate-keyed.wav");
+                    expect(project.exportMix(keyed, error), error);
+                    const auto audible = sampleAt(dry, 0.75);
+                    expect(audible > 0.01f, "there is signal for the gate to open");
+                    expectWithinAbsoluteError(sampleAt(keyed, 0.25), 0.0f, 0.001f, "closed before the key");
+                    expectWithinAbsoluteError(sampleAt(keyed, 0.75), audible, 0.001f, "the key opens the gate without mixing into the output");
+                    expectWithinAbsoluteError(sampleAt(keyed, 1.5), 0.0f, 0.001f, "closed after the key");
+                }
             }
 
             beginTest("Every effect handles mono, and never makes NaNs");

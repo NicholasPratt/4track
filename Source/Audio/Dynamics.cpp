@@ -1,4 +1,5 @@
 #include "Dynamics.h"
+#include <set>
 
 namespace
 {
@@ -21,7 +22,7 @@ namespace
 //==============================================================================
 const char* CompressorEffect::xmlTypeName = "eightTrackCompressor";
 
-CompressorEffect::CompressorEffect(te::PluginCreationInfo info) : EffectPlugin(info)
+CompressorEffect::CompressorEffect(te::PluginCreationInfo info) : KeyedEffect(info)
 {
     threshold = addKnob("threshold", "Threshold", { -60.0f, 0.0f, 0.1f }, -18.0f, dbText, "Compress");
     ratio     = addKnob("ratio", "Ratio", skewed(1.0f, 20.0f, 4.0f, 0.1f), 4.0f,
@@ -39,7 +40,7 @@ CompressorEffect::CompressorEffect(te::PluginCreationInfo info) : EffectPlugin(i
 
 CompressorEffect::~CompressorEffect() { notifyListenersOfDeletion(); }
 
-void CompressorEffect::getChannelNames(juce::StringArray* ins, juce::StringArray* outs)
+void KeyedEffect::getChannelNames(juce::StringArray* ins, juce::StringArray* outs)
 {
     Plugin::getChannelNames(ins, outs);
     if (ins != nullptr)
@@ -71,7 +72,7 @@ void CompressorEffect::applyToBuffer(const te::PluginRenderContext& fc)
     juce::ScopedNoDenormals noDenormals;
     auto& b = *fc.destBuffer;
     const int channels = juce::jmin(2, b.getNumChannels());
-    const bool keyed = b.getNumChannels() >= 4 && getSidechainSourceID().isValid();
+    const bool keyed = hasExternalKey(b.getNumChannels());
 
     float* io[2] = { b.getWritePointer(0, fc.bufferStartSample), b.getWritePointer(channels - 1, fc.bufferStartSample) };
     const float* key[2] = { keyed ? b.getReadPointer(2, fc.bufferStartSample) : io[0],
@@ -129,45 +130,50 @@ void CompressorEffect::applyToBuffer(const te::PluginRenderContext& fc)
     reductionNow.store(-reduction, std::memory_order_relaxed);
 }
 
-bool CompressorEffect::feeds(te::Track& from, te::Track& to)
+bool KeyedEffect::feeds(te::Track& from, te::Track& to)
 {
-    auto* source = dynamic_cast<te::AudioTrack*>(&from);
-    if (source == nullptr)
-        return false;
-
-    // Straight into another track (8track's Bus 1 can output to Bus 2)
-    if (auto* dest = source->getOutput().getDestinationTrack())
-        if (dest == &to || feeds(*dest, to))
+    const auto tracks = te::getAudioTracks(from.edit);
+    std::set<te::Track*> visited;
+    auto reaches = [&](auto&& self, te::Track& current) -> bool
+    {
+        if (&current == &to)
             return true;
+        auto* source = dynamic_cast<te::AudioTrack*>(&current);
+        if (source == nullptr || !visited.insert(source).second)
+            return false;
 
-    // Through an aux send that's switched on, to every track returning that bus
-    for (auto* p : source->pluginList.getPlugins())
-        if (auto* send = dynamic_cast<te::AuxSendPlugin*>(p); send != nullptr && send->isEnabled())
-            for (auto* track : te::getAudioTracks(from.edit))
-            {
-                if (track == source)
-                    continue;
-                bool returns = false;
-                for (auto* q : track->pluginList.getPlugins())
-                    if (auto* ret = dynamic_cast<te::AuxReturnPlugin*>(q);
-                        ret != nullptr && ret->isEnabled() && ret->busNumber == send->getBusNumber())
-                        returns = true;
-                if (returns && (track == &to || feeds(*track, to)))
+        if (auto* destination = source->getOutput().getDestinationTrack())
+            if (self(self, *destination))
+                return true;
+
+        // A detector is also a dependency on the source track, even when the key is muted.
+        for (auto* track : tracks)
+            for (auto* plugin : track->pluginList.getPlugins())
+                if (plugin->getSidechainSourceID() == source->itemID && self(self, *track))
                     return true;
-            }
-    return false;
+
+        for (auto* plugin : source->pluginList.getPlugins())
+            if (auto* send = dynamic_cast<te::AuxSendPlugin*>(plugin); send != nullptr && send->isEnabled())
+                for (auto* track : tracks)
+                    for (auto* receiver : track->pluginList.getPlugins())
+                        if (auto* ret = dynamic_cast<te::AuxReturnPlugin*>(receiver);
+                            ret != nullptr && ret->isEnabled() && ret->busNumber == send->getBusNumber() && self(self, *track))
+                            return true;
+        return false;
+    };
+    return reaches(reaches, from);
 }
 
-void CompressorEffect::removeLoopingKeys(te::Edit& e)
+void KeyedEffect::removeLoopingKeys(te::Edit& e)
 {
     for (auto* p : te::getAllPlugins(e, false))
-        if (auto* c = dynamic_cast<CompressorEffect*>(p))
+        if (auto* c = dynamic_cast<KeyedEffect*>(p))
             if (auto* key = c->getKeySource(); key != nullptr)
                 if (auto* owner = c->getOwnerTrack(); owner != nullptr && (key == owner || feeds(*owner, *key)))
                     c->setSidechainSourceID({});
 }
 
-std::vector<te::AudioTrack*> CompressorEffect::getKeySources()
+std::vector<te::AudioTrack*> KeyedEffect::getKeySources()
 {
     std::vector<te::AudioTrack*> sources;
     auto* owner = getOwnerTrack();
@@ -177,30 +183,35 @@ std::vector<te::AudioTrack*> CompressorEffect::getKeySources()
     return sources;
 }
 
-te::AudioTrack* CompressorEffect::getKeySource()
+te::AudioTrack* KeyedEffect::getKeySource()
 {
     if (!getSidechainSourceID().isValid())
         return nullptr;
     return dynamic_cast<te::AudioTrack*>(te::findTrackForID(edit, getSidechainSourceID()));
 }
 
-void CompressorEffect::setKeySource(te::AudioTrack* track)
+void KeyedEffect::setKeySource(te::AudioTrack* track)
 {
-    if (track == getKeySource())
-        return;
-    edit.getUndoManager().beginNewTransaction(track != nullptr ? "Key Compressor from " + track->getName()
-                                                               : juce::String("Remove Compressor key"));
-    if (track == nullptr)
+    if (track != nullptr)
     {
-        setSidechainSourceID({});
-        return;
+        auto* owner = getOwnerTrack();
+        if (&track->edit != &edit || (owner != nullptr && feeds(*owner, *track)))
+            return;
     }
-    setSidechainSourceID(track->itemID);
-    if (getNumWires() == 0)
+    const auto source = track != nullptr ? track->itemID : te::EditItemID();
+    if (source == getSidechainSourceID())
+        return;
+
+    auto& undo = edit.getUndoManager();
+    undo.beginNewTransaction(track != nullptr ? "Key " + getName() + " from " + track->getName()
+                                              : "Remove " + getName() + " key");
+    setSidechainSourceID(source);
+    if (track != nullptr && getNumWires() == 0)
         guessSidechainRouting();
+    undo.beginNewTransaction();
 }
 
-std::vector<EffectPlugin::Selector> CompressorEffect::getSelectors()
+std::vector<EffectPlugin::Selector> KeyedEffect::getSelectors()
 {
     Selector key;
     key.name = "Key Source";
