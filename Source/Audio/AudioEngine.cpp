@@ -1671,6 +1671,15 @@ void AudioEngine::stop()
         setPosition(returnPosition);
 }
 
+void AudioEngine::allNotesOff()
+{
+    chordPreview.stop();
+    if (edit != nullptr)
+        te::midiPanic(*edit, false);   // 8track's instruments take it on their next block; plugins send CC 123
+    for (int port = 0; port < MidiOutSender::kMaxPorts; ++port)
+        midiOutSender.allNotesOff(port);   // unopened ports are skipped
+}
+
 bool AudioEngine::record(const juce::File& takeFolder, juce::String& error)
 {
     chordPreview.stop();

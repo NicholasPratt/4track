@@ -102,6 +102,20 @@ juce::Rectangle<int> InsertSlots::slotBounds(int i) const
     return { 0, i * (kSlotHeight + kGap), getWidth(), kSlotHeight };
 }
 
+juce::Rectangle<int> InsertSlots::powerBounds(int i) const
+{
+    return slotBounds(i).removeFromRight(kSlotHeight);
+}
+
+void InsertSlots::toggleBypass(te::Plugin& plugin)
+{
+    if (!plugin.canBeDisabled())
+        return;
+    plugin.setEnabled(!plugin.isEnabled());
+    project.markDirty();
+    refresh();
+}
+
 void InsertSlots::paint(juce::Graphics& g)
 {
     g.setFont(Theme::font(10.0f));
@@ -116,7 +130,21 @@ void InsertSlots::paint(juce::Graphics& g)
             g.setColour(slot.enabled ? Theme::accent : Theme::textDim.withAlpha(0.5f));
             g.fillRoundedRectangle(r.withWidth(3.0f), 1.5f);
             g.setColour(slot.enabled ? Theme::text : Theme::textDim);
-            g.drawText(slot.name, r.toNearestInt().withTrimmedLeft(7).withTrimmedRight(3), juce::Justification::centredLeft, true);
+            g.drawText(slot.name, r.toNearestInt().withTrimmedLeft(7).withTrimmedRight(kSlotHeight), juce::Justification::centredLeft, true);
+
+            // The power button: lit while the plugin is on.
+            if (slot.plugin->canBeDisabled())
+            {
+                const auto p = powerBounds(i).toFloat().reduced(4.0f);
+                const auto colour = slot.enabled ? Theme::accent : Theme::textDim.withAlpha(0.6f);
+                juce::Path icon;
+                icon.addCentredArc(p.getCentreX(), p.getCentreY(), p.getWidth() * 0.5f, p.getHeight() * 0.5f, 0.0f,
+                                   juce::MathConstants<float>::pi * 0.22f, juce::MathConstants<float>::pi * 1.78f, true);
+                icon.startNewSubPath(p.getCentreX(), p.getY() - 0.5f);
+                icon.lineTo(p.getCentreX(), p.getCentreY());
+                g.setColour(colour);
+                g.strokePath(icon, juce::PathStrokeType(1.3f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+            }
         }
         else
         {
@@ -141,6 +169,8 @@ void InsertSlots::mouseUp(const juce::MouseEvent& e)
         auto* plugin = slots[(size_t) i].plugin;
         if (e.mods.isPopupMenu())
             showPluginMenu(*plugin);
+        else if (powerBounds(i).contains(e.getPosition()) && plugin->canBeDisabled())
+            toggleBypass(*plugin);
         else
             plugin->showWindowExplicitly();
     }

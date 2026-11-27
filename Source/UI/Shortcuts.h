@@ -14,7 +14,7 @@ namespace Shortcuts
         cmdZoomIn, cmdZoomOut, cmdZoomFit, cmdMixer, cmdShowShortcuts, cmdShowTuner,
         cmdPrevious, cmdNext, cmdPreviousBar, cmdNextBar,
         cmdQuantize, cmdPitchUp, cmdPitchDown, cmdOctaveUp, cmdOctaveDown, cmdCloseEditor, cmdEditSongNote,
-        cmdDrumSequencer
+        cmdDrumSequencer, cmdAllNotesOff
     };
 
     struct Binding

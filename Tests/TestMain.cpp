@@ -16,6 +16,7 @@
 #include "../Source/Audio/Dynamics.h"
 #include "../Source/Audio/Drive.h"
 #include "../Source/Audio/ChorusEffect.h"
+#include "../Source/Audio/DoublerEffect.h"
 #include "../Source/Audio/EqDeEsser.h"
 #include "../Source/Audio/ReverbEffect.h"
 #include "../Source/Audio/Arpeggiator.h"
@@ -3653,6 +3654,75 @@ public:
                 expect(diff < 1.0e-6f, "Mix 0: dry");
             }
 
+            beginTest("Doubler: the double comes in late and detuned, wide in stereo; Mix 0 is dry; 1 voice is mono");
+            {
+                Standalone<DoublerEffect> d(fresh);
+                set(d->variation, 0.0f);
+                set(d->lowCut, 20.0f);
+                set(d->highCut, 20000.0f);
+
+                // A click: with Mix all the way up, only the doubles, about Delay later.
+                set(d->mix, 1.0f);
+                set(d->voices, (float) DoublerEffect::One);
+                set(d->detune, 0.0f);
+                set(d->delay, 25.0f);
+                juce::AudioBuffer<float> click(2, 9600);
+                click.clear();
+                click.setSample(0, 1000, 1.0f), click.setSample(1, 1000, 1.0f);
+                render(*d.plugin, click);
+                int peakAt = 0;
+                for (int i = 0; i < click.getNumSamples(); ++i)
+                    if (std::abs(click.getSample(0, i)) > std::abs(click.getSample(0, peakAt)))
+                        peakAt = i;
+                expectWithinAbsoluteError(peakAt - 1000, juce::roundToInt(0.025 * kRate), 4, "the double is 25 ms late");
+                expect(std::abs(click.getSample(0, 1000)) < 1.0e-6f, "no lead at Mix 100%");
+
+                // Detuned: a sine through the double comes out a few cents off.
+                set(d->detune, 20.0f);
+                d.plugin->reset();
+                auto b = sine(440.0, 2.0, 0.3f);
+                render(*d.plugin, b);
+                int crossings = 0;
+                const int from = (int) kRate / 2, to = (int) (kRate * 1.9);
+                for (int i = from + 1; i < to; ++i)
+                    if (b.getSample(0, i - 1) < 0.0f && b.getSample(0, i) >= 0.0f)
+                        ++crossings;
+                const double hz = crossings / ((to - from) / kRate);
+                const double cents = 1200.0 * std::log2(hz / 440.0);
+                expectWithinAbsoluteError((float) cents, 20.0f, 4.0f, "+20 cents: " + juce::String(cents, 1));
+                float diff = 0.0f;
+                for (int i = from; i < to; ++i)
+                    diff = juce::jmax(diff, std::abs(b.getSample(0, i) - b.getSample(1, i)));
+                expect(diff < 1.0e-6f, "1 voice is in the centre");
+
+                // Two voices, spread: left and right differ.
+                set(d->voices, (float) DoublerEffect::Two);
+                set(d->variation, 0.5f);
+                set(d->width, 1.0f);
+                set(d->mix, 0.5f);
+                d.plugin->reset();
+                b = sine(300.0, 2.0, 0.3f);
+                render(*d.plugin, b);
+                double lr = 0, ll = 0, rr = 0;
+                for (int i = from; i < to; ++i)
+                {
+                    const double l = b.getSample(0, i), r = b.getSample(1, i);
+                    lr += l * r; ll += l * l; rr += r * r;
+                }
+                expect(lr / std::sqrt(ll * rr) < 0.95, "2 voices are wide");
+                expect(b.getMagnitude(0, b.getNumSamples()) < 1.0f, "and don't blow up");
+
+                set(d->mix, 0.0f);
+                d.plugin->reset();
+                const auto in = sine(330.0, 0.5, 0.3f);
+                b = in;
+                render(*d.plugin, b);
+                diff = 0.0f;
+                for (int i = 0; i < b.getNumSamples(); ++i)
+                    diff = juce::jmax(diff, std::abs(b.getSample(0, i) - in.getSample(0, i)));
+                expect(diff < 1.0e-6f, "Mix 0: dry");
+            }
+
             beginTest("EQ: flat by default; a bell, a cut and Output do what the curve says; a band that's off does nothing");
             {
                 Standalone<EqEffect> q(fresh);
@@ -4111,6 +4181,28 @@ public:
                 writer->writeFromAudioSampleBuffer(tone, 0, tone.getNumSamples());
                 return f;
             };
+
+            beginTest("MIDI panic: a held note on 8track's instruments lets go");
+            {
+                Standalone<AnalogSynth> syn(fresh);
+                set(syn->release, 0.1f);
+                juce::AudioBuffer<float> b(2, (int) kRate);
+                b.clear();
+                for (int s0 = 0; s0 < b.getNumSamples(); s0 += 512)
+                {
+                    const int n = juce::jmin(512, b.getNumSamples() - s0);
+                    te::MidiMessageArray midi;
+                    if (s0 == 0)
+                        midi.addMidiMessage(juce::MidiMessage::noteOn(1, 60, (juce::uint8) 100), 0.0, {});   // never let go
+                    if (s0 <= (int) (0.4 * kRate) && s0 + n > (int) (0.4 * kRate))
+                        syn.plugin->midiPanic();
+                    const te::TimeRange range(te::TimePosition::fromSeconds(s0 / kRate), te::TimeDuration::fromSeconds(n / kRate));
+                    te::PluginRenderContext fc(&b, s0, n, &midi, 0.0, range, true, false, false, false);
+                    syn.plugin->applyToBuffer(fc);
+                }
+                expect(rms(b, 0, 0.2, 0.4) > 1.0e-3f, "the note sounds");
+                expect(rms(b, 0, 0.8, 1.0) < rms(b, 0, 0.2, 0.4) * 1.0e-3f, "and stops after the panic");
+            }
 
             beginTest("Drum Sampler: pads play their sounds from C2 up, tuned, choked, copied into the project");
             {

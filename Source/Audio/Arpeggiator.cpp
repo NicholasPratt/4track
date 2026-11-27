@@ -152,6 +152,7 @@ void ArpeggiatorEffect::stopSounding(te::MidiMessageArray& midi, double time)
 
 void ArpeggiatorEffect::applyToBuffer(const te::PluginRenderContext& fc)
 {
+    applyPanic(fc);
     if (fc.bufferForMidiMessages == nullptr)
         return;
     auto& midi = *fc.bufferForMidiMessages;

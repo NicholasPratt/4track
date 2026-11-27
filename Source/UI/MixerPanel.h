@@ -15,7 +15,8 @@ private:
 };
 
 /** A track's plugin inserts: click an empty slot to add a plugin, click a plugin to
-    open its editor, right-click it to bypass or remove it. */
+    open its editor, click its power button to bypass it (or turn it back on), right-click
+    it to bypass or remove it. */
 class InsertSlots : public juce::Component
 {
 public:
@@ -30,6 +31,9 @@ public:
 private:
     struct Slot { te::Plugin* plugin; juce::String name; bool enabled; bool operator==(const Slot&) const = default; };
     juce::Rectangle<int> slotBounds(int i) const;
+    /** The bypass button at the right of a slot with a plugin in it. */
+    juce::Rectangle<int> powerBounds(int i) const;
+    void toggleBypass(te::Plugin&);
     void showAddMenu();
     void showPluginMenu(te::Plugin&);
 

@@ -256,6 +256,7 @@ void KeySampler::render(Voice& v, float* l, float* r, int n)
 
 void KeySampler::applyToBuffer(const te::PluginRenderContext& fc)
 {
+    applyPanic(fc);
     if (fc.destBuffer == nullptr || fc.bufferNumSamples == 0)
         return;
     juce::ScopedNoDenormals noDenormals;

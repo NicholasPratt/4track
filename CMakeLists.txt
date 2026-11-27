@@ -137,6 +137,7 @@ target_sources(8TrackTests PRIVATE
     Source/Audio/EqDeEsser.cpp
     Source/Audio/Drive.cpp
     Source/Audio/ChorusEffect.cpp
+    Source/Audio/DoublerEffect.cpp
     Source/Audio/ReverbEffect.cpp
     Source/Audio/Arpeggiator.cpp
     Source/Audio/AnalogSynth.cpp

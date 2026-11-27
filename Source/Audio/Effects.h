@@ -64,6 +64,10 @@ public:
     bool isSynth() override { return getKind() == Kind::Instrument; }
     void restorePluginStateFromValueTree(const juce::ValueTree&) override;
 
+    /** MIDI panic (te::midiPanic): the next block that has MIDI is marked all-notes-off,
+        which the instruments and the arpeggiator already handle. Any thread. */
+    void midiPanic() override { panicPending.store(true, std::memory_order_relaxed); }
+
     /** Effects process audio; instruments play MIDI; MIDI effects change the notes on their
         way to the instrument, so they go first in a MIDI track's chain. */
     enum class Kind { Effect, Instrument, MidiEffect };
@@ -135,12 +139,20 @@ protected:
     /** Position in quarter notes at the start of this block, if the transport is playing. */
     std::optional<double> getBeatPosition(const te::PluginRenderContext&) const;
 
+    /** Audio thread, first thing in applyToBuffer: passes on a panic asked for since the last block. */
+    void applyPanic(const te::PluginRenderContext& fc)
+    {
+        if (fc.bufferForMidiMessages != nullptr && panicPending.exchange(false, std::memory_order_relaxed))
+            fc.bufferForMidiMessages->isAllNotesOff = true;
+    }
+
     /** Mix 0..1 to dry and wet gains: both are at full level in the middle. */
     static std::pair<float, float> mixGains(float mix) { return { juce::jmin(1.0f, 2.0f * (1.0f - mix)), juce::jmin(1.0f, 2.0f * mix) }; }
 
 private:
     std::vector<Control> controls;
     std::atomic<double> tempoBpm { 120.0 };
+    std::atomic<bool> panicPending { false };
 };
 
 //==============================================================================

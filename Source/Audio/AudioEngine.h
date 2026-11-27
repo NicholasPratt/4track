@@ -254,6 +254,9 @@ public:
     void setPosition(juce::int64 newPosition);
     void play();
     void stop();
+    /** MIDI panic: every note off, on every instrument (8track's and plugins) and every
+        hardware MIDI output, and the sustain pedal up. Message thread. */
+    void allNotesOff();
     /** Starts recording on the armed tracks. New takes are written into takeFolder.
         In loop mode this also moves the looper on: see LoopRecord. */
     bool record(const juce::File& takeFolder, juce::String& error);

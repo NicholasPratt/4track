@@ -372,6 +372,7 @@ void DrumSampler::render(Voice& v, const Outputs& out, int n)
 
 void DrumSampler::applyToBuffer(const te::PluginRenderContext& fc)
 {
+    applyPanic(fc);
     if (fc.destBuffer == nullptr || fc.bufferNumSamples == 0)
         return;
     juce::ScopedNoDenormals noDenormals;

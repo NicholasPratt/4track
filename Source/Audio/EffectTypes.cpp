@@ -4,6 +4,7 @@
 #include "EqDeEsser.h"
 #include "Drive.h"
 #include "ChorusEffect.h"
+#include "DoublerEffect.h"
 #include "ReverbEffect.h"
 #include "Arpeggiator.h"
 #include "AnalogSynth.h"
@@ -32,6 +33,7 @@ std::vector<EffectPlugin::Type> EffectPlugin::getTypes()
         type<DriveEffect>("Overdrive, distortion, fuzz and tube, into a cabinet or an impulse response"),
         type<DelayEffect>("Echoes, free or in time with the song"),
         type<ChorusEffect>("CE-2, Juno and Dimension-style bucket-brigade chorus"),
+        type<DoublerEffect>("Double-tracks a voice: late, detuned, drifting copies, spread wide"),
         type<ReverbEffect>("Rooms, halls, plates and cathedrals, with shimmer"),
         type<AutoPanEffect>("Moves the sound between left and right"),
         type<FilterEffect>("Low, high, band pass or notch, with an LFO"),
@@ -53,6 +55,7 @@ void EffectPlugin::registerTypes(te::PluginManager& pm)
     pm.createBuiltInType<DriveEffect>();
     pm.createBuiltInType<DelayEffect>();
     pm.createBuiltInType<ChorusEffect>();
+    pm.createBuiltInType<DoublerEffect>();
     pm.createBuiltInType<ReverbEffect>();
     pm.createBuiltInType<AutoPanEffect>();
     pm.createBuiltInType<FilterEffect>();

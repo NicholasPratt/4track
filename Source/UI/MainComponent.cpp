@@ -593,6 +593,7 @@ void MainComponent::perform(int command, Context context)
         case cmdDrumSequencer: openDrumPatterns(); break;
         case cmdShowShortcuts: showShortcutHelp(); break;
         case cmdShowTuner: transport->showTuner(); break;
+        case cmdAllNotesOff: engine.allNotesOff(); break;
         case cmdPrevious:    movePlayhead(-1, false); break;
         case cmdNext:        movePlayhead(1, false); break;
         case cmdPreviousBar: movePlayhead(-1, true); break;
@@ -720,6 +721,8 @@ juce::PopupMenu MainComponent::getMenuForIndex(int index, const juce::String&)
             m.addSeparator();
             m.addItem(item(cmdClick, "Metronome", true, engine.metronomeOn.load()));
             m.addItem(item(cmdCountIn, "Recording Count-in", true, engine.countInOn.load()));
+            m.addSeparator();
+            m.addItem(item(cmdAllNotesOff, "MIDI Panic (All Notes Off)"));
             break;
         case 3:
             m.addItem(item(cmdZoomIn, "Zoom In"));

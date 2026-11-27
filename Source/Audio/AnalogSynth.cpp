@@ -176,6 +176,7 @@ void AnalogSynth::applySettings(bool force)
 
 void AnalogSynth::applyToBuffer(const te::PluginRenderContext& fc)
 {
+    applyPanic(fc);
     if (fc.destBuffer == nullptr || fc.bufferNumSamples == 0)
         return;
     juce::ScopedNoDenormals noDenormals;
